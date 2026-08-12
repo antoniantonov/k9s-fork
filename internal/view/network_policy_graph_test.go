@@ -162,10 +162,20 @@ func TestNetworkPolicyGraphSpecialCommandAliasesAndActionableErrors(t *testing.T
 		})
 	}
 
+	// Kind-only is valid syntax now that it resolves to the first instance, so
+	// a missing connection must be reported as such, not as a usage error.
 	assert.True(t, command.specialCmd(cmd.NewInterpreter("npg pod"), true))
 	message := <-app.Flash().Channel()
-	assert.Contains(t, message.Text, "npg <pod|deployment|job|namespace> <name> [namespace]")
+	assert.Contains(t, message.Text, "active Kubernetes connection")
 	assert.Empty(t, app.cmdHistory.List())
+
+	// Genuinely malformed input still gets the usage error.
+	for _, line := range []string{"npg service api default", "npg pod api default extra", "npg namespace payments extra"} {
+		assert.True(t, command.specialCmd(cmd.NewInterpreter(line), true))
+		message := <-app.Flash().Channel()
+		assert.Contains(t, message.Text, "npg <pod|deployment|job|namespace> <name> [namespace]", line)
+		assert.Empty(t, app.cmdHistory.List())
+	}
 }
 
 func TestNetworkPolicyGraphInitialLayoutAndDirectionToggles(t *testing.T) {

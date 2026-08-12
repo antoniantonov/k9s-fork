@@ -499,6 +499,7 @@ Each direction has two display modes:
 | `e` | Show or hide egress |
 | `m` | Toggle Rules/Primitives for the focused direction |
 | `M` | Apply the focused mode to both visible directions |
+| `s` | Change the reachability subject |
 | `f` | Configure CIDR/Pod/Namespace/Deployment/Job filters |
 | `Up` / `Down` | Select the previous/next rule or primitive |
 | `PageUp` / `PageDown` | Move selection by one page |
@@ -551,9 +552,9 @@ Reachability colors follow the active skin and can be customized:
 k9s:
   views:
     reachability:
-      allowedColor: darkgreen
-      disallowedColor: darkred
-      partialDataColor: darkorange
+      allowedColor: green
+      disallowedColor: red
+      partialDataColor: orange
 ```
 
 ### RBAC

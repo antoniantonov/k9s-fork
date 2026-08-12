@@ -368,6 +368,10 @@ func TestNetworkPolicyGraphCmd(t *testing.T) {
 		ok      bool
 		args    cmd.NetworkPolicyGraphArgs
 	}{
+		"bare": {
+			command: "npg",
+			ok:      true,
+		},
 		"pod": {
 			command: "netpolgraph pod api payments",
 			ok:      true,
@@ -411,8 +415,42 @@ func TestNetworkPolicyGraphCmd(t *testing.T) {
 				Name: "payments",
 			},
 		},
-		"incomplete": {
+		"pod-kind-only": {
 			command: "npg pod",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind: "pod",
+			},
+		},
+		"deployment-kind-only": {
+			command: "npg deploy",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind: "deployment",
+			},
+		},
+		"job-kind-only": {
+			command: "npg jobs",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind: "job",
+			},
+		},
+		"namespace-kind-only": {
+			command: "npg ns",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind: "namespace",
+			},
+		},
+		"case-insensitive": {
+			command: "NPG DEPLOYMENT API DEFAULT",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind:      "deployment",
+				Name:      "api",
+				Namespace: "default",
+			},
 		},
 		"unknown-kind": {
 			command: "npg service api payments",
@@ -457,14 +495,12 @@ func TestNetworkPolicyGraphKindAliases(t *testing.T) {
 
 	for alias, kind := range uu {
 		t.Run(alias, func(t *testing.T) {
-			line := "npg " + alias + " subject test"
-			if kind == "namespace" {
-				line = "npg " + alias + " subject"
-			}
+			line := "npg " + alias
 			p := cmd.NewInterpreter(line)
 			got, ok := p.NetworkPolicyGraphArgs()
 			require.True(t, ok)
 			assert.Equal(t, kind, got.Kind)
+			assert.Empty(t, got.Name)
 		})
 	}
 }

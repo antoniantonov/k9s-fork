@@ -24,11 +24,11 @@ type args map[string]string
 
 func newArgs(p *Interpreter, aa []string) args {
 	arguments := make(args, len(aa))
+	if p != nil && p.IsNetworkPolicyGraphCmd() {
+		return newNetworkPolicyGraphArgs(aa)
+	}
 	if len(aa) == 0 {
 		return arguments
-	}
-	if p.IsNetworkPolicyGraphCmd() {
-		return newNetworkPolicyGraphArgs(aa)
 	}
 
 	for i := 0; i < len(aa); i++ {
@@ -86,22 +86,29 @@ func newArgs(p *Interpreter, aa []string) args {
 }
 
 func newNetworkPolicyGraphArgs(aa []string) args {
-	if len(aa) < 2 || len(aa) > 3 {
+	if len(aa) == 0 || len(aa) > 3 {
 		return args{}
 	}
 
 	kind, ok := normalizeNetworkPolicyGraphKind(aa[0])
-	if !ok || strings.TrimSpace(aa[1]) == "" {
+	if !ok {
+		return args{}
+	}
+
+	arguments := args{kindKey: kind}
+	if len(aa) == 1 {
+		return arguments
+	}
+
+	name := strings.ToLower(strings.TrimSpace(aa[1]))
+	if name == "" {
 		return args{}
 	}
 	if kind == netpolGraphKindNS && len(aa) != 2 {
 		return args{}
 	}
+	arguments[nameKey] = name
 
-	arguments := args{
-		kindKey: kind,
-		nameKey: strings.ToLower(strings.TrimSpace(aa[1])),
-	}
 	if len(aa) == 3 {
 		namespace := strings.ToLower(strings.TrimSpace(aa[2]))
 		if namespace == "" {

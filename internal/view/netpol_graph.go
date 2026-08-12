@@ -14,6 +14,7 @@ import (
 	"github.com/derailed/k9s/internal"
 	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/config"
+	"github.com/derailed/k9s/internal/dao"
 	"github.com/derailed/k9s/internal/model"
 	"github.com/derailed/k9s/internal/netpol"
 	"github.com/derailed/k9s/internal/slogs"
@@ -21,7 +22,10 @@ import (
 	"github.com/derailed/k9s/internal/view/cmd"
 	"github.com/derailed/tcell/v2"
 	"github.com/derailed/tview"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
@@ -29,6 +33,7 @@ const (
 	netPolGraphTitle      = "NetworkPolicy Reachability"
 	netPolKindsDialogPage = "netpol-primitive-kinds"
 	netPolSearchPage      = "netpol-search"
+	netPolSubjectPage     = "netpol-subject"
 )
 
 type netPolGraphModel interface {
@@ -463,7 +468,7 @@ func (v *NetworkPolicyGraph) updateHeader() {
 		status += " | ERROR: " + v.lastError.Error()
 	}
 	v.header.SetText(fmt.Sprintf(
-		" %s %s | i:Ingress[%s] e:Egress[%s] m:Mode M:Both f:Kinds /:Search r:Refresh%s",
+		" %s %s | i:Ingress[%s] e:Egress[%s] m:Mode M:Both s:Subject f:Kinds /:Search r:Refresh%s",
 		subject.Kind, path, onOff(v.state[netpol.Ingress].visible),
 		onOff(v.state[netpol.Egress].visible), status,
 	))
@@ -605,22 +610,31 @@ func (v *NetworkPolicyGraph) openKindsDialog() {
 	if v.app == nil || !v.state[v.focus].visible {
 		return
 	}
+	styles := v.app.Styles.Dialog()
 	dialog := ui.NewPrimitiveKindDialog(v.state[v.focus].kinds, func(kinds sets.Set[netpol.PrimitiveKind]) {
 		v.app.Content.RemovePage(netPolKindsDialogPage)
 		v.state[v.focus].kinds = kinds
 		v.loadPanel(v.focus)
 		v.updateDetails(v.focus)
+		v.app.SetFocus(v.panels[v.focus])
 	}, func() {
 		v.app.Content.RemovePage(netPolKindsDialogPage)
 		v.app.SetFocus(v.panels[v.focus])
 	})
-	v.app.Content.AddPage(netPolKindsDialogPage, centered(dialog, 48, 16), false, true)
+	styleForm(dialog.Form, &styles)
+	modal := tview.NewModalForm("<Primitive Kinds>", dialog.Form)
+	modal.SetBackgroundColor(styles.BgColor.Color()).SetTextColor(styles.FgColor.Color())
+	modal.SetDoneFunc(func(int, string) { dialog.Cancel() })
+	v.app.Content.AddPage(netPolKindsDialogPage, modal, false, false)
+	v.app.Content.ShowPage(netPolKindsDialogPage)
+	v.app.SetFocus(modal)
 }
 
 func (v *NetworkPolicyGraph) openSearchDialog() {
 	if v.app == nil || !v.state[v.focus].visible {
 		return
 	}
+	styles := v.app.Styles.Dialog()
 	input := tview.NewInputField().
 		SetLabel("Filter: ").
 		SetText(v.state[v.focus].states[v.state[v.focus].mode].filter)
@@ -642,18 +656,131 @@ func (v *NetworkPolicyGraph) openSearchDialog() {
 		v.app.Content.RemovePage(netPolSearchPage)
 		v.app.SetFocus(v.panels[v.focus])
 	})
-	form.SetBorder(true).SetTitle(" Reachability Search ")
-	v.app.Content.AddPage(netPolSearchPage, centered(form, 58, 9), false, true)
+	styleForm(form, &styles)
+	modal := tview.NewModalForm("<Reachability Search>", form)
+	modal.SetBackgroundColor(styles.BgColor.Color()).SetTextColor(styles.FgColor.Color())
+	modal.SetDoneFunc(func(int, string) {
+		v.app.Content.RemovePage(netPolSearchPage)
+		v.app.SetFocus(v.panels[v.focus])
+	})
+	v.app.Content.AddPage(netPolSearchPage, modal, false, false)
+	v.app.Content.ShowPage(netPolSearchPage)
+	v.app.SetFocus(modal)
 }
 
-func centered(primitive tview.Primitive, width, height int) tview.Primitive {
-	return tview.NewFlex().
-		AddItem(nil, 0, 1, false).
-		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(nil, 0, 1, false).
-			AddItem(primitive, height, 0, true).
-			AddItem(nil, 0, 1, false), width, 0, true).
-		AddItem(nil, 0, 1, false)
+func styleForm(form *tview.Form, styles *config.Dialog) {
+	form.SetItemPadding(0).
+		SetButtonsAlign(tview.AlignCenter).
+		SetButtonBackgroundColor(styles.ButtonBgColor.Color()).
+		SetButtonTextColor(styles.ButtonFgColor.Color()).
+		SetLabelColor(styles.LabelFgColor.Color()).
+		SetFieldTextColor(styles.FieldFgColor.Color()).
+		SetFieldBackgroundColor(styles.BgColor.Color())
+	for i := range form.GetButtonCount() {
+		if b := form.GetButton(i); b != nil {
+			b.SetBackgroundColorActivated(styles.ButtonFocusBgColor.Color())
+			b.SetLabelColorActivated(styles.ButtonFocusFgColor.Color())
+		}
+	}
+}
+
+func (v *NetworkPolicyGraph) openSubjectDialog() {
+	if v.app == nil || v.app.factory == nil {
+		return
+	}
+	styles := v.app.Styles.Dialog()
+	picker := ui.NewSubjectPicker(&styles, subjectKinds(), v.loadSubjects, func(ref netpol.SubjectRef) {
+		v.app.Content.RemovePage(netPolSubjectPage)
+		v.applySubject(ref)
+	}, func() {
+		v.app.Content.RemovePage(netPolSubjectPage)
+		v.app.SetFocus(v.panels[v.focus])
+	})
+	v.app.Content.AddPage(netPolSubjectPage, picker, false, false)
+	v.app.Content.ShowPage(netPolSubjectPage)
+	v.app.SetFocus(picker)
+}
+
+func (v *NetworkPolicyGraph) applySubject(ref netpol.SubjectRef) {
+	v.subject = ref
+	v.model.SetSubject(ref)
+	v.result, v.haveResult, v.lastError = netpol.SubjectResult{}, false, nil
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		v.loadPanel(direction)
+	}
+	v.updateHeader()
+	v.showMessage("Waiting for NetworkPolicy evaluation...")
+	if v.app != nil {
+		v.app.SetFocus(v.panels[v.focus])
+	}
+}
+
+func subjectKinds() []netpol.SubjectKind {
+	return []netpol.SubjectKind{
+		netpol.SubjectPod,
+		netpol.SubjectDeployment,
+		netpol.SubjectJob,
+		netpol.SubjectNamespace,
+	}
+}
+
+func (v *NetworkPolicyGraph) loadSubjects(kind netpol.SubjectKind) ([]netpol.SubjectRef, error) {
+	return listSubjectRefs(v.app.factory, kind)
+}
+
+func listSubjectRefs(factory dao.Factory, kind netpol.SubjectKind) ([]netpol.SubjectRef, error) {
+	gvr := subjectGVR(kind)
+	if gvr == nil {
+		return nil, fmt.Errorf("unsupported subject kind %s", kind)
+	}
+	objects, err := factory.List(gvr, client.BlankNamespace, true, labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]netpol.SubjectRef, 0, len(objects))
+	for _, object := range objects {
+		ref, ok := subjectRefFromObject(kind, object)
+		if ok {
+			refs = append(refs, ref)
+		}
+	}
+	return refs, nil
+}
+
+func subjectGVR(kind netpol.SubjectKind) *client.GVR {
+	switch kind {
+	case netpol.SubjectPod:
+		return client.PodGVR
+	case netpol.SubjectDeployment:
+		return client.DpGVR
+	case netpol.SubjectJob:
+		return client.JobGVR
+	case netpol.SubjectNamespace:
+		return client.NsGVR
+	default:
+		return nil
+	}
+}
+
+func subjectRefFromObject(kind netpol.SubjectKind, object runtime.Object) (netpol.SubjectRef, bool) {
+	unstructuredObject, ok := object.(*unstructured.Unstructured)
+	if !ok {
+		return netpol.SubjectRef{}, false
+	}
+	name := unstructuredObject.GetName()
+	if name == "" {
+		return netpol.SubjectRef{}, false
+	}
+	ref := netpol.SubjectRef{
+		Kind:      kind,
+		Name:      name,
+		UID:       types.UID(unstructuredObject.GetUID()),
+		Namespace: unstructuredObject.GetNamespace(),
+	}
+	if kind == netpol.SubjectNamespace {
+		ref.Namespace = ""
+	}
+	return ref, true
 }
 
 func (v *NetworkPolicyGraph) applySearch(filter string) {
@@ -767,6 +894,7 @@ func (v *NetworkPolicyGraph) bindKeys() {
 		}, true),
 		ui.KeyF:        ui.NewKeyAction("Primitive Kinds", func(*tcell.EventKey) *tcell.EventKey { v.openKindsDialog(); return nil }, true),
 		ui.KeyO:        ui.NewKeyAction("Open Resource", v.openResourceCmd, true),
+		ui.KeyS:        ui.NewKeyAction("Subject", func(*tcell.EventKey) *tcell.EventKey { v.openSubjectDialog(); return nil }, true),
 		ui.KeySlash:    ui.NewKeyAction("Search", func(*tcell.EventKey) *tcell.EventKey { v.openSearchDialog(); return nil }, true),
 		ui.KeyR:        ui.NewKeyAction("Refresh", func(*tcell.EventKey) *tcell.EventKey { v.Refresh(); return nil }, true),
 		ui.KeyY:        ui.NewKeyAction("YAML", v.yamlCmd, true),

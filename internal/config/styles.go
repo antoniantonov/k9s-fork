@@ -326,9 +326,9 @@ func newViews() Views {
 
 func newReachability() Reachability {
 	return Reachability{
-		AllowedColor:     "darkgreen",
-		DisallowedColor:  "darkred",
-		PartialDataColor: "darkorange",
+		AllowedColor:     "green",
+		DisallowedColor:  "red",
+		PartialDataColor: "orange",
 	}
 }
 

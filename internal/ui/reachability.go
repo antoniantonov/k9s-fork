@@ -16,10 +16,10 @@ import (
 )
 
 const (
-	reachabilityAllowedBackground = tcell.ColorDarkGreen
-	reachabilityDeniedBackground  = tcell.ColorDarkRed
-	reachabilityPartialBackground = tcell.ColorDarkOrange
-	partialDataLabel              = "Partial Data"
+	reachabilityAllowedColor    = tcell.ColorGreen
+	reachabilityDisallowedColor = tcell.ColorRed
+	reachabilityPartialColor    = tcell.ColorOrange
+	partialDataLabel            = "Partial Data"
 )
 
 // ReachabilityProjection identifies the data shown by a DirectionPanel.
@@ -78,6 +78,8 @@ type DirectionPanel struct {
 	selected   func(string)
 	changing   bool
 	colors     reachabilityColors
+	cursorFg   tcell.Color
+	cursorBg   tcell.Color
 }
 
 // NewDirectionPanel creates a direction panel. Pass true as the optional
@@ -87,6 +89,8 @@ func NewDirectionPanel(direction netpol.Direction, ascii ...bool) *DirectionPane
 		Table:     tview.NewTable(),
 		direction: direction,
 		colors:    defaultReachabilityColors(),
+		cursorFg:  config.NewStyles().Table().CursorFgColor.Color(),
+		cursorBg:  config.NewStyles().Table().CursorBgColor.Color(),
 	}
 	if len(ascii) > 0 {
 		p.ascii = ascii[0]
@@ -96,6 +100,23 @@ func NewDirectionPanel(direction netpol.Direction, ascii ...bool) *DirectionPane
 	p.SetInputCapture(p.captureInput)
 	p.Table.SetSelectionChangedFunc(p.selectionChanged)
 	p.rebuild()
+	return p
+}
+
+// NewDirectionPanelWithStyle creates a direction panel using configured styles.
+func NewDirectionPanelWithStyle(direction netpol.Direction, styles *config.Styles, ascii ...bool) *DirectionPanel {
+	return NewDirectionPanel(direction, ascii...).SetStyles(styles)
+}
+
+// SetStyles applies the configured table cursor and reachability styles.
+func (p *DirectionPanel) SetStyles(styles *config.Styles) *DirectionPanel {
+	if styles == nil {
+		return p
+	}
+	p.cursorFg = styles.Table().CursorFgColor.Color()
+	p.cursorBg = styles.Table().CursorBgColor.Color()
+	p.SetReachabilityStyle(styles.Reachability())
+	p.applySelectionStyle()
 	return p
 }
 
@@ -289,13 +310,13 @@ func (p *DirectionPanel) rebuild() {
 	for index, block := range p.blocks {
 		row := index * 3
 		p.blockRows = append(p.blockRows, row)
-		background := reachabilityBackground(block.state, block.label, p.colors)
-		p.setBlockCell(row, 0, block.label, block.id, background, false)
-		p.setBlockCell(row, 1, block.primary, block.id, background, true)
-		p.setBlockCell(row, 2, block.secondary, block.id, background, true)
-		p.setBlockCell(row+1, 0, "", block.id, background, false)
-		p.setBlockCell(row+1, 1, block.detail, block.id, background, true)
-		p.setBlockCell(row+1, 2, "", block.id, background, true)
+		color := reachabilityColor(block.state, block.label, p.colors)
+		p.setBlockCell(row, 0, block.label, block.id, color, false)
+		p.setBlockCell(row, 1, block.primary, block.id, color, true)
+		p.setBlockCell(row, 2, block.secondary, block.id, color, true)
+		p.setBlockCell(row+1, 0, "", block.id, color, false)
+		p.setBlockCell(row+1, 1, block.detail, block.id, color, true)
+		p.setBlockCell(row+1, 2, "", block.id, color, true)
 
 		separator := strings.Repeat(p.separator(), 12)
 		cell := tview.NewTableCell(separator).
@@ -330,12 +351,11 @@ func (p *DirectionPanel) rebuild() {
 	p.SetOffset(old.Row, old.Column)
 }
 
-func (p *DirectionPanel) setBlockCell(row, column int, text, id string, background tcell.Color, expand bool) {
+func (p *DirectionPanel) setBlockCell(row, column int, text, id string, color tcell.Color, expand bool) {
 	cell := tview.NewTableCell(text).
 		SetReference(id).
-		SetBackgroundColor(background).
-		SetTextColor(tcell.ColorWhite)
-	cell.Transparent = false
+		SetTextColor(color)
+	cell.Transparent = true
 	if expand {
 		cell.SetExpansion(1)
 	}
@@ -413,12 +433,19 @@ func (p *DirectionPanel) selectBlock(index int, notify bool) {
 	p.changing = true
 	row := p.blockRows[index]
 	p.Select(row, 0)
-	background := p.GetCell(row, 0).BackgroundColor
-	p.SetSelectedStyle(tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(background).Bold(true))
+	p.applySelectionStyle()
 	p.changing = false
 	if notify && p.selected != nil {
 		p.selected(p.blocks[index].id)
 	}
+}
+
+func (p *DirectionPanel) applySelectionStyle() {
+	p.SetSelectedStyle(p.selectionStyle())
+}
+
+func (p *DirectionPanel) selectionStyle() tcell.Style {
+	return tcell.StyleDefault.Foreground(p.cursorFg).Background(p.cursorBg).Bold(true)
 }
 
 func (p *DirectionPanel) blockIndexAtRow(row int) int {
@@ -504,7 +531,7 @@ func primitiveState(primitive *netpol.PrimitiveResult) (state netpol.AccessState
 	return primitive.State, primitive.State.String()
 }
 
-func reachabilityBackground(state netpol.AccessState, label string, colors reachabilityColors) tcell.Color {
+func reachabilityColor(state netpol.AccessState, label string, colors reachabilityColors) tcell.Color {
 	if state == netpol.AccessAllowed && label == "Allowed" {
 		return colors.allowed
 	}
@@ -516,9 +543,9 @@ func reachabilityBackground(state netpol.AccessState, label string, colors reach
 
 func defaultReachabilityColors() reachabilityColors {
 	return reachabilityColors{
-		allowed:     reachabilityAllowedBackground,
-		disallowed:  reachabilityDeniedBackground,
-		partialData: reachabilityPartialBackground,
+		allowed:     reachabilityAllowedColor,
+		disallowed:  reachabilityDisallowedColor,
+		partialData: reachabilityPartialColor,
 	}
 }
 
@@ -703,7 +730,7 @@ func newApplicabilityTable(rows []netpol.ApplicabilityRow, colors reachabilityCo
 	}
 	for index := range rows {
 		row := &rows[index]
-		background := reachabilityBackground(row.EffectiveState, row.EffectiveState.String(), colors)
+		color := reachabilityColor(row.EffectiveState, row.EffectiveState.String(), colors)
 		opposite := fmt.Sprintf("%t", row.OppositeSideAllows)
 		if row.Primitive.Ref.Kind == netpol.PrimitiveCIDR {
 			opposite = "n/a"
@@ -717,10 +744,9 @@ func newApplicabilityTable(rows []netpol.ApplicabilityRow, colors reachabilityCo
 		}
 		for column, value := range values {
 			cell := tview.NewTableCell(value).
-				SetBackgroundColor(background).
-				SetTextColor(tcell.ColorWhite).
+				SetTextColor(color).
 				SetExpansion(1)
-			cell.Transparent = false
+			cell.Transparent = true
 			table.SetCell(index+1, column, cell)
 		}
 	}
@@ -728,15 +754,21 @@ func newApplicabilityTable(rows []netpol.ApplicabilityRow, colors reachabilityCo
 		if row < 1 || row >= table.GetRowCount() {
 			return
 		}
-		background := table.GetCell(row, 0).BackgroundColor
-		table.SetSelectedStyle(tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(background).Bold(true))
+		applyApplicabilitySelectionStyle(table)
 	})
 	if len(rows) > 0 {
 		table.Select(1, 0)
-		background := table.GetCell(1, 0).BackgroundColor
-		table.SetSelectedStyle(tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(background).Bold(true))
+		applyApplicabilitySelectionStyle(table)
 	}
 	return table
+}
+
+func applyApplicabilitySelectionStyle(table *tview.Table) {
+	styles := config.NewStyles().Table()
+	table.SetSelectedStyle(tcell.StyleDefault.
+		Foreground(styles.CursorFgColor.Color()).
+		Background(styles.CursorBgColor.Color()).
+		Bold(true))
 }
 
 func appendEvidence(b *strings.Builder, evidence []netpol.PolicyEvidence) {

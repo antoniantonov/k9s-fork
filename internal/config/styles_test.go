@@ -19,9 +19,9 @@ func TestNewStyle(t *testing.T) {
 	assert.Equal(t, config.Color("black"), s.K9s.Body.BgColor)
 	assert.Equal(t, config.Color("cadetblue"), s.K9s.Body.FgColor)
 	assert.Equal(t, config.Color("lightskyblue"), s.K9s.Frame.Status.NewColor)
-	assert.Equal(t, config.Color("darkgreen"), s.Reachability().AllowedColor)
-	assert.Equal(t, config.Color("darkred"), s.Reachability().DisallowedColor)
-	assert.Equal(t, config.Color("darkorange"), s.Reachability().PartialDataColor)
+	assert.Equal(t, config.Color("green"), s.Reachability().AllowedColor)
+	assert.Equal(t, config.Color("red"), s.Reachability().DisallowedColor)
+	assert.Equal(t, config.Color("orange"), s.Reachability().PartialDataColor)
 }
 
 func TestReachabilityStyleInvert(t *testing.T) {

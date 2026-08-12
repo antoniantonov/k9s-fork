@@ -294,7 +294,7 @@ func (c *Interpreter) NetworkPolicyGraphArgs() (NetworkPolicyGraphArgs, bool) {
 
 	kind, kindOK := c.args[kindKey]
 	name, nameOK := c.args[nameKey]
-	if !kindOK || !nameOK || kind == "" || name == "" {
+	if !kindOK && strings.TrimSpace(c.Args()) != "" {
 		return NetworkPolicyGraphArgs{}, false
 	}
 
@@ -307,7 +307,7 @@ func (c *Interpreter) NetworkPolicyGraphArgs() (NetworkPolicyGraphArgs, bool) {
 		Kind:      kind,
 		Name:      name,
 		Namespace: namespace,
-	}, true
+	}, (kindOK || strings.TrimSpace(c.Args()) == "") && (!nameOK || name != "")
 }
 
 // FilterArg returns the current filter if any.

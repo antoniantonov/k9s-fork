@@ -52,18 +52,21 @@ func TestDirectionPanelProjectionTitleAndFilter(t *testing.T) {
 	assert.Len(t, panel.blocks, 1, "filtering includes permission text")
 }
 
-func TestDirectionPanelAccessLabelsAndBackgrounds(t *testing.T) {
+func TestDirectionPanelAccessLabelsAndColors(t *testing.T) {
 	panel := NewDirectionPanel(netpol.Ingress)
 	panel.SetProjection(PrimitivesProjection).SetPrimitives(testPrimitives())
 
 	assert.Equal(t, "Allowed", panel.GetCell(0, 0).Text)
-	assert.Equal(t, reachabilityAllowedBackground, panel.GetCell(0, 0).BackgroundColor)
+	assert.Equal(t, reachabilityAllowedColor, panel.GetCell(0, 0).Color)
+	assert.True(t, panel.GetCell(0, 0).Transparent)
 	assert.Equal(t, "[PARTIAL 1/2]", panel.GetCell(3, 0).Text)
-	assert.Equal(t, reachabilityDeniedBackground, panel.GetCell(3, 0).BackgroundColor)
+	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(3, 0).Color)
+	assert.True(t, panel.GetCell(3, 0).Transparent)
 	assert.Equal(t, "Unknown", panel.GetCell(6, 0).Text)
 	assert.Equal(t, "[EMPTY]", panel.GetCell(9, 0).Text)
 	assert.Equal(t, "Partial Data", panel.GetCell(12, 0).Text)
-	assert.Equal(t, reachabilityPartialBackground, panel.GetCell(12, 0).BackgroundColor)
+	assert.Equal(t, reachabilityPartialColor, panel.GetCell(12, 0).Color)
+	assert.True(t, panel.GetCell(12, 0).Transparent)
 
 	style := config.Reachability{
 		AllowedColor:     config.Color("green"),
@@ -71,9 +74,9 @@ func TestDirectionPanelAccessLabelsAndBackgrounds(t *testing.T) {
 		PartialDataColor: config.Color("orange"),
 	}
 	panel.SetReachabilityStyle(style)
-	assert.Equal(t, style.AllowedColor.Color(), panel.GetCell(0, 0).BackgroundColor)
-	assert.Equal(t, style.DisallowedColor.Color(), panel.GetCell(3, 0).BackgroundColor)
-	assert.Equal(t, style.PartialDataColor.Color(), panel.GetCell(12, 0).BackgroundColor)
+	assert.Equal(t, style.AllowedColor.Color(), panel.GetCell(0, 0).Color)
+	assert.Equal(t, style.DisallowedColor.Color(), panel.GetCell(3, 0).Color)
+	assert.Equal(t, style.PartialDataColor.Color(), panel.GetCell(12, 0).Color)
 }
 
 func TestDirectionPanelNavigationSkipsSeparators(t *testing.T) {
@@ -145,7 +148,7 @@ func TestDirectionPanelScrollStateHelpers(t *testing.T) {
 	assert.Equal(t, rules[1].StableID(), restored.SelectedID())
 }
 
-func TestDirectionPanelSelectionCallbackAndStylePreserveBackground(t *testing.T) {
+func TestDirectionPanelSelectionCallbackAndStyleKeepsResultAsTextColor(t *testing.T) {
 	panel := NewDirectionPanel(netpol.Ingress)
 	panel.SetProjection(PrimitivesProjection).SetPrimitives(testPrimitives())
 	var selected string
@@ -153,7 +156,23 @@ func TestDirectionPanelSelectionCallbackAndStylePreserveBackground(t *testing.T)
 
 	panel.captureInput(tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
 	assert.Equal(t, testPrimitives()[1].StableID(), selected)
-	assert.Equal(t, reachabilityDeniedBackground, panel.GetCell(3, 0).BackgroundColor)
+	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(3, 0).Color)
+	assert.True(t, panel.GetCell(3, 0).Transparent)
+}
+
+func TestDirectionPanelSelectionStyleUsesTableCursorColors(t *testing.T) {
+	styles := config.NewStyles()
+	styles.K9s.Views.Table.CursorFgColor = config.Color("blue")
+	styles.K9s.Views.Table.CursorBgColor = config.Color("yellow")
+	panel := NewDirectionPanelWithStyle(netpol.Ingress, styles)
+	panel.SetProjection(PrimitivesProjection).SetPrimitives(testPrimitives())
+	panel.SelectID(testPrimitives()[1].StableID())
+
+	fg, bg, attrs := panel.selectionStyle().Decompose()
+	assert.Equal(t, styles.Table().CursorFgColor.Color(), fg)
+	assert.Equal(t, styles.Table().CursorBgColor.Color(), bg)
+	assert.Equal(t, tcell.AttrBold, attrs&tcell.AttrBold)
+	assert.NotEqual(t, panel.GetCell(3, 0).Color, bg)
 }
 
 func TestRuleStateLabels(t *testing.T) {
@@ -209,7 +228,8 @@ func TestPrimitiveAndRuleDetails(t *testing.T) {
 	assert.Equal(t, 2, details.Applicability.GetRowCount())
 	assert.Equal(t, "Primitive", details.Applicability.GetCell(0, 0).Text)
 	assert.Equal(t, "Partial", details.Applicability.GetCell(1, 3).Text)
-	assert.Equal(t, reachabilityDeniedBackground, details.Applicability.GetCell(1, 0).BackgroundColor)
+	assert.Equal(t, reachabilityDisallowedColor, details.Applicability.GetCell(1, 0).Color)
+	assert.True(t, details.Applicability.GetCell(1, 0).Transparent)
 }
 
 func TestPrimitiveDetailsUsesNormalizedState(t *testing.T) {
@@ -229,12 +249,14 @@ func TestPartialAndEmptyLabelsAreSearchableAndRemainDisallowedColored(t *testing
 	panel.SetRules(testRules()).SetFilter("[PARTIAL 1/2]")
 	require.Equal(t, 3, panel.GetRowCount())
 	assert.Equal(t, "[PARTIAL 1/2]", panel.GetCell(0, 0).Text)
-	assert.Equal(t, reachabilityDeniedBackground, panel.GetCell(0, 0).BackgroundColor)
+	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(0, 0).Color)
+	assert.True(t, panel.GetCell(0, 0).Transparent)
 
 	panel.SetFilter("[EMPTY]")
 	require.Equal(t, 3, panel.GetRowCount())
 	assert.Equal(t, "[EMPTY]", panel.GetCell(0, 0).Text)
-	assert.Equal(t, reachabilityDeniedBackground, panel.GetCell(0, 0).BackgroundColor)
+	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(0, 0).Color)
+	assert.True(t, panel.GetCell(0, 0).Transparent)
 }
 
 func TestDirectionPanelEmptyMessageIsNonSelectable(t *testing.T) {

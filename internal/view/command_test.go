@@ -8,7 +8,13 @@ import (
 	"github.com/derailed/k9s/internal/config"
 	"github.com/derailed/k9s/internal/dao"
 	"github.com/derailed/k9s/internal/view/cmd"
+	"github.com/derailed/k9s/internal/watch"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/informers"
 )
 
 func Test_viewMetaFor(t *testing.T) {
@@ -81,4 +87,146 @@ func Test_viewMetaFor(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveNetworkPolicyGraphArgsDefaults(t *testing.T) {
+	factory := &networkPolicyGraphTestFactory{
+		items: map[string][]runtime.Object{
+			client.NsGVR.String() + "|" + client.ClusterScope: {
+				npgObject("zeta"),
+				npgObject("alpha"),
+			},
+			client.PodGVR.String() + "|payments": {
+				npgObject("web"),
+				npgObject("api"),
+			},
+			client.DpGVR.String() + "|payments": {
+				npgObject("worker"),
+				npgObject("api"),
+			},
+			client.JobGVR.String() + "|payments": {
+				npgObject("z-cleanup"),
+				npgObject("a-cleanup"),
+			},
+		},
+	}
+
+	tests := map[string]struct {
+		args     cmd.NetworkPolicyGraphArgs
+		expected cmd.NetworkPolicyGraphArgs
+	}{
+		"bare defaults to first namespace": {
+			expected: cmd.NetworkPolicyGraphArgs{Kind: "namespace", Name: "alpha"},
+		},
+		"pod kind defaults in active namespace": {
+			args:     cmd.NetworkPolicyGraphArgs{Kind: "pod"},
+			expected: cmd.NetworkPolicyGraphArgs{Kind: "pod", Name: "api", Namespace: "payments"},
+		},
+		"deployment kind defaults in active namespace": {
+			args:     cmd.NetworkPolicyGraphArgs{Kind: "deployment"},
+			expected: cmd.NetworkPolicyGraphArgs{Kind: "deployment", Name: "api", Namespace: "payments"},
+		},
+		"job kind defaults in active namespace": {
+			args:     cmd.NetworkPolicyGraphArgs{Kind: "job"},
+			expected: cmd.NetworkPolicyGraphArgs{Kind: "job", Name: "a-cleanup", Namespace: "payments"},
+		},
+		"namespace kind defaults cluster-wide": {
+			args:     cmd.NetworkPolicyGraphArgs{Kind: "namespace"},
+			expected: cmd.NetworkPolicyGraphArgs{Kind: "namespace", Name: "alpha"},
+		},
+		"explicit subject does not list": {
+			args:     cmd.NetworkPolicyGraphArgs{Kind: "pod", Name: "api", Namespace: "default"},
+			expected: cmd.NetworkPolicyGraphArgs{Kind: "pod", Name: "api", Namespace: "default"},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			factory.calls = nil
+			got, err := resolveNetworkPolicyGraphArgs(factory, test.args, "payments")
+			require.NoError(t, err)
+			assert.Equal(t, test.expected, got)
+			if test.args.Name == "" {
+				require.Len(t, factory.calls, 1)
+				assert.True(t, factory.calls[0].wait)
+			} else {
+				assert.Empty(t, factory.calls)
+			}
+		})
+	}
+}
+
+func TestResolveNetworkPolicyGraphArgsErrors(t *testing.T) {
+	tests := map[string]struct {
+		args     cmd.NetworkPolicyGraphArgs
+		activeNS string
+		items    map[string][]runtime.Object
+		err      string
+	}{
+		"no namespaces": {
+			err: "no namespaces found",
+		},
+		"no pods in active namespace": {
+			args:     cmd.NetworkPolicyGraphArgs{Kind: "pod"},
+			activeNS: "payments",
+			err:      "no pods found in namespace payments",
+		},
+		"all namespaces active namespace": {
+			args:     cmd.NetworkPolicyGraphArgs{Kind: "deployment"},
+			activeNS: client.NamespaceAll,
+			err:      "a concrete namespace is required",
+		},
+		"unknown kind": {
+			args: cmd.NetworkPolicyGraphArgs{Kind: "service", Name: "api"},
+			err:  "unsupported",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			factory := &networkPolicyGraphTestFactory{items: test.items}
+			_, err := resolveNetworkPolicyGraphArgs(factory, test.args, test.activeNS)
+			require.ErrorContains(t, err, test.err)
+		})
+	}
+}
+
+type networkPolicyGraphTestFactory struct {
+	items map[string][]runtime.Object
+	calls []networkPolicyGraphListCall
+}
+
+type networkPolicyGraphListCall struct {
+	gvr  *client.GVR
+	ns   string
+	wait bool
+}
+
+func (networkPolicyGraphTestFactory) Client() client.Connection { return nil }
+
+func (networkPolicyGraphTestFactory) Get(*client.GVR, string, bool, labels.Selector) (runtime.Object, error) {
+	return nil, errors.New("not found")
+}
+
+func (f *networkPolicyGraphTestFactory) List(gvr *client.GVR, ns string, wait bool, _ labels.Selector) ([]runtime.Object, error) {
+	f.calls = append(f.calls, networkPolicyGraphListCall{gvr: gvr, ns: ns, wait: wait})
+	return f.items[gvr.String()+"|"+ns], nil
+}
+
+func (networkPolicyGraphTestFactory) ForResource(string, *client.GVR) (informers.GenericInformer, error) {
+	return nil, nil
+}
+
+func (networkPolicyGraphTestFactory) CanForResource(string, *client.GVR, []string) (informers.GenericInformer, error) {
+	return nil, nil
+}
+
+func (networkPolicyGraphTestFactory) WaitForCacheSync()      {}
+func (networkPolicyGraphTestFactory) DeleteForwarder(string) {}
+func (networkPolicyGraphTestFactory) Forwarders() watch.Forwarders {
+	return nil
+}
+
+func npgObject(name string) runtime.Object {
+	return &unstructured.Unstructured{Object: map[string]any{"metadata": map[string]any{"name": name}}}
 }

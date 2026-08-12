@@ -82,9 +82,9 @@ k9s:
       colonColor: white
       valueColor: papayawhip
     reachability:
-      allowedColor: darkgreen
-      disallowedColor: darkred
-      partialDataColor: darkorange
+      allowedColor: green
+      disallowedColor: red
+      partialDataColor: orange
     logs:
       fgColor: white
       bgColor: black
