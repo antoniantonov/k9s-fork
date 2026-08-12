@@ -45,8 +45,13 @@ func NewDeploy(gvr *client.GVR) ResourceViewer {
 
 func (d *Deploy) bindKeys(aa *ui.KeyActions) {
 	aa.Bulk(ui.KeyMap{
-		ui.KeyZ: ui.NewKeyAction("ReplicaSets", d.replicaSetsCmd, true),
+		ui.KeyZ:      ui.NewKeyAction("ReplicaSets", d.replicaSetsCmd, true),
+		ui.KeyShiftR: ui.NewKeyAction("Network Reachability", d.networkPolicyGraphCmd, true),
 	})
+}
+
+func (d *Deploy) networkPolicyGraphCmd(evt *tcell.EventKey) *tcell.EventKey {
+	return gotoNetworkPolicyGraph(d.App(), "deployment", d.GetTable().GetSelectedItem(), evt)
 }
 
 func (d *Deploy) logOptions(prev bool) (*dao.LogOptions, error) {

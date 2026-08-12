@@ -1,0 +1,6 @@
+k9s:
+  views:
+    reachability:
+      allowedColor: "#006b3c"
+      disallowedColor: "#a51c30"
+      partialDataColor: "#9c5700"

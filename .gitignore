@@ -26,3 +26,5 @@ kind
 /stresser
 __debug_bin*
 fg.yaml
+# Local kind cluster kubeconfigs (contain credentials)
+.kube/

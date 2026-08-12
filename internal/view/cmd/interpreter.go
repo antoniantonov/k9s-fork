@@ -190,6 +190,11 @@ func (c *Interpreter) IsXrayCmd() bool {
 	return xrayCmd.Has(c.cmd)
 }
 
+// IsNetworkPolicyGraphCmd returns true if a network policy graph cmd is detected.
+func (c *Interpreter) IsNetworkPolicyGraphCmd() bool {
+	return netpolGraphCmd.Has(c.cmd)
+}
+
 // IsContextCmd returns true if context cmd is detected.
 func (c *Interpreter) IsContextCmd() bool {
 	return contextCmd.Has(c.cmd)
@@ -279,6 +284,30 @@ func (c *Interpreter) XrayArgs() (cmd, namespace string, ok bool) {
 	}
 
 	return
+}
+
+// NetworkPolicyGraphArgs returns a normalized network policy graph subject.
+func (c *Interpreter) NetworkPolicyGraphArgs() (NetworkPolicyGraphArgs, bool) {
+	if !c.IsNetworkPolicyGraphCmd() {
+		return NetworkPolicyGraphArgs{}, false
+	}
+
+	kind, kindOK := c.args[kindKey]
+	name, nameOK := c.args[nameKey]
+	if !kindOK || !nameOK || kind == "" || name == "" {
+		return NetworkPolicyGraphArgs{}, false
+	}
+
+	namespace := c.args[nsKey]
+	if kind == netpolGraphKindNS && namespace != "" {
+		return NetworkPolicyGraphArgs{}, false
+	}
+
+	return NetworkPolicyGraphArgs{
+		Kind:      kind,
+		Name:      name,
+		Namespace: namespace,
+	}, true
 }
 
 // FilterArg returns the current filter if any.

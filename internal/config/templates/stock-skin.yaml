@@ -100,6 +100,10 @@ k9s:
       mainColor: white
       focusColor: aqua
       shortcutColor: aqua
+    reachability:
+      allowedColor: darkgreen
+      disallowedColor: darkred
+      partialDataColor: darkorange
     logs:
       fgColor: lightskyblue
       bgColor: black

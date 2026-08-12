@@ -433,6 +433,7 @@ K9s uses aliases to navigate most K8s resources.
 | Port forward                                                                    | `shift-f`                      | Pods/Services/Containers                                               |
 | Warp to namespace                                                               | `w`                            | When namespace column is available                                     |
 | Jump to owner                                                                   | `shift-j`                      | When resource has an owner                                             |
+| Open NetworkPolicy reachability                                                 | `shift-r`                      | Pods/Deployments/Jobs/Namespaces                                        |
 | Use/switch namespace                                                            | `u`                            | Namespace view                                                         |
 | UsedBy (show resources using this)                                              | `u`                            | ServiceAccounts/PVCs/Secrets/ConfigMaps                                |
 | Benchmark (run/stop)                                                            | `b`                            | Services/Port-forwards                                                 |
@@ -446,6 +447,141 @@ K9s uses aliases to navigate most K8s resources.
 | Restart resource                                                                | `r`                            | Deployments/DaemonSets/StatefulSets                                    |
 | Rollback resource                                                               | `ctrl-l`                       | ReplicaSets                                                            |
 | View ReplicaSets                                                                | `z`                            | Deployment view                                                        |
+
+---
+
+## NetworkPolicy Reachability
+
+The NetworkPolicy reachability view explains effective **Kubernetes
+NetworkPolicy** connectivity. Open it with:
+
+```text
+:netpolgraph <kind> <name> [namespace]
+:npgraph <kind> <name> [namespace]
+:npg <kind> <name> [namespace]
+```
+
+Supported subjects are `Pod`, `Deployment`, `Job`, and `Namespace` (kind names
+are case-insensitive). The aliases `po`, `pods`, `dp`, `deploy`,
+`deployments`, `jobs`, `ns`, and `namespaces` are also accepted. Pod,
+Deployment, and Job subjects accept an optional namespace; Namespace subjects
+use `:npg namespace <name>` without a namespace argument. For example:
+
+```text
+:npg pod api-7d8c9f default
+:npg deployment api default
+:npg job database-migration default
+:npg namespace payments
+```
+
+In Pod, Deployment, Job, and Namespace views, select a row and press `Shift-R`
+to open the same view for that resource. `:np` remains the normal
+NetworkPolicy resource alias.
+
+Ingress and egress are evaluated independently and are both visible initially.
+For ingress, the displayed primitive is the source; for egress, it is the
+destination. Effective reachability checks both the source's egress policy and
+the destination's ingress policy.
+
+Each direction has two display modes:
+
+- **Rules** lists the NetworkPolicy rules selecting the subject, including
+  synthetic unrestricted/default-deny explanations where applicable.
+- **Primitives** evaluates reachable CIDRs, Pods, Namespaces, Deployments, and
+  Jobs. Press `f` to enable or disable these five primitive kinds independently
+  for each direction.
+
+### Reachability key map
+
+| Key | Action |
+|---|---|
+| `i` | Show or hide ingress |
+| `e` | Show or hide egress |
+| `m` | Toggle Rules/Primitives for the focused direction |
+| `M` | Apply the focused mode to both visible directions |
+| `f` | Configure CIDR/Pod/Namespace/Deployment/Job filters |
+| `Up` / `Down` | Select the previous/next rule or primitive |
+| `PageUp` / `PageDown` | Move selection by one page |
+| `Home` / `End` | Select the first/last item |
+| `Left` / `Right` | Focus ingress/egress |
+| `Tab` / `Shift-Tab` | Cycle visible directions and details |
+| `Enter` | Expand aggregate details or focus rule applicability |
+| `y` | Open YAML for selected policy evidence |
+| `/` | Filter visible items by text |
+| `r` | Force a refresh |
+| `Esc` | Close a dialog/filter or return to the previous view |
+
+Hiding a direction does not discard its mode, filters, selection, or scroll
+position. If both directions are hidden, the subject and details remain
+visible.
+
+### Results and details
+
+Allowed primitives are green and disallowed primitives are red, but status
+labels always accompany color. Namespace, Deployment, and Job results are
+conservative aggregates: green means every evaluated pod pair is allowed.
+Zero allowed pairs are red; mixed results are red and labeled
+`[PARTIAL allowed/total]`; workloads without current pods are red and labeled
+`[EMPTY]`. Thus a partially reachable aggregate is never presented as fully
+allowed.
+
+The details panel shows the direction, subject and primitive, pod-pair coverage,
+ports, contributing policies/rule indexes, disallow explanations, and warnings.
+Rule details include selectors, peers, ports, and an applicability table for
+the enabled primitive kinds. A peer selector match alone is not sufficient:
+the table's effective result also checks policy on the opposite endpoint.
+NetworkPolicy has additive allow rules, not explicit deny rules, so a
+disallowed result means an endpoint is isolated and no matching allow rule was
+found.
+
+Named ports are resolved against destination pod container ports when they can
+be determined safely. Ambiguous named ports and unsupported semantics are
+reported as unknown rather than optimistically allowed. Numeric ports,
+protocols, ranges, `ipBlock.cidr`, and `except` are included in details.
+
+Results are capped to protect K9s on large clusters (the default cap is 5,000
+results). A truncated result is explicitly marked and must not be interpreted
+as a complete graph. Failed or forbidden list/watch requests similarly produce
+a **partial data** warning identifying incomplete resource data; partial-data
+results are distinct from a mixed `[PARTIAL x/y]` aggregate.
+
+Reachability colors follow the active skin and can be customized:
+
+```yaml
+k9s:
+  views:
+    reachability:
+      allowedColor: darkgreen
+      disallowedColor: darkred
+      partialDataColor: darkorange
+```
+
+### RBAC
+
+A complete graph requires cluster-wide `get`, `list`, and `watch` access to:
+
+- core `pods` and `namespaces`;
+- `networking.k8s.io/networkpolicies`;
+- `apps/deployments` and `apps/replicasets`;
+- `batch/jobs`.
+
+Access to the selected subject is also required. Namespace-scoped or otherwise
+incomplete RBAC can still produce useful results, but they are labeled partial
+data and must not be treated as complete.
+
+### Limitations
+
+This view models the standard `networking.k8s.io/v1` NetworkPolicy API; it does
+not prove packet delivery. Enforcement and some edge cases depend on the
+cluster's CNI plugin. In particular, existing connections during policy
+changes, `hostNetwork` and node-local traffic, IP blocks before/after NAT, and
+networks outside standard NetworkPolicy enforcement can differ by
+implementation.
+
+Service meshes, application authorization, DNS, routes, load balancers, node
+or cloud firewalls, flow logs, and vendor policy APIs such as
+CiliumNetworkPolicy, Calico GlobalNetworkPolicy, and AdminNetworkPolicy are not
+evaluated.
 
 ---
 

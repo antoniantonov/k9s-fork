@@ -167,6 +167,18 @@ func TestFlagsNew(t *testing.T) {
 			i:  NewInterpreter("apply -f"),
 			ll: args{},
 		},
+
+		"netpol-graph": {
+			i:  NewInterpreter("npg"),
+			aa: []string{"deployments", "api", "payments"},
+			ll: args{kindKey: "deployment", nameKey: "api", nsKey: "payments"},
+		},
+
+		"netpol-graph-invalid": {
+			i:  NewInterpreter("npg"),
+			aa: []string{"pod"},
+			ll: args{},
+		},
 	}
 
 	for k := range uu {

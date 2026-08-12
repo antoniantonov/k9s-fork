@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: netpol-disallowed
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: netpol-disallowed
+  labels:
+    app: client
+spec:
+  containers:
+    - name: client
+      image: registry.k8s.io/pause:3.10
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api
+  namespace: netpol-disallowed
+  labels:
+    app: api
+spec:
+  containers:
+    - name: api
+      image: registry.k8s.io/pause:3.10
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-api-ingress
+  namespace: netpol-disallowed
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+    - Ingress
+  ingress: []

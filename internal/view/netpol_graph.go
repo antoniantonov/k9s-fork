@@ -1,0 +1,854 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
+package view
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/derailed/k9s/internal"
+	"github.com/derailed/k9s/internal/client"
+	"github.com/derailed/k9s/internal/config"
+	"github.com/derailed/k9s/internal/model"
+	"github.com/derailed/k9s/internal/netpol"
+	"github.com/derailed/k9s/internal/slogs"
+	"github.com/derailed/k9s/internal/ui"
+	"github.com/derailed/k9s/internal/view/cmd"
+	"github.com/derailed/tcell/v2"
+	"github.com/derailed/tview"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
+)
+
+const (
+	netPolGraphTitle      = "NetworkPolicy Reachability"
+	netPolKindsDialogPage = "netpol-primitive-kinds"
+	netPolSearchPage      = "netpol-search"
+)
+
+type netPolGraphModel interface {
+	SetSubject(netpol.SubjectRef)
+	Subject() netpol.SubjectRef
+	AddListener(model.NetPolGraphListener)
+	RemoveListener(model.NetPolGraphListener)
+	Watch(context.Context) error
+	Stop()
+	Refresh(context.Context) error
+	Peek() (netpol.SubjectResult, bool)
+	LastRefresh() model.NetPolGraphRefresh
+}
+
+type reachabilityModeState struct {
+	scroll ui.ReachabilityScrollState
+	filter string
+}
+
+type reachabilityDirectionState struct {
+	mode    ui.ReachabilityProjection
+	kinds   sets.Set[netpol.PrimitiveKind]
+	visible bool
+	states  map[ui.ReachabilityProjection]reachabilityModeState
+}
+
+type reachabilityFocus uint8
+
+const (
+	focusIngress reachabilityFocus = iota
+	focusEgress
+	focusDetails
+	focusApplicability
+)
+
+// NetworkPolicyGraph displays evaluated ingress and egress NetworkPolicy reachability.
+type NetworkPolicyGraph struct {
+	*tview.Flex
+
+	app         *App
+	model       netPolGraphModel
+	evaluator   netpol.Evaluator
+	subject     netpol.SubjectRef
+	command     *cmd.Interpreter
+	actions     *ui.KeyActions
+	header      *tview.TextView
+	directions  *tview.Flex
+	details     *tview.Flex
+	placeholder *tview.TextView
+	detailItem  tview.Primitive
+	panels      map[netpol.Direction]*ui.DirectionPanel
+	state       map[netpol.Direction]*reachabilityDirectionState
+	focus       netpol.Direction
+	focusTarget reachabilityFocus
+	result      netpol.SubjectResult
+	haveResult  bool
+	lastError   error
+	cancel      context.CancelFunc
+	listening   bool
+	mx          sync.Mutex
+}
+
+var (
+	_ model.Component           = (*NetworkPolicyGraph)(nil)
+	_ Viewer                    = (*NetworkPolicyGraph)(nil)
+	_ model.NetPolGraphListener = (*NetworkPolicyGraph)(nil)
+	_ config.StyleListener      = (*NetworkPolicyGraph)(nil)
+)
+
+// NewNetworkPolicyGraph creates a complete reachability viewer for subject.
+func NewNetworkPolicyGraph(subject netpol.SubjectRef) *NetworkPolicyGraph {
+	evaluator := netpol.NewEvaluator()
+	graph := model.NewNetPolGraph(evaluator)
+	graph.SetSubject(subject)
+	return newNetworkPolicyGraph(subject, evaluator, graph)
+}
+
+func newNetworkPolicyGraph(subject netpol.SubjectRef, evaluator netpol.Evaluator, graph netPolGraphModel) *NetworkPolicyGraph {
+	v := &NetworkPolicyGraph{
+		Flex:        tview.NewFlex().SetDirection(tview.FlexRow),
+		model:       graph,
+		evaluator:   evaluator,
+		subject:     subject,
+		actions:     ui.NewKeyActions(),
+		header:      tview.NewTextView().SetDynamicColors(true),
+		directions:  tview.NewFlex(),
+		details:     tview.NewFlex(),
+		panels:      make(map[netpol.Direction]*ui.DirectionPanel, 2),
+		state:       make(map[netpol.Direction]*reachabilityDirectionState, 2),
+		focus:       netpol.Ingress,
+		focusTarget: focusIngress,
+	}
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		v.state[direction] = &reachabilityDirectionState{
+			mode:    ui.RulesProjection,
+			kinds:   netpol.AllPrimitiveKinds(),
+			visible: true,
+			states: map[ui.ReachabilityProjection]reachabilityModeState{
+				ui.RulesProjection:      {},
+				ui.PrimitivesProjection: {},
+			},
+		}
+		panel := ui.NewDirectionPanel(direction)
+		panel.SetSelectionChangedFunc(func(string) {
+			v.savePanelState(direction)
+			v.updateDetails(direction)
+		})
+		v.panels[direction] = panel
+	}
+	v.AddItem(v.header, 2, 0, false)
+	v.AddItem(v.directions, 0, 3, true)
+	v.AddItem(v.details, 0, 2, false)
+	v.bindKeys()
+	v.SetInputCapture(v.keyboard)
+	v.rebuildDirections()
+	v.updateHeader()
+	v.showMessage("Waiting for NetworkPolicy evaluation...")
+	return v
+}
+
+// Init initializes the component.
+func (v *NetworkPolicyGraph) Init(ctx context.Context) error {
+	app, err := extractApp(ctx)
+	if err != nil {
+		return err
+	}
+	v.app = app
+	v.model.SetSubject(v.subject)
+	v.ensureListeners()
+	v.StylesChanged(app.Styles)
+	v.applyASCII(app.Config.K9s.UI.NoIcons)
+	if result, ok := v.model.Peek(); ok {
+		v.applyResult(&result)
+	}
+	return nil
+}
+
+func (v *NetworkPolicyGraph) ensureListeners() {
+	if v.listening || v.app == nil {
+		return
+	}
+	v.model.AddListener(v)
+	v.app.Styles.AddListener(v)
+	v.listening = true
+}
+
+// Start starts the graph watch loop.
+func (v *NetworkPolicyGraph) Start() {
+	v.Stop()
+	v.ensureListeners()
+	ctx := context.WithValue(context.Background(), internal.KeyFactory, v.app.factory)
+	ctx, v.cancel = context.WithCancel(ctx)
+	go func() {
+		if err := v.model.Watch(ctx); err != nil && ctx.Err() == nil {
+			slog.Warn("NetworkPolicy graph watch failed", slogs.Error, err)
+		}
+	}()
+}
+
+// Stop terminates graph updates and releases listeners.
+func (v *NetworkPolicyGraph) Stop() {
+	v.mx.Lock()
+	if v.cancel != nil {
+		v.cancel()
+		v.cancel = nil
+	}
+	v.mx.Unlock()
+	if v.listening {
+		v.model.RemoveListener(v)
+		if v.app != nil {
+			v.app.Styles.RemoveListener(v)
+		}
+		v.listening = false
+	}
+	v.model.Stop()
+}
+
+// Refresh immediately reevaluates the graph.
+func (v *NetworkPolicyGraph) Refresh() {
+	if v.app == nil {
+		return
+	}
+	ctx := context.WithValue(context.Background(), internal.KeyFactory, v.app.factory)
+	go func() {
+		if err := v.model.Refresh(ctx); err != nil {
+			slog.Warn("NetworkPolicy graph refresh failed", slogs.Error, err)
+		}
+	}()
+}
+
+// NetPolGraphChanged handles model updates on the UI queue.
+//
+//nolint:gocritic // Value parameter implements the public model listener contract.
+func (v *NetworkPolicyGraph) NetPolGraphChanged(result netpol.SubjectResult) {
+	if v.app == nil {
+		v.applyResult(&result)
+		return
+	}
+	v.app.QueueUpdateDraw(func() { v.applyResult(&result) })
+}
+
+// NetPolGraphFailed reports failures while retaining any usable partial result.
+func (v *NetworkPolicyGraph) NetPolGraphFailed(err error) {
+	if v.app == nil {
+		v.applyError(err)
+		return
+	}
+	v.app.QueueUpdateDraw(func() { v.applyError(err) })
+}
+
+func (v *NetworkPolicyGraph) applyError(err error) {
+	v.lastError = err
+	v.updateHeader()
+	if !v.haveResult {
+		v.showMessage("NetworkPolicy evaluation failed:\n" + err.Error())
+	} else {
+		v.updateDetails(v.focus)
+	}
+}
+
+func (v *NetworkPolicyGraph) applyResult(result *netpol.SubjectResult) {
+	v.result, v.haveResult, v.lastError = *result, true, nil
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		v.loadPanel(direction)
+	}
+	v.updateHeader()
+	v.updateDetails(v.focus)
+}
+
+func (v *NetworkPolicyGraph) loadPanel(direction netpol.Direction) {
+	panel, state := v.panels[direction], v.state[direction]
+	modeState := state.states[state.mode]
+	panel.SetProjection(state.mode).
+		SetEnabledKinds(state.kinds).
+		SetFilter(modeState.filter)
+	if state.mode == ui.PrimitivesProjection && len(state.kinds) == 0 {
+		panel.SetData(nil, nil).SetEmptyMessage("No primitive kinds selected. Press f to enable kinds.")
+	} else {
+		panel.SetEmptyMessage("No reachability results match this view.").
+			SetData(
+				v.evaluator.Rules(v.result, direction),
+				v.evaluator.Primitives(v.result, direction, state.kinds),
+			)
+	}
+	panel.RestoreScrollState(modeState.scroll)
+}
+
+func (v *NetworkPolicyGraph) savePanelState(direction netpol.Direction) {
+	state := v.state[direction]
+	modeState := state.states[state.mode]
+	modeState.scroll = v.panels[direction].ScrollState()
+	modeState.filter = v.panels[direction].Filter()
+	state.states[state.mode] = modeState
+}
+
+func (v *NetworkPolicyGraph) rebuildDirections() {
+	v.directions.Clear()
+	visible := 0
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		if v.state[direction].visible {
+			v.directions.AddItem(v.panels[direction], 0, 1, direction == v.focus)
+			visible++
+		}
+	}
+	if visible == 0 {
+		v.placeholder = tview.NewTextView().
+			SetTextAlign(tview.AlignCenter).
+			SetText("Both directions are hidden. Press i for ingress or e for egress.")
+		v.placeholder.SetBorder(true).SetTitle(" Directions ")
+		v.directions.AddItem(v.placeholder, 0, 1, true)
+		return
+	}
+	v.placeholder = nil
+	if !v.state[v.focus].visible {
+		v.focus = v.firstVisibleDirection()
+		if v.focus == netpol.Ingress {
+			v.focusTarget = focusIngress
+		} else {
+			v.focusTarget = focusEgress
+		}
+	}
+	if v.app != nil {
+		v.app.SetFocus(v.panels[v.focus])
+	}
+}
+
+func (v *NetworkPolicyGraph) firstVisibleDirection() netpol.Direction {
+	if v.state[netpol.Ingress].visible {
+		return netpol.Ingress
+	}
+	return netpol.Egress
+}
+
+func (v *NetworkPolicyGraph) toggleDirection(direction netpol.Direction) {
+	v.savePanelState(direction)
+	v.state[direction].visible = !v.state[direction].visible
+	if v.state[direction].visible {
+		v.focus = direction
+		v.loadPanel(direction)
+	}
+	v.rebuildDirections()
+	v.updateHeader()
+	v.updateDetails(v.focus)
+}
+
+func (v *NetworkPolicyGraph) switchMode(direction netpol.Direction) {
+	v.savePanelState(direction)
+	state := v.state[direction]
+	if state.mode == ui.RulesProjection {
+		state.mode = ui.PrimitivesProjection
+	} else {
+		state.mode = ui.RulesProjection
+	}
+	v.loadPanel(direction)
+	v.updateDetails(direction)
+}
+
+func (v *NetworkPolicyGraph) switchVisibleModesFromFocus() {
+	v.switchMode(v.focus)
+	mode := v.state[v.focus].mode
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		if direction == v.focus || !v.state[direction].visible || v.state[direction].mode == mode {
+			continue
+		}
+		v.savePanelState(direction)
+		v.state[direction].mode = mode
+		v.loadPanel(direction)
+	}
+	v.updateDetails(v.focus)
+}
+
+func (v *NetworkPolicyGraph) focusDirection(direction netpol.Direction) {
+	if !v.state[direction].visible {
+		return
+	}
+	v.focus = direction
+	if direction == netpol.Ingress {
+		v.focusTarget = focusIngress
+	} else {
+		v.focusTarget = focusEgress
+	}
+	if v.app != nil {
+		v.app.SetFocus(v.panels[direction])
+	}
+	v.updateDetails(direction)
+}
+
+func (v *NetworkPolicyGraph) cycleFocus(reverse bool) {
+	targets := v.focusTargets()
+	if len(targets) < 2 {
+		return
+	}
+	current := 0
+	for index, target := range targets {
+		if target == v.focusTarget {
+			current = index
+			break
+		}
+	}
+	step := 1
+	if reverse {
+		step = -1
+	}
+	v.applyFocusTarget(targets[(current+step+len(targets))%len(targets)])
+}
+
+func (v *NetworkPolicyGraph) focusTargets() []reachabilityFocus {
+	var targets []reachabilityFocus
+	if v.state[netpol.Ingress].visible {
+		targets = append(targets, focusIngress)
+	}
+	if v.state[netpol.Egress].visible {
+		targets = append(targets, focusEgress)
+	}
+	if v.detailItem != nil && v.panels[v.focus].SelectedID() != "" {
+		targets = append(targets, focusDetails)
+		if detail, ok := v.detailItem.(*ui.RuleDetails); ok && detail.Applicability.GetRowCount() > 1 {
+			targets = append(targets, focusApplicability)
+		}
+	}
+	return targets
+}
+
+func (v *NetworkPolicyGraph) applyFocusTarget(target reachabilityFocus) {
+	v.focusTarget = target
+	switch target {
+	case focusIngress:
+		v.focus = netpol.Ingress
+	case focusEgress:
+		v.focus = netpol.Egress
+	case focusDetails:
+		if v.app != nil {
+			if detail, ok := v.detailItem.(*ui.RuleDetails); ok {
+				v.app.SetFocus(detail.Text)
+			} else {
+				v.app.SetFocus(v.detailItem)
+			}
+		}
+		return
+	case focusApplicability:
+		if v.app != nil {
+			if detail, ok := v.detailItem.(*ui.RuleDetails); ok {
+				v.app.SetFocus(detail.Applicability)
+			}
+		}
+		return
+	}
+	if v.app != nil {
+		v.app.SetFocus(v.panels[v.focus])
+	}
+	v.updateDetails(v.focus)
+}
+
+func (v *NetworkPolicyGraph) updateHeader() {
+	subject := v.subject
+	path := subject.Name
+	if subject.Namespace != "" {
+		path = subject.Namespace + "/" + subject.Name
+	}
+	status := ""
+	if v.haveResult && v.result.Truncated {
+		status += fmt.Sprintf(" | TRUNCATED at %d results", v.result.ResultLimit)
+	}
+	warnings := len(v.result.Warnings)
+	if refresh := v.model.LastRefresh(); len(refresh.Incomplete) > 0 {
+		warnings += len(refresh.Incomplete)
+	}
+	if warnings > 0 {
+		status += fmt.Sprintf(" | PARTIAL DATA (%d warning(s))", warnings)
+	}
+	if v.lastError != nil {
+		status += " | ERROR: " + v.lastError.Error()
+	}
+	v.header.SetText(fmt.Sprintf(
+		" %s %s | i:Ingress[%s] e:Egress[%s] m:Mode M:Both f:Kinds /:Search r:Refresh%s",
+		subject.Kind, path, onOff(v.state[netpol.Ingress].visible),
+		onOff(v.state[netpol.Egress].visible), status,
+	))
+}
+
+func onOff(value bool) string {
+	if value {
+		return "on"
+	}
+	return "off"
+}
+
+func (v *NetworkPolicyGraph) updateDetails(direction netpol.Direction) {
+	v.details.Clear()
+	v.detailItem = nil
+	if !v.haveResult || !v.state[direction].visible {
+		v.showMessage("No selected reachability result.")
+		return
+	}
+	id := v.panels[direction].SelectedID()
+	if id == "" {
+		v.showMessage("No selected reachability result.")
+		return
+	}
+	var detail tview.Primitive
+	if v.state[direction].mode == ui.RulesProjection {
+		rule, ok := v.selectedRule(direction, id)
+		if !ok {
+			v.showMessage("Selected rule is no longer available.")
+			return
+		}
+		rows := v.evaluator.RuleApplicability(v.result, direction, rule.ID, v.state[direction].kinds)
+		ruleDetail := ui.NewRuleDetailsWithStyle(rule, rows, v.reachabilityStyle())
+		var text strings.Builder
+		text.WriteString(v.detailPrefix(direction))
+		text.WriteString("\n")
+		text.WriteString(ui.RuleDetailsText(rule))
+		v.appendResultWarnings(&text)
+		ruleDetail.Text.SetText(strings.TrimSpace(text.String()))
+		detail = ruleDetail
+	} else {
+		primitive, ok := v.selectedPrimitive(direction, id)
+		if !ok {
+			v.showMessage("Selected primitive is no longer available.")
+			return
+		}
+		text := ui.NewPrimitiveDetails(primitive)
+		text.SetText(v.primitiveDetails(direction, &primitive))
+		detail = text
+	}
+	v.details.AddItem(detail, 0, 1, false)
+	v.detailItem = detail
+	if v.focusTarget == focusDetails || v.focusTarget == focusApplicability {
+		v.applyFocusTarget(v.focusTarget)
+	}
+}
+
+func (v *NetworkPolicyGraph) detailPrefix(direction netpol.Direction) string {
+	ref := v.result.Subject.Ref
+	return fmt.Sprintf("Direction: %s\nSubject: %s %s/%s\nSubject UID: %s",
+		direction, ref.Kind, ref.Namespace, ref.Name, valueOrUnknown(string(ref.UID)))
+}
+
+func (v *NetworkPolicyGraph) primitiveDetails(direction netpol.Direction, primitive *netpol.PrimitiveResult) string {
+	ref := primitive.Ref
+	identity := ref.Name
+	if ref.Namespace != "" {
+		identity = ref.Namespace + "/" + ref.Name
+	}
+	if ref.Kind == netpol.PrimitiveCIDR {
+		identity = ref.CIDR
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\nIdentity: %s %s\nUID: %s\nCoverage: %d/%d pairs\n",
+		v.detailPrefix(direction), ref.Kind, valueOrUnknown(identity),
+		valueOrUnknown(string(ref.UID)), primitive.AllowedPairs, primitive.TotalPairs)
+	b.WriteString(ui.PrimitiveDetailsText(*primitive))
+	v.appendResultWarnings(&b)
+	return strings.TrimSpace(b.String())
+}
+
+func (v *NetworkPolicyGraph) appendResultWarnings(b *strings.Builder) {
+	if v.result.Truncated {
+		fmt.Fprintf(b, "\nWarning: results truncated at %d entries\n", v.result.ResultLimit)
+	}
+	for _, warning := range v.result.Warnings {
+		fmt.Fprintf(b, "\nWarning: %s", warning)
+	}
+	if refresh := v.model.LastRefresh(); len(refresh.Incomplete) > 0 {
+		keys := make([]string, 0, len(refresh.Incomplete))
+		for resource := range refresh.Incomplete {
+			keys = append(keys, resource)
+		}
+		slices.Sort(keys)
+		for _, resource := range keys {
+			fmt.Fprintf(b, "\nWarning: partial %s data: %v", resource, refresh.Incomplete[resource])
+		}
+	}
+}
+
+func valueOrUnknown(value string) string {
+	if value == "" {
+		return "<unknown>"
+	}
+	return value
+}
+
+func (v *NetworkPolicyGraph) showMessage(message string) {
+	v.details.Clear()
+	text := tview.NewTextView().SetText(message).SetWrap(true)
+	text.SetBorder(true).SetTitle(" Details ")
+	v.details.AddItem(text, 0, 1, false)
+	v.detailItem = text
+}
+
+func (v *NetworkPolicyGraph) selectedRule(direction netpol.Direction, id string) (netpol.RuleResult, bool) {
+	rules := v.evaluator.Rules(v.result, direction)
+	for index := range rules {
+		rule := &rules[index]
+		if rule.StableID() == id {
+			return *rule, true
+		}
+	}
+	return netpol.RuleResult{}, false
+}
+
+func (v *NetworkPolicyGraph) selectedPrimitive(direction netpol.Direction, id string) (netpol.PrimitiveResult, bool) {
+	primitives := v.evaluator.Primitives(v.result, direction, v.state[direction].kinds)
+	for index := range primitives {
+		primitive := &primitives[index]
+		if primitive.StableID() == id {
+			return *primitive, true
+		}
+	}
+	return netpol.PrimitiveResult{}, false
+}
+
+func (v *NetworkPolicyGraph) openKindsDialog() {
+	if v.app == nil || !v.state[v.focus].visible {
+		return
+	}
+	dialog := ui.NewPrimitiveKindDialog(v.state[v.focus].kinds, func(kinds sets.Set[netpol.PrimitiveKind]) {
+		v.app.Content.RemovePage(netPolKindsDialogPage)
+		v.state[v.focus].kinds = kinds
+		v.loadPanel(v.focus)
+		v.updateDetails(v.focus)
+	}, func() {
+		v.app.Content.RemovePage(netPolKindsDialogPage)
+		v.app.SetFocus(v.panels[v.focus])
+	})
+	v.app.Content.AddPage(netPolKindsDialogPage, centered(dialog, 48, 16), false, true)
+}
+
+func (v *NetworkPolicyGraph) openSearchDialog() {
+	if v.app == nil || !v.state[v.focus].visible {
+		return
+	}
+	input := tview.NewInputField().
+		SetLabel("Filter: ").
+		SetText(v.state[v.focus].states[v.state[v.focus].mode].filter)
+	form := tview.NewForm().
+		AddFormItem(input).
+		AddButton("Apply", func() {
+			v.applySearch(input.GetText())
+			v.app.Content.RemovePage(netPolSearchPage)
+		}).
+		AddButton("Clear", func() {
+			v.applySearch("")
+			v.app.Content.RemovePage(netPolSearchPage)
+		}).
+		AddButton("Cancel", func() {
+			v.app.Content.RemovePage(netPolSearchPage)
+			v.app.SetFocus(v.panels[v.focus])
+		})
+	form.SetCancelFunc(func() {
+		v.app.Content.RemovePage(netPolSearchPage)
+		v.app.SetFocus(v.panels[v.focus])
+	})
+	form.SetBorder(true).SetTitle(" Reachability Search ")
+	v.app.Content.AddPage(netPolSearchPage, centered(form, 58, 9), false, true)
+}
+
+func centered(primitive tview.Primitive, width, height int) tview.Primitive {
+	return tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(primitive, height, 0, true).
+			AddItem(nil, 0, 1, false), width, 0, true).
+		AddItem(nil, 0, 1, false)
+}
+
+func (v *NetworkPolicyGraph) applySearch(filter string) {
+	state := v.state[v.focus]
+	modeState := state.states[state.mode]
+	modeState.filter = filter
+	state.states[state.mode] = modeState
+	v.panels[v.focus].SetFilter(filter)
+	v.savePanelState(v.focus)
+	v.updateDetails(v.focus)
+	if v.app != nil {
+		v.app.SetFocus(v.panels[v.focus])
+	}
+}
+
+func (v *NetworkPolicyGraph) yamlCmd(_ *tcell.EventKey) *tcell.EventKey {
+	namespace, name, ok := v.selectedPolicy()
+	if !ok {
+		if v.app != nil {
+			v.app.Flash().Errf("selected item does not reference a NetworkPolicy")
+		}
+		return nil
+	}
+	path := name
+	if namespace != "" {
+		path = namespace + "/" + name
+	}
+	live := NewLiveView(v.app, yamlAction, model.NewYAML(client.NpGVR, path))
+	if err := v.app.inject(live, false); err != nil {
+		v.app.Flash().Err(err)
+	}
+	return nil
+}
+
+func (v *NetworkPolicyGraph) selectedPolicy() (namespace, name string, found bool) {
+	id := v.panels[v.focus].SelectedID()
+	if v.state[v.focus].mode == ui.RulesProjection {
+		rule, ok := v.selectedRule(v.focus, id)
+		return rule.ID.PolicyNamespace, rule.ID.PolicyName, ok && rule.ID.PolicyName != ""
+	}
+	primitive, ok := v.selectedPrimitive(v.focus, id)
+	if !ok || len(primitive.Evidence) == 0 {
+		return "", "", false
+	}
+	idRef := primitive.Evidence[0].RuleID
+	return idRef.PolicyNamespace, idRef.PolicyName, idRef.PolicyName != ""
+}
+
+func (v *NetworkPolicyGraph) enterCmd(evt *tcell.EventKey) *tcell.EventKey {
+	if v.focusTarget == focusIngress || v.focusTarget == focusEgress {
+		v.applyFocusTarget(focusDetails)
+		return nil
+	}
+	if v.focusTarget == focusDetails {
+		if detail, ok := v.detailItem.(*ui.RuleDetails); ok && detail.Applicability.GetRowCount() > 1 {
+			v.applyFocusTarget(focusApplicability)
+			return nil
+		}
+	}
+	return evt
+}
+
+func (v *NetworkPolicyGraph) openResourceCmd(evt *tcell.EventKey) *tcell.EventKey {
+	if v.app == nil {
+		return evt
+	}
+	if namespace, name, ok := v.selectedPolicy(); v.state[v.focus].mode == ui.RulesProjection && ok {
+		v.app.gotoResource("networkpolicies", namespace+"/"+name, false, true)
+		return nil
+	}
+	primitive, ok := v.selectedPrimitive(v.focus, v.panels[v.focus].SelectedID())
+	if !ok {
+		return evt
+	}
+	command, path := primitiveCommand(&primitive.Ref)
+	if command == "" {
+		v.app.Flash().Errf("CIDR primitives are not Kubernetes resources")
+		return nil
+	}
+	v.app.gotoResource(command, path, false, true)
+	return nil
+}
+
+func primitiveCommand(ref *netpol.PrimitiveRef) (command, resourcePath string) {
+	path := ref.Name
+	if ref.Namespace != "" {
+		path = ref.Namespace + "/" + ref.Name
+	}
+	switch ref.Kind {
+	case netpol.PrimitivePod:
+		return "pods", path
+	case netpol.PrimitiveNamespace:
+		return "namespaces", ref.Name
+	case netpol.PrimitiveDeployment:
+		return "deployments", path
+	case netpol.PrimitiveJob:
+		return "jobs", path
+	default:
+		return "", ""
+	}
+}
+
+func (v *NetworkPolicyGraph) bindKeys() {
+	v.actions.Bulk(ui.KeyMap{
+		ui.KeyI: ui.NewKeyAction("Toggle Ingress", func(*tcell.EventKey) *tcell.EventKey { v.toggleDirection(netpol.Ingress); return nil }, true),
+		ui.KeyE: ui.NewKeyAction("Toggle Egress", func(*tcell.EventKey) *tcell.EventKey { v.toggleDirection(netpol.Egress); return nil }, true),
+		ui.KeyM: ui.NewKeyAction("Toggle Mode", func(*tcell.EventKey) *tcell.EventKey { v.switchMode(v.focus); return nil }, true),
+		ui.KeyShiftM: ui.NewKeyAction("Set Visible Modes", func(*tcell.EventKey) *tcell.EventKey {
+			v.switchVisibleModesFromFocus()
+			return nil
+		}, true),
+		ui.KeyF:        ui.NewKeyAction("Primitive Kinds", func(*tcell.EventKey) *tcell.EventKey { v.openKindsDialog(); return nil }, true),
+		ui.KeyO:        ui.NewKeyAction("Open Resource", v.openResourceCmd, true),
+		ui.KeySlash:    ui.NewKeyAction("Search", func(*tcell.EventKey) *tcell.EventKey { v.openSearchDialog(); return nil }, true),
+		ui.KeyR:        ui.NewKeyAction("Refresh", func(*tcell.EventKey) *tcell.EventKey { v.Refresh(); return nil }, true),
+		ui.KeyY:        ui.NewKeyAction("YAML", v.yamlCmd, true),
+		tcell.KeyEnter: ui.NewKeyAction("Focus Details", v.enterCmd, true),
+		tcell.KeyEscape: ui.NewKeyAction("Back", func(evt *tcell.EventKey) *tcell.EventKey {
+			if v.app != nil {
+				return v.app.PrevCmd(evt)
+			}
+			return evt
+		}, false),
+		tcell.KeyLeft:    ui.NewKeyAction("Focus Ingress", func(*tcell.EventKey) *tcell.EventKey { v.focusDirection(netpol.Ingress); return nil }, false),
+		tcell.KeyRight:   ui.NewKeyAction("Focus Egress", func(*tcell.EventKey) *tcell.EventKey { v.focusDirection(netpol.Egress); return nil }, false),
+		tcell.KeyTAB:     ui.NewKeyAction("Next Panel", func(*tcell.EventKey) *tcell.EventKey { v.cycleFocus(false); return nil }, false),
+		tcell.KeyBacktab: ui.NewKeyAction("Previous Panel", func(*tcell.EventKey) *tcell.EventKey { v.cycleFocus(true); return nil }, false),
+	})
+}
+
+func (v *NetworkPolicyGraph) keyboard(evt *tcell.EventKey) *tcell.EventKey {
+	if action, ok := v.actions.Get(ui.AsKey(evt)); ok {
+		return action.Action(evt)
+	}
+	return evt
+}
+
+func (v *NetworkPolicyGraph) applyASCII(ascii bool) {
+	for _, panel := range v.panels {
+		panel.SetASCII(ascii)
+	}
+}
+
+func (v *NetworkPolicyGraph) reachabilityStyle() config.Reachability {
+	if v.app == nil {
+		return config.Reachability{}
+	}
+	return v.app.Styles.Reachability()
+}
+
+// StylesChanged applies reachability and frame skin settings.
+func (v *NetworkPolicyGraph) StylesChanged(styles *config.Styles) {
+	reachability := styles.Reachability()
+	for _, panel := range v.panels {
+		panel.SetReachabilityStyle(reachability)
+		panel.SetBorderFocusColor(styles.Frame().Border.FocusColor.Color())
+	}
+	v.SetBackgroundColor(styles.BgColor())
+	v.header.SetTextColor(styles.FgColor())
+	if v.haveResult {
+		v.updateDetails(v.focus)
+	}
+}
+
+// Actions returns active menu actions.
+func (v *NetworkPolicyGraph) Actions() *ui.KeyActions { return v.actions }
+
+// App returns the application handle.
+func (v *NetworkPolicyGraph) App() *App { return v.app }
+
+// Hints returns active key hints.
+func (v *NetworkPolicyGraph) Hints() model.MenuHints { return v.actions.Hints() }
+
+// ExtraHints returns no additional hints.
+func (*NetworkPolicyGraph) ExtraHints() map[string]string { return nil }
+
+// Name returns the component name.
+func (*NetworkPolicyGraph) Name() string { return netPolGraphTitle }
+
+// InCmdMode reports whether a command buffer owns input.
+func (*NetworkPolicyGraph) InCmdMode() bool { return false }
+
+// SetCommand records the command used to open this view.
+func (v *NetworkPolicyGraph) SetCommand(command *cmd.Interpreter) { v.command = command }
+
+// SetFilter applies an initial text filter to both current direction modes.
+func (v *NetworkPolicyGraph) SetFilter(filter string, _ bool) {
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		state := v.state[direction]
+		modeState := state.states[state.mode]
+		modeState.filter = filter
+		state.states[state.mode] = modeState
+		v.panels[direction].SetFilter(filter)
+	}
+}
+
+// SetLabelSelector is unsupported for evaluated reachability.
+func (*NetworkPolicyGraph) SetLabelSelector(labels.Selector, bool) {}
