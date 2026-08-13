@@ -92,6 +92,8 @@ type NetworkPolicyGraph struct {
 	focusTarget reachabilityFocus
 	result      netpol.SubjectResult
 	haveResult  bool
+	autoRefresh bool
+	detailShown detailScrollState
 	lastError   error
 	cancel      context.CancelFunc
 	listening   bool
@@ -141,7 +143,12 @@ func newNetworkPolicyGraph(subject netpol.SubjectRef, evaluator netpol.Evaluator
 		panel := ui.NewDirectionPanel(direction)
 		panel.SetSelectionChangedFunc(func(string) {
 			v.savePanelState(direction)
-			v.updateDetails(direction)
+			// The detail pane always mirrors the focused direction. Reloading
+			// the other panel must not repaint it, or a refresh would drop the
+			// focused pane's cursor.
+			if direction == v.focus {
+				v.updateDetails(direction)
+			}
 		})
 		v.panels[direction] = panel
 	}
@@ -182,27 +189,22 @@ func (v *NetworkPolicyGraph) ensureListeners() {
 	v.listening = true
 }
 
-// Start starts the graph watch loop.
+// Start loads the graph. Periodic reevaluation only runs while auto-refresh is
+// enabled; otherwise a single evaluation is performed and further updates are
+// driven by the refresh key.
 func (v *NetworkPolicyGraph) Start() {
-	v.Stop()
+	v.stopWatch()
 	v.ensureListeners()
-	ctx := context.WithValue(context.Background(), internal.KeyFactory, v.app.factory)
-	ctx, v.cancel = context.WithCancel(ctx)
-	go func() {
-		if err := v.model.Watch(ctx); err != nil && ctx.Err() == nil {
-			slog.Warn("NetworkPolicy graph watch failed", slogs.Error, err)
-		}
-	}()
+	if v.autoRefresh {
+		v.startWatch()
+		return
+	}
+	v.Refresh()
 }
 
 // Stop terminates graph updates and releases listeners.
 func (v *NetworkPolicyGraph) Stop() {
-	v.mx.Lock()
-	if v.cancel != nil {
-		v.cancel()
-		v.cancel = nil
-	}
-	v.mx.Unlock()
+	v.stopWatch()
 	if v.listening {
 		v.model.RemoveListener(v)
 		if v.app != nil {
@@ -210,20 +212,69 @@ func (v *NetworkPolicyGraph) Stop() {
 		}
 		v.listening = false
 	}
+}
+
+func (v *NetworkPolicyGraph) startWatch() {
+	ctx, cancel := context.WithCancel(v.defaultCtx())
+	v.mx.Lock()
+	v.cancel = cancel
+	v.mx.Unlock()
+	go func() {
+		if err := v.model.Watch(ctx); err != nil && ctx.Err() == nil {
+			slog.Warn("NetworkPolicy graph watch failed", slogs.Error, err)
+		}
+	}()
+}
+
+func (v *NetworkPolicyGraph) stopWatch() {
+	v.mx.Lock()
+	if v.cancel != nil {
+		v.cancel()
+		v.cancel = nil
+	}
+	v.mx.Unlock()
 	v.model.Stop()
 }
+
+func (v *NetworkPolicyGraph) defaultCtx() context.Context {
+	var factory dao.Factory
+	if v.app != nil {
+		factory = v.app.factory
+	}
+	return context.WithValue(context.Background(), internal.KeyFactory, factory)
+}
+
+// AutoRefresh reports whether the graph is periodically reevaluated.
+func (v *NetworkPolicyGraph) AutoRefresh() bool { return v.autoRefresh }
 
 // Refresh immediately reevaluates the graph.
 func (v *NetworkPolicyGraph) Refresh() {
 	if v.app == nil {
 		return
 	}
-	ctx := context.WithValue(context.Background(), internal.KeyFactory, v.app.factory)
+	ctx := v.defaultCtx()
 	go func() {
 		if err := v.model.Refresh(ctx); err != nil {
 			slog.Warn("NetworkPolicy graph refresh failed", slogs.Error, err)
 		}
 	}()
+}
+
+func (v *NetworkPolicyGraph) toggleAutoRefresh() {
+	v.autoRefresh = !v.autoRefresh
+	if v.autoRefresh {
+		v.startWatch()
+	} else {
+		v.stopWatch()
+	}
+	v.updateSubject()
+	if v.app != nil {
+		if v.autoRefresh {
+			v.app.Flash().Infof("Auto-refresh is enabled (every %s)", model.NetPolGraphRefreshRate)
+		} else {
+			v.app.Flash().Info("Auto-refresh is disabled. Press Ctrl-R to refresh")
+		}
+	}
 }
 
 // NetPolGraphChanged handles model updates on the UI queue.
@@ -259,6 +310,10 @@ func (v *NetworkPolicyGraph) applyError(err error) {
 func (v *NetworkPolicyGraph) applyResult(result *netpol.SubjectResult) {
 	v.result, v.haveResult, v.lastError = *result, true, nil
 	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		// Capture the live cursor first: loadPanel restores from the saved
+		// state, which would otherwise reset the panel to whatever position was
+		// recorded the last time the selection changed.
+		v.savePanelState(direction)
 		v.loadPanel(direction)
 	}
 	v.updateSubject()
@@ -480,11 +535,12 @@ func (v *NetworkPolicyGraph) updateSubject() {
 	}
 	workloads, workloadNotes := v.subjectWorkloads()
 	extras = append(extras, workloadNotes...)
-	summary := fmt.Sprintf("%s %s · %d %s · Ingress %s · Egress %s · Kinds: %s",
+	summary := fmt.Sprintf("%s %s · %d %s · Ingress %s · Egress %s · Kinds: %s · Auto-refresh %s",
 		subject.Kind, path, podCount, pluralize("pod", podCount),
 		onOff(v.state[netpol.Ingress].visible),
 		onOff(v.state[netpol.Egress].visible),
 		primitiveKindsSummary(v.kinds),
+		onOff(v.autoRefresh),
 	)
 	if len(extras) > 0 {
 		summary += " · " + strings.Join(extras, " · ")
@@ -592,6 +648,9 @@ func (v *NetworkPolicyGraph) namespaceSubjectWorkloads(namespace string) ([]ui.S
 	return workloads, notes
 }
 
+// listUnstructured returns namespace/name sorted objects. The informer cache
+// iterates a map, so an unsorted list reshuffles the subject workload rows on
+// every refresh and makes the row cap pick an arbitrary subset.
 func (v *NetworkPolicyGraph) listUnstructured(gvr *client.GVR, namespace string) ([]*unstructured.Unstructured, error) {
 	objects, err := v.app.factory.List(gvr, namespace, true, labels.Everything())
 	if err != nil {
@@ -603,6 +662,12 @@ func (v *NetworkPolicyGraph) listUnstructured(gvr *client.GVR, namespace string)
 			items = append(items, item)
 		}
 	}
+	slices.SortFunc(items, func(a, b *unstructured.Unstructured) int {
+		return strings.Compare(
+			objectKey(a.GetNamespace(), a.GetName()),
+			objectKey(b.GetNamespace(), b.GetName()),
+		)
+	})
 	return items, nil
 }
 
@@ -745,8 +810,12 @@ func onOff(value bool) string {
 }
 
 func (v *NetworkPolicyGraph) updateDetails(direction netpol.Direction) {
+	// The detail pane is rebuilt from scratch on every refresh, so remember
+	// where the cursor was before dropping the old primitives.
+	previous := v.captureDetailState()
 	v.details.Clear()
 	v.detailItem = nil
+	v.detailShown = detailScrollState{}
 	if !v.haveResult || !v.state[direction].visible {
 		v.showMessage("No selected reachability result.")
 		return
@@ -786,8 +855,50 @@ func (v *NetworkPolicyGraph) updateDetails(direction netpol.Direction) {
 	}
 	v.details.AddItem(detail, 0, 1, false)
 	v.detailItem = detail
+	v.detailShown = detailScrollState{direction: direction, selectionID: id}
+	v.restoreDetailState(previous, direction, id)
 	if v.focusTarget == focusDetails || v.focusTarget == focusApplicability {
 		v.applyFocusTarget(v.focusTarget)
+	}
+}
+
+// detailScrollState remembers what the detail pane renders and where its cursor
+// sits so a refresh does not scroll the user back to the top of the rebuilt
+// widgets.
+type detailScrollState struct {
+	direction     netpol.Direction
+	selectionID   string
+	applicability string
+	textRow       int
+	textColumn    int
+}
+
+// captureDetailState reads the live cursor off the currently rendered pane. The
+// pane identity comes from detailShown rather than the panels because the
+// panels may already carry the freshly loaded data.
+func (v *NetworkPolicyGraph) captureDetailState() detailScrollState {
+	state := v.detailShown
+	switch detail := v.detailItem.(type) {
+	case *ui.RuleDetails:
+		state.applicability = detail.SelectedApplicabilityID()
+		state.textRow, state.textColumn = detail.Text.GetScrollOffset()
+	case *tview.TextView:
+		state.textRow, state.textColumn = detail.GetScrollOffset()
+	}
+	return state
+}
+
+func (v *NetworkPolicyGraph) restoreDetailState(state detailScrollState, direction netpol.Direction, id string) {
+	// A different rule/primitive is rendered: the old cursor is meaningless.
+	if state.direction != direction || state.selectionID != id {
+		return
+	}
+	switch detail := v.detailItem.(type) {
+	case *ui.RuleDetails:
+		detail.SelectApplicabilityID(state.applicability)
+		detail.Text.ScrollTo(state.textRow, state.textColumn)
+	case *tview.TextView:
+		detail.ScrollTo(state.textRow, state.textColumn)
 	}
 }
 
@@ -848,6 +959,7 @@ func (v *NetworkPolicyGraph) showMessage(message string) {
 	v.applyTextFocusStyle(text)
 	v.details.AddItem(text, 0, 1, false)
 	v.detailItem = text
+	v.detailShown = detailScrollState{}
 }
 
 func (v *NetworkPolicyGraph) selectedRule(direction netpol.Direction, id string) (netpol.RuleResult, bool) {
@@ -981,6 +1093,11 @@ func (v *NetworkPolicyGraph) applySubject(ref netpol.SubjectRef) {
 	v.showMessage("Waiting for NetworkPolicy evaluation...")
 	if v.app != nil {
 		v.app.SetFocus(v.panels[v.focus])
+	}
+	// Without a watch loop nothing consumes the model refresh request, so the
+	// new subject would never be evaluated while auto-refresh is disabled.
+	if !v.autoRefresh {
+		v.Refresh()
 	}
 }
 
@@ -1165,7 +1282,8 @@ func (v *NetworkPolicyGraph) bindKeys() {
 		ui.KeyO:        ui.NewKeyAction("Open Resource", v.openResourceCmd, true),
 		ui.KeyS:        ui.NewKeyAction("Subject", func(*tcell.EventKey) *tcell.EventKey { v.openSubjectDialog(); return nil }, true),
 		ui.KeySlash:    ui.NewKeyAction("Search", func(*tcell.EventKey) *tcell.EventKey { v.openSearchDialog(); return nil }, true),
-		ui.KeyR:        ui.NewKeyAction("Refresh", func(*tcell.EventKey) *tcell.EventKey { v.Refresh(); return nil }, true),
+		ui.KeyR:        ui.NewKeyAction("Toggle Auto-Refresh", func(*tcell.EventKey) *tcell.EventKey { v.toggleAutoRefresh(); return nil }, true),
+		tcell.KeyCtrlR: ui.NewKeyAction("Refresh", func(*tcell.EventKey) *tcell.EventKey { v.Refresh(); return nil }, true),
 		ui.KeyY:        ui.NewKeyAction("YAML", v.yamlCmd, true),
 		tcell.KeyEnter: ui.NewKeyAction("Focus Details", v.enterCmd, true),
 		tcell.KeyEscape: ui.NewKeyAction("Back", func(evt *tcell.EventKey) *tcell.EventKey {

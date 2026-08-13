@@ -25,8 +25,11 @@ import (
 )
 
 const (
-	defaultNetPolGraphRefreshRate = 5 * time.Second
-	defaultNetPolGraphDebounce    = 150 * time.Millisecond
+	// NetPolGraphRefreshRate is the interval between periodic graph
+	// reevaluations while auto-refresh is enabled.
+	NetPolGraphRefreshRate = 5 * time.Second
+
+	defaultNetPolGraphDebounce = 150 * time.Millisecond
 )
 
 // NetPolGraphListener listens for NetworkPolicy graph evaluations.
@@ -93,7 +96,7 @@ type NetworkPolicyGraph = NetPolGraph
 func NewNetPolGraph(evaluator netpol.Evaluator) *NetPolGraph {
 	return &NetPolGraph{
 		evaluator:   evaluator,
-		refreshRate: defaultNetPolGraphRefreshRate,
+		refreshRate: NetPolGraphRefreshRate,
 		debounce:    defaultNetPolGraphDebounce,
 		trigger:     make(chan struct{}, 1),
 	}

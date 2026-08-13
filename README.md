@@ -483,13 +483,19 @@ For ingress, the displayed primitive is the source; for egress, it is the
 destination. Effective reachability checks both the source's egress policy and
 the destination's ingress policy.
 
+The **Subject** panel at the top shows a status summary line and a selectable
+table of the subject's workloads. Pod, Deployment, and Job subjects list their
+pods; Namespace subjects list the namespace's deployments, replicasets,
+statefulsets, daemonsets, jobs, and pods. Rows are sorted by namespace and name
+and capped at 300.
+
 Each direction has two display modes:
 
 - **Rules** lists the NetworkPolicy rules selecting the subject, including
   synthetic unrestricted/default-deny explanations where applicable.
 - **Primitives** evaluates reachable CIDRs, Pods, Namespaces, Deployments, and
-  Jobs. Press `f` to enable or disable these five primitive kinds independently
-  for each direction.
+  Jobs. Press `f` to enable or disable these five primitive kinds; the
+  selection applies to both directions.
 
 ### Reachability key map
 
@@ -509,8 +515,15 @@ Each direction has two display modes:
 | `Enter` | Expand aggregate details or focus rule applicability |
 | `y` | Open YAML for selected policy evidence |
 | `/` | Filter visible items by text |
-| `r` | Force a refresh |
+| `r` | Enable or disable auto-refresh (disabled by default) |
+| `Ctrl-R` | Reevaluate reachability now |
 | `Esc` | Close a dialog/filter or return to the previous view |
+
+Reachability is evaluated once when the view opens. Auto-refresh is **off** by
+default: press `r` to reevaluate every 5 seconds, or `Ctrl-R` for a one-off
+refresh. The current state is shown in the subject summary line. Refreshing
+preserves the selected rule, primitive, applicability row, subject workload,
+and scroll position.
 
 Hiding a direction does not discard its mode, filters, selection, or scroll
 position. If both directions are hidden, the subject and details remain
@@ -555,6 +568,7 @@ k9s:
       allowedColor: green
       disallowedColor: red
       partialDataColor: orange
+      focusColor: orange
 ```
 
 ### RBAC

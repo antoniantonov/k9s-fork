@@ -83,6 +83,54 @@ func TestSubjectInfoSetSubjectWithoutSummaryRendersDefaultSummary(t *testing.T) 
 	require.Equal(t, "Deployment netpol-demo-app/api · 3 pods", info.SummaryText())
 }
 
+func TestSubjectInfoKeepsSelectionWhenWorkloadsAreReordered(t *testing.T) {
+	workloads := []SubjectWorkload{
+		{Kind: "Pod", Namespace: "demo", Name: "a", Status: "Running"},
+		{Kind: "Pod", Namespace: "demo", Name: "b", Status: "Running"},
+		{Kind: "Pod", Namespace: "demo", Name: "c", Status: "Running"},
+	}
+	info := NewSubjectInfo().SetWorkloads(workloads)
+	require.True(t, info.SelectID("Pod/demo/c"))
+	require.Equal(t, "Pod/demo/c", info.SelectedID())
+
+	// A refresh may hand back the same workloads in informer cache order.
+	info.SetWorkloads([]SubjectWorkload{workloads[2], workloads[0], workloads[1]})
+
+	require.Equal(t, "Pod/demo/c", info.SelectedID(), "selection must follow the workload, not the row")
+	row, _ := info.Table.GetSelection()
+	require.Equal(t, 1, row)
+}
+
+func TestSubjectInfoKeepsSelectionAcrossStatusOnlyRefresh(t *testing.T) {
+	info := NewSubjectInfo().SetWorkloads([]SubjectWorkload{
+		{Kind: "Pod", Namespace: "demo", Name: "a", Status: "Running"},
+		{Kind: "Pod", Namespace: "demo", Name: "b", Status: "Running"},
+	})
+	require.True(t, info.SelectID("Pod/demo/b"))
+
+	info.SetSummary("refreshed").SetWorkloads([]SubjectWorkload{
+		{Kind: "Pod", Namespace: "demo", Name: "a", Status: "Running"},
+		{Kind: "Pod", Namespace: "demo", Name: "b", Status: "1/1 ready"},
+	})
+
+	require.Equal(t, "Pod/demo/b", info.SelectedID())
+	requireSubjectInfoRow(t, info, 2, SubjectWorkload{
+		Kind: "Pod", Namespace: "demo", Name: "b", Status: "1/1 ready",
+	})
+}
+
+func TestSubjectInfoFallsBackToFirstRowWhenSelectionDisappears(t *testing.T) {
+	info := NewSubjectInfo().SetWorkloads([]SubjectWorkload{
+		{Kind: "Pod", Namespace: "demo", Name: "a"},
+		{Kind: "Pod", Namespace: "demo", Name: "b"},
+	})
+	require.True(t, info.SelectID("Pod/demo/b"))
+
+	info.SetWorkloads([]SubjectWorkload{{Kind: "Pod", Namespace: "demo", Name: "a"}})
+
+	require.Equal(t, "Pod/demo/a", info.SelectedID())
+}
+
 func requireSubjectInfoRow(t *testing.T, info *SubjectInfo, row int, expected SubjectWorkload) {
 	t.Helper()
 

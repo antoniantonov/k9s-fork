@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/derailed/k9s/internal/config"
 	"github.com/derailed/k9s/internal/model"
@@ -57,6 +59,7 @@ func TestNetworkPolicyGraphCommand(t *testing.T) {
 }
 
 type fakeNetPolGraphModel struct {
+	mx        sync.Mutex
 	subject   netpol.SubjectRef
 	result    netpol.SubjectResult
 	refresh   model.NetPolGraphRefresh
@@ -83,11 +86,20 @@ func (m *fakeNetPolGraphModel) RemoveListener(listener model.NetPolGraphListener
 	}
 }
 func (m *fakeNetPolGraphModel) Watch(context.Context) error {
+	m.mx.Lock()
+	defer m.mx.Unlock()
 	m.watches++
 	return m.err
 }
+func (m *fakeNetPolGraphModel) watchCount() int {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+	return m.watches
+}
 func (*fakeNetPolGraphModel) Stop() {}
 func (m *fakeNetPolGraphModel) Refresh(context.Context) error {
+	m.mx.Lock()
+	defer m.mx.Unlock()
 	m.refreshes++
 	return m.err
 }
@@ -395,6 +407,89 @@ func TestNetworkPolicyGraphSubjectKindsIgnorePrimitiveFilter(t *testing.T) {
 	}, subjectKinds())
 }
 
+func TestNetworkPolicyGraphAutoRefreshIsDisabledByDefault(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+
+	assert.False(t, view.AutoRefresh())
+	assert.Contains(t, view.subjectInfo.SummaryText(), "Auto-refresh off")
+
+	graph, ok := view.model.(*fakeNetPolGraphModel)
+	require.True(t, ok)
+	view.Start()
+	assert.Zero(t, graph.watches, "no watch loop must run while auto-refresh is off")
+}
+
+func TestNetworkPolicyGraphToggleAutoRefreshStartsAndStopsTheWatch(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	graph, ok := view.model.(*fakeNetPolGraphModel)
+	require.True(t, ok)
+
+	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'r', tcell.ModNone)))
+	assert.True(t, view.AutoRefresh())
+	assert.Contains(t, view.subjectInfo.SummaryText(), "Auto-refresh on")
+	assert.Eventually(t, func() bool { return graph.watchCount() > 0 }, time.Second, 10*time.Millisecond)
+
+	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'r', tcell.ModNone)))
+	assert.False(t, view.AutoRefresh())
+	assert.Contains(t, view.subjectInfo.SummaryText(), "Auto-refresh off")
+}
+
+func TestNetworkPolicyGraphRefreshKeepsPanelSelection(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := multiRuleSubjectResult()
+	view.applyResult(result)
+
+	ingress := view.panels[netpol.Ingress]
+	require.True(t, ingress.SelectID(result.Ingress.Rules[2].StableID()))
+	selected := ingress.SelectedID()
+	require.NotEmpty(t, selected)
+
+	// Simulate a stale snapshot: the saved scroll state lags behind the live
+	// cursor whenever the panel moves without notifying the view.
+	state := view.state[netpol.Ingress]
+	modeState := state.states[state.mode]
+	modeState.scroll = ui.ReachabilityScrollState{SelectedID: result.Ingress.Rules[0].StableID()}
+	state.states[state.mode] = modeState
+
+	view.applyResult(multiRuleSubjectResult())
+
+	assert.Equal(t, selected, ingress.SelectedID(), "a refresh must not reset the cursor")
+}
+
+func TestNetworkPolicyGraphRefreshKeepsApplicabilitySelection(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(multiPrimitiveSubjectResult())
+
+	details, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	require.Equal(t, 4, details.Applicability.GetRowCount())
+	require.True(t, details.SelectApplicabilityID(details.Applicability.GetCell(3, 0).GetReference().(string)))
+	id := details.SelectedApplicabilityID()
+	require.NotEmpty(t, id)
+
+	view.applyResult(multiPrimitiveSubjectResult())
+
+	details, ok = view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	assert.Equal(t, id, details.SelectedApplicabilityID())
+}
+
+func TestNetworkPolicyGraphSubjectChangeResetsDetailState(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := multiRuleSubjectResult()
+	view.applyResult(result)
+	require.True(t, view.panels[netpol.Ingress].SelectID(result.Ingress.Rules[2].StableID()))
+
+	view.applySubject(netpol.SubjectRef{
+		Kind: netpol.SubjectNamespace, Name: "other", UID: types.UID("other-uid"),
+	})
+
+	assert.Equal(t, netpol.SubjectNamespace, view.subject.Kind)
+	assert.Empty(t, view.panels[netpol.Ingress].SelectedID())
+}
+
 func newTestNetworkPolicyGraph() *NetworkPolicyGraph {
 	subject := netpol.SubjectRef{
 		Kind: netpol.SubjectPod, Namespace: "payments", Name: "api", UID: types.UID("subject-uid"),
@@ -468,6 +563,77 @@ func oppositeDirection(direction netpol.Direction) netpol.Direction {
 		return netpol.Egress
 	}
 	return netpol.Ingress
+}
+
+// multiRuleSubjectResult yields several selectable rules per direction so
+// selection retention can be observed across a refresh.
+func multiRuleSubjectResult() *netpol.SubjectResult {
+	subject := netpol.SubjectRef{
+		Kind: netpol.SubjectPod, Namespace: "payments", Name: "api", UID: types.UID("subject-uid"),
+	}
+	rule := func(direction netpol.Direction, index int, policy string) netpol.RuleResult {
+		id := netpol.RuleID{
+			PolicyNamespace: "payments", PolicyName: policy, PolicyUID: types.UID(policy + "-uid"),
+			Direction: direction, Index: index,
+		}
+		return netpol.RuleResult{
+			ID: id, SubjectPodCount: 1, SubjectMatchCount: 1, PeerSummary: "peer",
+			Permissions: []netpol.PortPermission{{All: true}},
+			Evidence:    []netpol.PolicyEvidence{{RuleID: id, Summary: "policy evidence"}},
+		}
+	}
+	return &netpol.SubjectResult{
+		Subject: netpol.Subject{Ref: subject, Pods: []netpol.PodRef{{Namespace: "payments", Name: "api"}}},
+		Ingress: netpol.DirectionResult{
+			Rules: []netpol.RuleResult{
+				rule(netpol.Ingress, 0, "allow-a"),
+				rule(netpol.Ingress, 1, "allow-b"),
+				rule(netpol.Ingress, 2, "allow-c"),
+			},
+		},
+		Egress: netpol.DirectionResult{
+			Rules: []netpol.RuleResult{rule(netpol.Egress, 0, "allow-a")},
+		},
+	}
+}
+
+// multiPrimitiveSubjectResult yields several applicability rows for the single
+// ingress rule so detail selection retention can be observed.
+func multiPrimitiveSubjectResult() *netpol.SubjectResult {
+	result := testSubjectResult()
+	id := result.Ingress.Rules[0].ID
+	for _, spec := range []struct {
+		kind netpol.PrimitiveKind
+		name string
+	}{
+		{netpol.PrimitiveDeployment, "peer-dp"},
+		{netpol.PrimitiveJob, "peer-job"},
+	} {
+		result.Ingress.Primitives[spec.kind] = []netpol.PrimitiveResult{{
+			Ref: netpol.PrimitiveRef{
+				Kind: spec.kind, Namespace: "payments", Name: spec.name,
+				UID: types.UID(spec.name + "-uid"),
+			},
+			State:        netpol.AccessAllowed,
+			AllowedPairs: 1,
+			TotalPairs:   1,
+			Permissions:  []netpol.PortPermission{{All: true}},
+			Evidence:     []netpol.PolicyEvidence{{RuleID: id, Summary: "allow-api evidence"}},
+			PairDecisions: []netpol.PairDecision{{
+				Source:      netpol.PodRef{Namespace: "payments", Name: spec.name},
+				Destination: netpol.PodRef{Namespace: "payments", Name: "api"},
+				Decision: netpol.Decision{
+					State:       netpol.AccessAllowed,
+					Permissions: []netpol.PortPermission{{All: true}},
+					Evidence: []netpol.PolicyEvidence{
+						{RuleID: id, Summary: "Ingress evidence"},
+						{RuleID: netpol.RuleID{Direction: netpol.Egress}, Summary: "opposite evidence"},
+					},
+				},
+			}},
+		}}
+	}
+	return result
 }
 
 func TestPrimitiveCommand(t *testing.T) {

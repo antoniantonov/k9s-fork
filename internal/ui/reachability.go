@@ -623,6 +623,40 @@ type RuleDetails struct {
 	Applicability *tview.Table
 }
 
+// SelectedApplicabilityID returns the stable primitive ID of the selected
+// applicability row, if any.
+func (d *RuleDetails) SelectedApplicabilityID() string {
+	row, _ := d.Applicability.GetSelection()
+	if row < 1 || row >= d.Applicability.GetRowCount() {
+		return ""
+	}
+	cell := d.Applicability.GetCell(row, 0)
+	if cell == nil {
+		return ""
+	}
+	id, _ := cell.GetReference().(string)
+	return id
+}
+
+// SelectApplicabilityID selects the applicability row for the given stable
+// primitive ID. It reports whether the row was found.
+func (d *RuleDetails) SelectApplicabilityID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for row := 1; row < d.Applicability.GetRowCount(); row++ {
+		cell := d.Applicability.GetCell(row, 0)
+		if cell == nil {
+			continue
+		}
+		if current, _ := cell.GetReference().(string); current == id {
+			d.Applicability.Select(row, 0)
+			return true
+		}
+	}
+	return false
+}
+
 // NewRuleDetails renders rule details and an applicability table.
 //
 //nolint:gocritic // Value parameter preserves the public constructor API.
@@ -728,10 +762,12 @@ func newApplicabilityTable(rows []netpol.ApplicabilityRow, colors reachabilityCo
 			row.EffectiveState.String(),
 			formatPermissions(row.Permissions),
 		}
+		id := row.Primitive.StableID()
 		for column, value := range values {
 			cell := tview.NewTableCell(value).
 				SetTextColor(color).
-				SetExpansion(1)
+				SetExpansion(1).
+				SetReference(id)
 			cell.Transparent = true
 			table.SetCell(index+1, column, cell)
 		}

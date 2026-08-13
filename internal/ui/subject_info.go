@@ -23,6 +23,11 @@ type SubjectWorkload struct {
 	Status    string // "3/3 ready", "Running", "Complete", ...
 }
 
+// ID returns a stable identity used to preserve the selection across refreshes.
+func (w SubjectWorkload) ID() string {
+	return w.Kind + "/" + w.Namespace + "/" + w.Name
+}
+
 // SubjectInfo renders subject identity, a status summary and subject workloads.
 // The summary lives in its own text line rather than a table cell so that a long
 // summary cannot widen the workload columns.
@@ -38,6 +43,7 @@ type SubjectInfo struct {
 	summaryTxt  string
 	summarySet  bool
 	workloads   []SubjectWorkload
+	selectedID  string
 	styles      *config.Styles
 	borderColor tcell.Color
 	focusColor  tcell.Color
@@ -57,6 +63,9 @@ func NewSubjectInfo() *SubjectInfo {
 	s.SetTitle(" Subject ")
 	s.Table.SetSelectable(true, false)
 	s.Table.SetFixed(1, 0)
+	s.Table.SetSelectionChangedFunc(func(row, _ int) {
+		s.selectedID = s.workloadIDAtRow(row)
+	})
 	s.AddItem(s.summary, 1, 0, false)
 	s.AddItem(s.Table, 0, 1, true)
 	s.SetStyles(s.styles)
@@ -149,7 +158,12 @@ func (s *SubjectInfo) SetStyles(styles *config.Styles) *SubjectInfo {
 
 func (s *SubjectInfo) rebuild() {
 	s.summary.SetText(s.summaryText())
+	// Preserve the selection by workload identity: the informer cache can hand
+	// back rows in a different order, so a row index alone silently jumps the
+	// cursor onto an unrelated workload.
+	selectedID := s.selectedID
 	row, column := s.Table.GetSelection()
+	offsetRow, offsetColumn := s.Table.GetOffset()
 	s.Table.Clear()
 	if len(s.workloads) == 0 {
 		s.Table.SetCell(0, 0, s.emptyCell())
@@ -160,13 +174,51 @@ func (s *SubjectInfo) rebuild() {
 	for index, item := range s.workloads {
 		s.setWorkload(1+index, item)
 	}
-	// Keep the caller's position across refreshes, but never land on the
-	// header or past the end of a shrunken list.
+	if index := s.indexOf(selectedID); index >= 0 {
+		s.Table.Select(1+index, max(0, column))
+		s.Table.SetOffset(offsetRow, offsetColumn)
+		return
+	}
+	// The previously selected workload is gone: fall back to the old row, but
+	// never land on the header or past the end of a shrunken list.
 	if row < 1 || row >= s.Table.GetRowCount() {
 		row, column = 1, 0
-		s.Table.SetOffset(0, 0)
+		offsetRow, offsetColumn = 0, 0
 	}
 	s.Table.Select(row, column)
+	s.Table.SetOffset(offsetRow, offsetColumn)
+}
+
+// SelectedID returns the identity of the selected workload, if any.
+func (s *SubjectInfo) SelectedID() string {
+	row, _ := s.Table.GetSelection()
+	return s.workloadIDAtRow(row)
+}
+
+// SelectID selects the workload matching id. It reports whether it was found.
+func (s *SubjectInfo) SelectID(id string) bool {
+	index := s.indexOf(id)
+	if index < 0 {
+		return false
+	}
+	s.Table.Select(1+index, 0)
+	return true
+}
+
+func (s *SubjectInfo) workloadIDAtRow(row int) string {
+	if row < 1 || row > len(s.workloads) {
+		return ""
+	}
+	return s.workloads[row-1].ID()
+}
+
+func (s *SubjectInfo) indexOf(id string) int {
+	if id == "" {
+		return -1
+	}
+	return slices.IndexFunc(s.workloads, func(item SubjectWorkload) bool {
+		return item.ID() == id
+	})
 }
 
 func (s *SubjectInfo) setHeader(row int) {
