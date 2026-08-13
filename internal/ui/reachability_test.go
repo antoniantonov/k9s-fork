@@ -39,14 +39,12 @@ func TestDirectionPanelASCIISeparators(t *testing.T) {
 func TestDirectionPanelProjectionTitleAndFilter(t *testing.T) {
 	panel := NewDirectionPanel(netpol.Egress)
 	panel.SetData(testRules(), testPrimitives())
-	assert.Contains(t, panel.PanelTitle(), "Egress")
-	assert.Contains(t, panel.PanelTitle(), "Rules")
+	assert.Equal(t, " Egress · Rules ", panel.PanelTitle())
 
 	panel.SetProjection(PrimitivesProjection).SetFilter("database")
 	assert.Len(t, panel.blocks, 1)
 	assert.Contains(t, panel.GetCell(0, 1).Text, "database")
-	assert.Contains(t, panel.PanelTitle(), "Primitives")
-	assert.Contains(t, panel.PanelTitle(), "filter: database")
+	assert.Equal(t, " Egress · Primitives · filter: database ", panel.PanelTitle())
 
 	panel.SetFilter("TCP/all")
 	assert.Len(t, panel.blocks, 1, "filtering includes permission text")
@@ -72,6 +70,7 @@ func TestDirectionPanelAccessLabelsAndColors(t *testing.T) {
 		AllowedColor:     config.Color("green"),
 		DisallowedColor:  config.Color("red"),
 		PartialDataColor: config.Color("orange"),
+		FocusColor:       config.Color("orange"),
 	}
 	panel.SetReachabilityStyle(style)
 	assert.Equal(t, style.AllowedColor.Color(), panel.GetCell(0, 0).Color)

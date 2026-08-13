@@ -225,31 +225,33 @@ func TestNetworkPolicyGraphModesKeepIndependentState(t *testing.T) {
 	assert.Equal(t, ui.RulesProjection, view.state[netpol.Egress].mode)
 }
 
-func TestNetworkPolicyGraphIndependentKindsAndEmptySelection(t *testing.T) {
+func TestNetworkPolicyGraphGlobalKindsAndEmptySelection(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
 
-	view.state[netpol.Ingress].kinds = sets.New[netpol.PrimitiveKind]()
+	view.kinds = sets.New[netpol.PrimitiveKind]()
 	view.loadPanel(netpol.Ingress)
 	view.updateDetails(netpol.Ingress)
-	assert.Contains(t, view.panels[netpol.Ingress].PanelTitle(), "kinds: none")
+	assert.NotContains(t, view.panels[netpol.Ingress].PanelTitle(), "kinds:")
 	assert.Contains(t, view.panels[netpol.Ingress].GetCell(0, 1).Text, "allow-api", "rules remain visible")
 	ruleDetails, ok := view.detailItem.(*ui.RuleDetails)
 	require.True(t, ok)
-	assert.Equal(t, 1, ruleDetails.Applicability.GetRowCount(), "kind filters still constrain applicability")
+	assert.Equal(t, 1, ruleDetails.Applicability.GetRowCount(), "global kind filters constrain applicability")
 
 	view.switchMode(netpol.Ingress)
 	assert.Contains(t, view.panels[netpol.Ingress].GetCell(0, 0).Text, "No primitive kinds selected")
 	assert.True(t, view.panels[netpol.Ingress].GetCell(0, 0).NotSelectable)
-	assert.Equal(t, netpol.AllPrimitiveKinds(), view.state[netpol.Egress].kinds)
+	view.switchMode(netpol.Egress)
+	assert.Contains(t, view.panels[netpol.Egress].GetCell(0, 0).Text, "No primitive kinds selected")
 
-	view.state[netpol.Ingress].kinds = sets.New(netpol.PrimitivePod)
+	view.kinds = sets.New(netpol.PrimitivePod)
 	view.loadPanel(netpol.Ingress)
-	assert.Contains(t, view.panels[netpol.Ingress].PanelTitle(), "kinds: Pod")
-	assert.Contains(t, view.panels[netpol.Egress].PanelTitle(), "CIDR,Pod,Namespace,Deployment,Job")
+	view.loadPanel(netpol.Egress)
+	assert.NotContains(t, view.panels[netpol.Ingress].PanelTitle(), "kinds:")
+	assert.NotContains(t, view.panels[netpol.Egress].PanelTitle(), "CIDR,Pod,Namespace,Deployment,Job")
 }
 
-func TestNetworkPolicyGraphDetailsUseDirectionKindsAndExposeWarnings(t *testing.T) {
+func TestNetworkPolicyGraphDetailsUseGlobalKindsAndExposeWarnings(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	result := testSubjectResult()
 	result.Truncated = true
@@ -267,6 +269,14 @@ func TestNetworkPolicyGraphDetailsUseDirectionKindsAndExposeWarnings(t *testing.
 	assert.Contains(t, ruleText, "partial jobs data: forbidden")
 	assert.Equal(t, 2, ruleDetails.Applicability.GetRowCount())
 
+	view.kinds = sets.New[netpol.PrimitiveKind]()
+	view.updateDetails(netpol.Ingress)
+	ruleDetails, ok = view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	assert.Equal(t, 1, ruleDetails.Applicability.GetRowCount())
+
+	view.kinds = netpol.AllPrimitiveKinds()
+	view.loadPanel(netpol.Ingress)
 	view.switchMode(netpol.Ingress)
 	primitiveText, ok := view.detailItem.(*tview.TextView)
 	require.True(t, ok)
@@ -286,6 +296,14 @@ func TestNetworkPolicyGraphKeyboardModesFocusAndNavigation(t *testing.T) {
 
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'm', tcell.ModNone)))
 	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Ingress].mode)
+	// Shift-M propagates the focused mode; it must not toggle it first.
+	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'M', tcell.ModShift)))
+	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Ingress].mode)
+	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Egress].mode)
+
+	// Applicability focus only exists in Rules mode, so return both panels to it
+	// before exercising the focus cycle below.
+	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'm', tcell.ModNone)))
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'M', tcell.ModShift)))
 	assert.Equal(t, ui.RulesProjection, view.state[netpol.Ingress].mode)
 	assert.Equal(t, ui.RulesProjection, view.state[netpol.Egress].mode)
@@ -302,6 +320,10 @@ func TestNetworkPolicyGraphKeyboardModesFocusAndNavigation(t *testing.T) {
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyBacktab, 0, tcell.ModShift)))
 	assert.Equal(t, focusEgress, view.focusTarget)
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyBacktab, 0, tcell.ModShift)))
+	assert.Equal(t, focusIngress, view.focusTarget)
+	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyBacktab, 0, tcell.ModShift)))
+	assert.Equal(t, focusSubject, view.focusTarget)
+	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyTAB, 0, tcell.ModNone)))
 	assert.Equal(t, netpol.Ingress, view.focus)
 	assert.Equal(t, focusIngress, view.focusTarget)
 
@@ -322,24 +344,55 @@ func TestNetworkPolicyGraphShiftMDoesNotModifyHiddenPanelMode(t *testing.T) {
 	view.applyResult(testSubjectResult())
 	view.toggleDirection(netpol.Egress)
 
+	view.switchMode(netpol.Ingress)
 	view.switchVisibleModesFromFocus()
 	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Ingress].mode)
 	assert.Equal(t, ui.RulesProjection, view.state[netpol.Egress].mode)
 }
 
-func TestNetworkPolicyGraphHeaderReportsState(t *testing.T) {
+func TestNetworkPolicyGraphShiftMPropagatesFocusedModeWithoutToggling(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+
+	view.switchMode(netpol.Ingress)
+	require.Equal(t, ui.PrimitivesProjection, view.state[netpol.Ingress].mode)
+
+	view.switchVisibleModesFromFocus()
+	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Ingress].mode,
+		"the focused panel must keep its mode")
+	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Egress].mode,
+		"the other visible panel must adopt the focused mode")
+}
+
+func TestNetworkPolicyGraphSubjectInfoReportsState(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	result := testSubjectResult()
 	result.Truncated, result.ResultLimit = true, 17
 	result.Warnings = []string{"partial"}
 	view.applyResult(result)
 
-	header := view.header.GetText(true)
-	assert.Contains(t, header, "Pod payments/api")
-	assert.Contains(t, header, "Ingress[on]")
-	assert.Contains(t, header, "Egress[on]")
-	assert.Contains(t, header, "TRUNCATED at 17")
-	assert.Contains(t, header, "PARTIAL DATA")
+	summary := view.subjectInfo.SummaryText()
+	assert.Contains(t, summary, "Pod payments/api")
+	assert.Contains(t, summary, "1 pod")
+	assert.Contains(t, summary, "Ingress on")
+	assert.Contains(t, summary, "Egress on")
+	assert.Contains(t, summary, "Kinds: CIDR,Pod,Namespace,Deployment,Job")
+	assert.Contains(t, summary, "TRUNCATED at 17")
+	assert.Contains(t, summary, "PARTIAL DATA")
+	assert.Contains(t, summary, "workloads unavailable")
+	assert.Contains(t, view.subjectInfo.Table.GetCell(0, 0).Text, "No workloads found")
+}
+
+func TestNetworkPolicyGraphSubjectKindsIgnorePrimitiveFilter(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.kinds = sets.New[netpol.PrimitiveKind]()
+
+	assert.Equal(t, []netpol.SubjectKind{
+		netpol.SubjectPod,
+		netpol.SubjectDeployment,
+		netpol.SubjectJob,
+		netpol.SubjectNamespace,
+	}, subjectKinds())
 }
 
 func newTestNetworkPolicyGraph() *NetworkPolicyGraph {

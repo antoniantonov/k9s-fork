@@ -34,6 +34,7 @@ const (
 	netPolKindsDialogPage = "netpol-primitive-kinds"
 	netPolSearchPage      = "netpol-search"
 	netPolSubjectPage     = "netpol-subject"
+	subjectInfoRowLimit   = 300
 )
 
 type netPolGraphModel interface {
@@ -55,7 +56,6 @@ type reachabilityModeState struct {
 
 type reachabilityDirectionState struct {
 	mode    ui.ReachabilityProjection
-	kinds   sets.Set[netpol.PrimitiveKind]
 	visible bool
 	states  map[ui.ReachabilityProjection]reachabilityModeState
 }
@@ -63,7 +63,8 @@ type reachabilityDirectionState struct {
 type reachabilityFocus uint8
 
 const (
-	focusIngress reachabilityFocus = iota
+	focusSubject reachabilityFocus = iota
+	focusIngress
 	focusEgress
 	focusDetails
 	focusApplicability
@@ -79,13 +80,14 @@ type NetworkPolicyGraph struct {
 	subject     netpol.SubjectRef
 	command     *cmd.Interpreter
 	actions     *ui.KeyActions
-	header      *tview.TextView
+	subjectInfo *ui.SubjectInfo
 	directions  *tview.Flex
 	details     *tview.Flex
 	placeholder *tview.TextView
 	detailItem  tview.Primitive
 	panels      map[netpol.Direction]*ui.DirectionPanel
 	state       map[netpol.Direction]*reachabilityDirectionState
+	kinds       sets.Set[netpol.PrimitiveKind]
 	focus       netpol.Direction
 	focusTarget reachabilityFocus
 	result      netpol.SubjectResult
@@ -118,18 +120,18 @@ func newNetworkPolicyGraph(subject netpol.SubjectRef, evaluator netpol.Evaluator
 		evaluator:   evaluator,
 		subject:     subject,
 		actions:     ui.NewKeyActions(),
-		header:      tview.NewTextView().SetDynamicColors(true),
+		subjectInfo: ui.NewSubjectInfo(),
 		directions:  tview.NewFlex(),
 		details:     tview.NewFlex(),
 		panels:      make(map[netpol.Direction]*ui.DirectionPanel, 2),
 		state:       make(map[netpol.Direction]*reachabilityDirectionState, 2),
+		kinds:       netpol.AllPrimitiveKinds(),
 		focus:       netpol.Ingress,
 		focusTarget: focusIngress,
 	}
 	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
 		v.state[direction] = &reachabilityDirectionState{
 			mode:    ui.RulesProjection,
-			kinds:   netpol.AllPrimitiveKinds(),
 			visible: true,
 			states: map[ui.ReachabilityProjection]reachabilityModeState{
 				ui.RulesProjection:      {},
@@ -143,13 +145,13 @@ func newNetworkPolicyGraph(subject netpol.SubjectRef, evaluator netpol.Evaluator
 		})
 		v.panels[direction] = panel
 	}
-	v.AddItem(v.header, 2, 0, false)
+	v.AddItem(v.subjectInfo, 0, 1, false)
 	v.AddItem(v.directions, 0, 3, true)
 	v.AddItem(v.details, 0, 2, false)
 	v.bindKeys()
 	v.SetInputCapture(v.keyboard)
 	v.rebuildDirections()
-	v.updateHeader()
+	v.updateSubject()
 	v.showMessage("Waiting for NetworkPolicy evaluation...")
 	return v
 }
@@ -246,7 +248,7 @@ func (v *NetworkPolicyGraph) NetPolGraphFailed(err error) {
 
 func (v *NetworkPolicyGraph) applyError(err error) {
 	v.lastError = err
-	v.updateHeader()
+	v.updateSubject()
 	if !v.haveResult {
 		v.showMessage("NetworkPolicy evaluation failed:\n" + err.Error())
 	} else {
@@ -259,7 +261,7 @@ func (v *NetworkPolicyGraph) applyResult(result *netpol.SubjectResult) {
 	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
 		v.loadPanel(direction)
 	}
-	v.updateHeader()
+	v.updateSubject()
 	v.updateDetails(v.focus)
 }
 
@@ -267,15 +269,14 @@ func (v *NetworkPolicyGraph) loadPanel(direction netpol.Direction) {
 	panel, state := v.panels[direction], v.state[direction]
 	modeState := state.states[state.mode]
 	panel.SetProjection(state.mode).
-		SetEnabledKinds(state.kinds).
 		SetFilter(modeState.filter)
-	if state.mode == ui.PrimitivesProjection && len(state.kinds) == 0 {
+	if state.mode == ui.PrimitivesProjection && len(v.kinds) == 0 {
 		panel.SetData(nil, nil).SetEmptyMessage("No primitive kinds selected. Press f to enable kinds.")
 	} else {
 		panel.SetEmptyMessage("No reachability results match this view.").
 			SetData(
 				v.evaluator.Rules(v.result, direction),
-				v.evaluator.Primitives(v.result, direction, state.kinds),
+				v.evaluator.Primitives(v.result, direction, v.kinds),
 			)
 	}
 	panel.RestoreScrollState(modeState.scroll)
@@ -335,7 +336,7 @@ func (v *NetworkPolicyGraph) toggleDirection(direction netpol.Direction) {
 		v.loadPanel(direction)
 	}
 	v.rebuildDirections()
-	v.updateHeader()
+	v.updateSubject()
 	v.updateDetails(v.focus)
 }
 
@@ -352,7 +353,8 @@ func (v *NetworkPolicyGraph) switchMode(direction netpol.Direction) {
 }
 
 func (v *NetworkPolicyGraph) switchVisibleModesFromFocus() {
-	v.switchMode(v.focus)
+	// Propagate the focused panel's current mode; it must not toggle first,
+	// otherwise the focused panel ends up in the mode you did not ask for.
 	mode := v.state[v.focus].mode
 	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
 		if direction == v.focus || !v.state[direction].visible || v.state[direction].mode == mode {
@@ -401,7 +403,7 @@ func (v *NetworkPolicyGraph) cycleFocus(reverse bool) {
 }
 
 func (v *NetworkPolicyGraph) focusTargets() []reachabilityFocus {
-	var targets []reachabilityFocus
+	targets := []reachabilityFocus{focusSubject}
 	if v.state[netpol.Ingress].visible {
 		targets = append(targets, focusIngress)
 	}
@@ -420,6 +422,11 @@ func (v *NetworkPolicyGraph) focusTargets() []reachabilityFocus {
 func (v *NetworkPolicyGraph) applyFocusTarget(target reachabilityFocus) {
 	v.focusTarget = target
 	switch target {
+	case focusSubject:
+		if v.app != nil {
+			v.app.SetFocus(v.subjectInfo)
+		}
+		return
 	case focusIngress:
 		v.focus = netpol.Ingress
 	case focusEgress:
@@ -447,31 +454,287 @@ func (v *NetworkPolicyGraph) applyFocusTarget(target reachabilityFocus) {
 	v.updateDetails(v.focus)
 }
 
-func (v *NetworkPolicyGraph) updateHeader() {
+func (v *NetworkPolicyGraph) updateSubject() {
 	subject := v.subject
 	path := subject.Name
 	if subject.Namespace != "" {
 		path = subject.Namespace + "/" + subject.Name
 	}
-	status := ""
+	podCount := 0
+	if v.haveResult {
+		podCount = len(v.result.Subject.Pods)
+	}
+	extras := []string{}
 	if v.haveResult && v.result.Truncated {
-		status += fmt.Sprintf(" | TRUNCATED at %d results", v.result.ResultLimit)
+		extras = append(extras, fmt.Sprintf("TRUNCATED at %d results", v.result.ResultLimit))
 	}
 	warnings := len(v.result.Warnings)
 	if refresh := v.model.LastRefresh(); len(refresh.Incomplete) > 0 {
 		warnings += len(refresh.Incomplete)
 	}
 	if warnings > 0 {
-		status += fmt.Sprintf(" | PARTIAL DATA (%d warning(s))", warnings)
+		extras = append(extras, fmt.Sprintf("PARTIAL DATA (%d warning(s))", warnings))
 	}
 	if v.lastError != nil {
-		status += " | ERROR: " + v.lastError.Error()
+		extras = append(extras, "ERROR: "+v.lastError.Error())
 	}
-	v.header.SetText(fmt.Sprintf(
-		" %s %s | i:Ingress[%s] e:Egress[%s] m:Mode M:Both s:Subject f:Kinds /:Search r:Refresh%s",
-		subject.Kind, path, onOff(v.state[netpol.Ingress].visible),
-		onOff(v.state[netpol.Egress].visible), status,
-	))
+	workloads, workloadNotes := v.subjectWorkloads()
+	extras = append(extras, workloadNotes...)
+	summary := fmt.Sprintf("%s %s · %d %s · Ingress %s · Egress %s · Kinds: %s",
+		subject.Kind, path, podCount, pluralize("pod", podCount),
+		onOff(v.state[netpol.Ingress].visible),
+		onOff(v.state[netpol.Egress].visible),
+		primitiveKindsSummary(v.kinds),
+	)
+	if len(extras) > 0 {
+		summary += " · " + strings.Join(extras, " · ")
+	}
+	v.subjectInfo.SetSubject(subject, podCount).SetSummary(summary).SetWorkloads(workloads)
+}
+
+func (v *NetworkPolicyGraph) subjectWorkloads() ([]ui.SubjectWorkload, []string) {
+	if !v.haveResult {
+		return nil, nil
+	}
+	if v.app == nil || v.app.factory == nil {
+		return nil, []string{"workloads unavailable: no resource factory"}
+	}
+	switch v.subject.Kind {
+	case netpol.SubjectNamespace:
+		return v.namespaceSubjectWorkloads(v.subject.Name)
+	case netpol.SubjectPod, netpol.SubjectDeployment, netpol.SubjectJob:
+		return v.subjectPodWorkloads()
+	default:
+		return nil, nil
+	}
+}
+
+func (v *NetworkPolicyGraph) subjectPodWorkloads() ([]ui.SubjectWorkload, []string) {
+	pods := v.result.Subject.Pods
+	if len(pods) == 0 {
+		return nil, nil
+	}
+	byNamespace := make(map[string][]netpol.PodRef)
+	for _, pod := range pods {
+		byNamespace[pod.Namespace] = append(byNamespace[pod.Namespace], pod)
+	}
+	statuses := make(map[string]string, len(pods))
+	notes := []string{}
+	for namespace := range byNamespace {
+		objects, err := v.listUnstructured(client.PodGVR, namespace)
+		if err != nil {
+			return nil, []string{fmt.Sprintf("workloads unavailable: pod list in %s failed: %v", namespace, err)}
+		}
+		for _, object := range objects {
+			statuses[objectKey(object.GetNamespace(), object.GetName())] = podStatus(object)
+		}
+	}
+	workloads := make([]ui.SubjectWorkload, 0, min(len(pods), subjectInfoRowLimit))
+	truncated := false
+	for _, pod := range pods {
+		if len(workloads) >= subjectInfoRowLimit {
+			truncated = true
+			break
+		}
+		workloads = append(workloads, ui.SubjectWorkload{
+			Kind:      "Pod",
+			Namespace: pod.Namespace,
+			Name:      pod.Name,
+			Status:    statuses[objectKey(pod.Namespace, pod.Name)],
+		})
+	}
+	if truncated {
+		notes = append(notes, fmt.Sprintf("workloads truncated at %d rows", subjectInfoRowLimit))
+	}
+	return workloads, notes
+}
+
+func (v *NetworkPolicyGraph) namespaceSubjectWorkloads(namespace string) ([]ui.SubjectWorkload, []string) {
+	specs := []struct {
+		gvr  *client.GVR
+		kind string
+	}{
+		{client.DpGVR, "Deployment"},
+		{client.RsGVR, "ReplicaSet"},
+		{client.StsGVR, "StatefulSet"},
+		{client.DsGVR, "DaemonSet"},
+		{client.JobGVR, "Job"},
+		{client.PodGVR, "Pod"},
+	}
+	workloads := make([]ui.SubjectWorkload, 0, subjectInfoRowLimit)
+	notes := []string{}
+	truncated := false
+	for _, spec := range specs {
+		if len(workloads) >= subjectInfoRowLimit {
+			truncated = true
+			break
+		}
+		objects, err := v.listUnstructured(spec.gvr, namespace)
+		if err != nil {
+			return nil, []string{fmt.Sprintf("workloads unavailable: %s list failed: %v", spec.kind, err)}
+		}
+		for _, object := range objects {
+			if len(workloads) >= subjectInfoRowLimit {
+				truncated = true
+				break
+			}
+			workloads = append(workloads, ui.SubjectWorkload{
+				Kind:      spec.kind,
+				Namespace: object.GetNamespace(),
+				Name:      object.GetName(),
+				Status:    workloadStatus(spec.kind, object),
+			})
+		}
+	}
+	if truncated {
+		notes = append(notes, fmt.Sprintf("workloads truncated at %d rows", subjectInfoRowLimit))
+	}
+	return workloads, notes
+}
+
+func (v *NetworkPolicyGraph) listUnstructured(gvr *client.GVR, namespace string) ([]*unstructured.Unstructured, error) {
+	objects, err := v.app.factory.List(gvr, namespace, true, labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+	items := make([]*unstructured.Unstructured, 0, len(objects))
+	for _, object := range objects {
+		if item, ok := object.(*unstructured.Unstructured); ok {
+			items = append(items, item)
+		}
+	}
+	return items, nil
+}
+
+func workloadStatus(kind string, object *unstructured.Unstructured) string {
+	switch kind {
+	case "Pod":
+		return podStatus(object)
+	case "Deployment", "ReplicaSet", "StatefulSet":
+		return readyReplicasStatus(object)
+	case "DaemonSet":
+		return daemonSetStatus(object)
+	case "Job":
+		return jobStatus(object)
+	default:
+		return ""
+	}
+}
+
+func podStatus(object *unstructured.Unstructured) string {
+	phase, _, _ := unstructured.NestedString(object.Object, "status", "phase")
+	ready, total := podReadyContainers(object)
+	parts := []string{}
+	if phase != "" {
+		parts = append(parts, phase)
+	}
+	if total > 0 {
+		parts = append(parts, fmt.Sprintf("%d/%d ready", ready, total))
+	}
+	if owner := ownerSummary(object); owner != "" {
+		parts = append(parts, "owner "+owner)
+	}
+	return strings.Join(parts, " · ")
+}
+
+func podReadyContainers(object *unstructured.Unstructured) (int, int) {
+	statuses, _, _ := unstructured.NestedSlice(object.Object, "status", "containerStatuses")
+	ready := 0
+	for _, status := range statuses {
+		statusMap, ok := status.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if value, ok := statusMap["ready"].(bool); ok && value {
+			ready++
+		}
+	}
+	total := len(statuses)
+	if total == 0 {
+		containers, _, _ := unstructured.NestedSlice(object.Object, "spec", "containers")
+		total = len(containers)
+	}
+	return ready, total
+}
+
+func ownerSummary(object *unstructured.Unstructured) string {
+	owners := object.GetOwnerReferences()
+	if len(owners) == 0 {
+		return ""
+	}
+	return owners[0].Kind + "/" + owners[0].Name
+}
+
+func readyReplicasStatus(object *unstructured.Unstructured) string {
+	ready, _, _ := unstructured.NestedInt64(object.Object, "status", "readyReplicas")
+	desired, found, _ := unstructured.NestedInt64(object.Object, "spec", "replicas")
+	if !found {
+		desired = 0
+	}
+	return fmt.Sprintf("%d/%d ready", ready, desired)
+}
+
+func daemonSetStatus(object *unstructured.Unstructured) string {
+	ready, _, _ := unstructured.NestedInt64(object.Object, "status", "numberReady")
+	desired, _, _ := unstructured.NestedInt64(object.Object, "status", "desiredNumberScheduled")
+	return fmt.Sprintf("%d/%d ready", ready, desired)
+}
+
+func jobStatus(object *unstructured.Unstructured) string {
+	for _, condition := range jobConditions(object) {
+		if conditionType, _ := condition["type"].(string); conditionType != "" {
+			if status, _ := condition["status"].(string); status == "True" {
+				return conditionType
+			}
+		}
+	}
+	succeeded, _, _ := unstructured.NestedInt64(object.Object, "status", "succeeded")
+	completions, found, _ := unstructured.NestedInt64(object.Object, "spec", "completions")
+	if !found {
+		completions = 1
+	}
+	return fmt.Sprintf("%d/%d complete", succeeded, completions)
+}
+
+func jobConditions(object *unstructured.Unstructured) []map[string]interface{} {
+	conditions, _, _ := unstructured.NestedSlice(object.Object, "status", "conditions")
+	items := make([]map[string]interface{}, 0, len(conditions))
+	for _, condition := range conditions {
+		if item, ok := condition.(map[string]interface{}); ok {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func objectKey(namespace, name string) string {
+	return namespace + "/" + name
+}
+
+func primitiveKindsSummary(kinds sets.Set[netpol.PrimitiveKind]) string {
+	if len(kinds) == 0 {
+		return "none"
+	}
+	names := make([]string, 0, len(kinds))
+	for _, kind := range []netpol.PrimitiveKind{
+		netpol.PrimitiveCIDR,
+		netpol.PrimitivePod,
+		netpol.PrimitiveNamespace,
+		netpol.PrimitiveDeployment,
+		netpol.PrimitiveJob,
+	} {
+		if kinds.Has(kind) {
+			names = append(names, kind.String())
+		}
+	}
+	return strings.Join(names, ",")
+}
+
+func pluralize(word string, count int) string {
+	if count == 1 {
+		return word
+	}
+	return word + "s"
 }
 
 func onOff(value bool) string {
@@ -500,8 +763,9 @@ func (v *NetworkPolicyGraph) updateDetails(direction netpol.Direction) {
 			v.showMessage("Selected rule is no longer available.")
 			return
 		}
-		rows := v.evaluator.RuleApplicability(v.result, direction, rule.ID, v.state[direction].kinds)
+		rows := v.evaluator.RuleApplicability(v.result, direction, rule.ID, v.kinds)
 		ruleDetail := ui.NewRuleDetailsWithStyle(rule, rows, v.reachabilityStyle())
+		v.applyDetailFocusStyle(ruleDetail)
 		var text strings.Builder
 		text.WriteString(v.detailPrefix(direction))
 		text.WriteString("\n")
@@ -517,6 +781,7 @@ func (v *NetworkPolicyGraph) updateDetails(direction netpol.Direction) {
 		}
 		text := ui.NewPrimitiveDetails(primitive)
 		text.SetText(v.primitiveDetails(direction, &primitive))
+		v.applyTextFocusStyle(text)
 		detail = text
 	}
 	v.details.AddItem(detail, 0, 1, false)
@@ -580,6 +845,7 @@ func (v *NetworkPolicyGraph) showMessage(message string) {
 	v.details.Clear()
 	text := tview.NewTextView().SetText(message).SetWrap(true)
 	text.SetBorder(true).SetTitle(" Details ")
+	v.applyTextFocusStyle(text)
 	v.details.AddItem(text, 0, 1, false)
 	v.detailItem = text
 }
@@ -596,7 +862,7 @@ func (v *NetworkPolicyGraph) selectedRule(direction netpol.Direction, id string)
 }
 
 func (v *NetworkPolicyGraph) selectedPrimitive(direction netpol.Direction, id string) (netpol.PrimitiveResult, bool) {
-	primitives := v.evaluator.Primitives(v.result, direction, v.state[direction].kinds)
+	primitives := v.evaluator.Primitives(v.result, direction, v.kinds)
 	for index := range primitives {
 		primitive := &primitives[index]
 		if primitive.StableID() == id {
@@ -611,10 +877,13 @@ func (v *NetworkPolicyGraph) openKindsDialog() {
 		return
 	}
 	styles := v.app.Styles.Dialog()
-	dialog := ui.NewPrimitiveKindDialog(v.state[v.focus].kinds, func(kinds sets.Set[netpol.PrimitiveKind]) {
+	dialog := ui.NewPrimitiveKindDialog(v.kinds, func(kinds sets.Set[netpol.PrimitiveKind]) {
 		v.app.Content.RemovePage(netPolKindsDialogPage)
-		v.state[v.focus].kinds = kinds
-		v.loadPanel(v.focus)
+		v.kinds = kinds
+		for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+			v.loadPanel(direction)
+		}
+		v.updateSubject()
 		v.updateDetails(v.focus)
 		v.app.SetFocus(v.panels[v.focus])
 	}, func() {
@@ -622,7 +891,7 @@ func (v *NetworkPolicyGraph) openKindsDialog() {
 		v.app.SetFocus(v.panels[v.focus])
 	})
 	styleForm(dialog.Form, &styles)
-	modal := tview.NewModalForm("<Primitive Kinds>", dialog.Form)
+	modal := tview.NewModalForm("<Primitive Kinds (global)>", dialog.Form)
 	modal.SetBackgroundColor(styles.BgColor.Color()).SetTextColor(styles.FgColor.Color())
 	modal.SetDoneFunc(func(int, string) { dialog.Cancel() })
 	v.app.Content.AddPage(netPolKindsDialogPage, modal, false, false)
@@ -708,7 +977,7 @@ func (v *NetworkPolicyGraph) applySubject(ref netpol.SubjectRef) {
 	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
 		v.loadPanel(direction)
 	}
-	v.updateHeader()
+	v.updateSubject()
 	v.showMessage("Waiting for NetworkPolicy evaluation...")
 	if v.app != nil {
 		v.app.SetFocus(v.panels[v.focus])
@@ -932,15 +1201,41 @@ func (v *NetworkPolicyGraph) reachabilityStyle() config.Reachability {
 	return v.app.Styles.Reachability()
 }
 
+func (v *NetworkPolicyGraph) reachabilityFocusColor() tcell.Color {
+	if v.app == nil {
+		return config.NewStyles().Reachability().FocusColor.Color()
+	}
+	return v.app.Styles.Reachability().FocusColor.Color()
+}
+
+func (v *NetworkPolicyGraph) applyTextFocusStyle(text *tview.TextView) {
+	text.SetBorder(true)
+	text.SetBorderFocusColor(v.reachabilityFocusColor())
+	text.SetBorderAttributes(tcell.AttrBold)
+}
+
+func (v *NetworkPolicyGraph) applyTableFocusStyle(table *tview.Table) {
+	table.SetBorder(true)
+	table.SetBorderFocusColor(v.reachabilityFocusColor())
+	table.SetBorderAttributes(tcell.AttrBold)
+}
+
+func (v *NetworkPolicyGraph) applyDetailFocusStyle(detail *ui.RuleDetails) {
+	v.applyTextFocusStyle(detail.Text)
+	v.applyTableFocusStyle(detail.Applicability)
+}
+
 // StylesChanged applies reachability and frame skin settings.
 func (v *NetworkPolicyGraph) StylesChanged(styles *config.Styles) {
 	reachability := styles.Reachability()
 	for _, panel := range v.panels {
 		panel.SetReachabilityStyle(reachability)
-		panel.SetBorderFocusColor(styles.Frame().Border.FocusColor.Color())
+		panel.SetBorderFocusColor(reachability.FocusColor.Color())
 	}
 	v.SetBackgroundColor(styles.BgColor())
-	v.header.SetTextColor(styles.FgColor())
+	v.subjectInfo.SetStyles(styles)
+	v.subjectInfo.SetBorderFocusColor(v.reachabilityFocusColor())
+	v.subjectInfo.SetBorderAttributes(tcell.AttrBold)
 	if v.haveResult {
 		v.updateDetails(v.focus)
 	}

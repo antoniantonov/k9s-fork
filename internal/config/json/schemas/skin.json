@@ -116,7 +116,8 @@
               "properties": {
                 "allowedColor": {"type": "string"},
                 "disallowedColor": {"type": "string"},
-                "partialDataColor": {"type": "string"}
+                "partialDataColor": {"type": "string"},
+                "focusColor": {"type": "string"}
               }
             },
             "charts": {

@@ -137,6 +137,7 @@ type (
 		AllowedColor     Color `json:"allowedColor" yaml:"allowedColor"`
 		DisallowedColor  Color `json:"disallowedColor" yaml:"disallowedColor"`
 		PartialDataColor Color `json:"partialDataColor" yaml:"partialDataColor"`
+		FocusColor       Color `json:"focusColor" yaml:"focusColor"`
 	}
 
 	// Status tracks resource status styles.
@@ -329,6 +330,7 @@ func newReachability() Reachability {
 		AllowedColor:     "green",
 		DisallowedColor:  "red",
 		PartialDataColor: "orange",
+		FocusColor:       "orange",
 	}
 }
 
@@ -728,6 +730,7 @@ func (r *Reachability) Invert() {
 	r.AllowedColor = r.AllowedColor.InvertColor()
 	r.DisallowedColor = r.DisallowedColor.InvertColor()
 	r.PartialDataColor = r.PartialDataColor.InvertColor()
+	r.FocusColor = r.FocusColor.InvertColor()
 }
 
 // Invert inverts all colors in Table.

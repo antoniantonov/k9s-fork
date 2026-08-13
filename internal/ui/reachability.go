@@ -71,7 +71,6 @@ type DirectionPanel struct {
 	primitives []netpol.PrimitiveResult
 	filter     string
 	emptyText  string
-	kinds      sets.Set[netpol.PrimitiveKind]
 	ascii      bool
 	blocks     []reachabilityBlock
 	blockRows  []int
@@ -128,6 +127,14 @@ func (p *DirectionPanel) SetReachabilityStyle(style config.Reachability) *Direct
 		partialData: style.PartialDataColor.Color(),
 	}
 	p.rebuild()
+	return p
+}
+
+// SetBorderFocusColor applies the focused border color and makes the border
+// visually stronger when focus is rendered.
+func (p *DirectionPanel) SetBorderFocusColor(color tcell.Color) *DirectionPanel {
+	p.Table.SetBorderFocusColor(color)
+	p.SetBorderAttributes(tcell.AttrBold)
 	return p
 }
 
@@ -194,14 +201,6 @@ func (p *DirectionPanel) SetFilter(filter string) *DirectionPanel {
 		p.filter = filter
 		p.rebuild()
 	}
-	return p
-}
-
-// SetEnabledKinds annotates the title with the primitive kinds enabled for
-// this direction.
-func (p *DirectionPanel) SetEnabledKinds(kinds sets.Set[netpol.PrimitiveKind]) *DirectionPanel {
-	p.kinds = clonePrimitiveKinds(kinds)
-	p.updateTitle()
 	return p
 }
 
@@ -282,19 +281,6 @@ func (p *DirectionPanel) RestoreScrollState(state ReachabilityScrollState) {
 // PanelTitle returns the title generated from direction, mode, and filter.
 func (p *DirectionPanel) PanelTitle() string {
 	title := fmt.Sprintf(" %s · %s ", p.direction, p.projection)
-	if p.kinds != nil {
-		names := make([]string, 0, len(p.kinds))
-		for _, kind := range primitiveKinds() {
-			if p.kinds.Has(kind) {
-				names = append(names, kind.String())
-			}
-		}
-		enabled := "none"
-		if len(names) > 0 {
-			enabled = strings.Join(names, ",")
-		}
-		title = fmt.Sprintf(" %s · %s · kinds: %s ", p.direction, p.projection, enabled)
-	}
 	if p.filter != "" {
 		title = strings.TrimSuffix(title, " ") + fmt.Sprintf(" · filter: %s ", p.filter)
 	}

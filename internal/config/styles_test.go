@@ -22,6 +22,7 @@ func TestNewStyle(t *testing.T) {
 	assert.Equal(t, config.Color("green"), s.Reachability().AllowedColor)
 	assert.Equal(t, config.Color("red"), s.Reachability().DisallowedColor)
 	assert.Equal(t, config.Color("orange"), s.Reachability().PartialDataColor)
+	assert.Equal(t, config.Color("orange"), s.Reachability().FocusColor)
 }
 
 func TestReachabilityStyleInvert(t *testing.T) {
@@ -33,6 +34,7 @@ func TestReachabilityStyleInvert(t *testing.T) {
 	assert.Equal(t, before.AllowedColor.InvertColor(), s.Reachability().AllowedColor)
 	assert.Equal(t, before.DisallowedColor.InvertColor(), s.Reachability().DisallowedColor)
 	assert.Equal(t, before.PartialDataColor.InvertColor(), s.Reachability().PartialDataColor)
+	assert.Equal(t, before.FocusColor.InvertColor(), s.Reachability().FocusColor)
 }
 
 func TestReachabilitySkin(t *testing.T) {
@@ -42,6 +44,7 @@ func TestReachabilitySkin(t *testing.T) {
 	assert.Equal(t, config.Color("#006b3c"), s.Reachability().AllowedColor)
 	assert.Equal(t, config.Color("#a51c30"), s.Reachability().DisallowedColor)
 	assert.Equal(t, config.Color("#9c5700"), s.Reachability().PartialDataColor)
+	assert.Equal(t, config.Color("#c05621"), s.Reachability().FocusColor)
 }
 
 func TestColor(t *testing.T) {
