@@ -43,6 +43,7 @@ type ReachabilityScrollState struct {
 	Column      int
 	SelectedRow int
 	SelectedID  string
+	Cleared     bool
 }
 
 type reachabilityBlock struct {
@@ -76,6 +77,7 @@ type DirectionPanel struct {
 	blockRows  []int
 	selected   func(string)
 	changing   bool
+	cleared    bool
 	colors     reachabilityColors
 	cursorFg   tcell.Color
 	cursorBg   tcell.Color
@@ -231,8 +233,21 @@ func (p *DirectionPanel) SetSelectionChangedFunc(callback func(string)) *Directi
 	return p
 }
 
+// ClearSelection leaves the panel with no selected block.
+func (p *DirectionPanel) ClearSelection() {
+	p.clearSelection(true)
+}
+
+// HasSelection reports whether a block is currently selected.
+func (p *DirectionPanel) HasSelection() bool {
+	return !p.cleared && len(p.blocks) > 0
+}
+
 // SelectedID returns the stable ID of the selected block.
 func (p *DirectionPanel) SelectedID() string {
+	if p.cleared {
+		return ""
+	}
 	row, _ := p.GetSelection()
 	index := p.blockIndexAtRow(row)
 	if index < 0 {
@@ -261,6 +276,7 @@ func (p *DirectionPanel) ScrollState() ReachabilityScrollState {
 		Column:      column,
 		SelectedRow: selectedRow,
 		SelectedID:  p.SelectedID(),
+		Cleared:     p.cleared,
 	}
 }
 
@@ -268,6 +284,10 @@ func (p *DirectionPanel) ScrollState() ReachabilityScrollState {
 // longer present, the nearest block to the old row is selected.
 func (p *DirectionPanel) RestoreScrollState(state ReachabilityScrollState) {
 	p.SetOffset(max(0, state.Row), max(0, state.Column))
+	if state.Cleared {
+		p.clearSelection(false)
+		return
+	}
 	if state.SelectedID != "" && p.SelectID(state.SelectedID) {
 		return
 	}
@@ -316,12 +336,20 @@ func (p *DirectionPanel) rebuild() {
 
 	p.updateTitle()
 	if len(p.blocks) == 0 {
+		if old.Cleared {
+			p.clearSelection(false)
+		}
 		if p.emptyText != "" {
 			p.SetCell(0, 0, tview.NewTableCell(p.emptyText).
 				SetTextColor(tview.Styles.SecondaryTextColor).
 				SetSelectable(false).
 				SetExpansion(1))
 		}
+		return
+	}
+	if old.Cleared {
+		p.clearSelection(false)
+		p.SetOffset(old.Row, old.Column)
 		return
 	}
 	if old.SelectedID != "" {
@@ -402,7 +430,7 @@ func (p *DirectionPanel) updateTitle() {
 }
 
 func (p *DirectionPanel) selectionChanged(row, _ int) {
-	if p.changing || len(p.blocks) == 0 {
+	if p.changing || p.cleared || len(p.blocks) == 0 {
 		return
 	}
 	index := p.blockIndexAtRow(row)
@@ -417,12 +445,28 @@ func (p *DirectionPanel) selectBlock(index int, notify bool) {
 		return
 	}
 	p.changing = true
+	p.cleared = false
+	p.SetSelectable(true, false)
 	row := p.blockRows[index]
 	p.Select(row, 0)
 	p.applySelectionStyle()
 	p.changing = false
 	if notify && p.selected != nil {
 		p.selected(p.blocks[index].id)
+	}
+}
+
+func (p *DirectionPanel) clearSelection(notify bool) {
+	if p.cleared {
+		p.SetSelectable(false, false)
+		return
+	}
+	p.changing = true
+	p.cleared = true
+	p.SetSelectable(false, false)
+	p.changing = false
+	if notify && p.selected != nil {
+		p.selected("")
 	}
 }
 
@@ -455,6 +499,18 @@ func (p *DirectionPanel) nearestBlockForRow(row int) int {
 func (p *DirectionPanel) captureInput(event *tcell.EventKey) *tcell.EventKey {
 	if len(p.blocks) == 0 {
 		return event
+	}
+	if p.cleared {
+		switch event.Key() {
+		case tcell.KeyDown, tcell.KeyPgDn, tcell.KeyHome:
+			p.selectBlock(0, true)
+			return nil
+		case tcell.KeyUp, tcell.KeyPgUp, tcell.KeyEnd:
+			p.selectBlock(len(p.blocks)-1, true)
+			return nil
+		default:
+			return event
+		}
 	}
 	row, _ := p.GetSelection()
 	current := p.blockIndexAtRow(row)
@@ -672,11 +728,11 @@ func NewRuleDetailsWithStyle(
 	applicability []netpol.ApplicabilityRow,
 	style config.Reachability,
 ) *RuleDetails {
-	return newRuleDetails(&rule, applicability, reachabilityColors{
+	return newRuleDetailsWithTitle(&rule, applicability, reachabilityColors{
 		allowed:     style.AllowedColor.Color(),
 		disallowed:  style.DisallowedColor.Color(),
 		partialData: style.PartialDataColor.Color(),
-	})
+	}, " Rule Details ")
 }
 
 func newRuleDetails(
@@ -684,16 +740,51 @@ func newRuleDetails(
 	applicability []netpol.ApplicabilityRow,
 	colors reachabilityColors,
 ) *RuleDetails {
+	return newRuleDetailsWithTitle(rule, applicability, colors, " Rule Details ")
+}
+
+func newRuleDetailsWithTitle(
+	rule *netpol.RuleResult,
+	applicability []netpol.ApplicabilityRow,
+	colors reachabilityColors,
+	title string,
+) *RuleDetails {
+	return newRuleDetailsFromText(RuleDetailsText(*rule), applicability, colors, title, " Applicability ")
+}
+
+func newRuleDetailsFromText(
+	body string,
+	applicability []netpol.ApplicabilityRow,
+	colors reachabilityColors,
+	textTitle string,
+	applicabilityTitle string,
+) *RuleDetails {
 	text := tview.NewTextView().
-		SetText(RuleDetailsText(*rule)).
+		SetText(body).
 		SetScrollable(true).
 		SetWrap(true)
-	text.SetBorder(true).SetTitle(" Rule Details ")
-	table := newApplicabilityTable(applicability, colors)
+	text.SetBorder(true).SetTitle(textTitle)
+	table := newApplicabilityTableWithTitle(applicability, colors, applicabilityTitle)
 	flex := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(text, 0, 1, true).
 		AddItem(table, 0, 1, false)
 	return &RuleDetails{Flex: flex, Text: text, Applicability: table}
+}
+
+// NewEffectiveDetailsWithStyle renders the effective applicability of an entire
+// direction: the primitive states after every rule has been applied.
+//
+//nolint:gocritic // Value parameter preserves the public constructor API.
+func NewEffectiveDetailsWithStyle(
+	text string,
+	rows []netpol.ApplicabilityRow,
+	style config.Reachability,
+) *RuleDetails {
+	return newRuleDetailsFromText(text, rows, reachabilityColors{
+		allowed:     style.AllowedColor.Color(),
+		disallowed:  style.DisallowedColor.Color(),
+		partialData: style.PartialDataColor.Color(),
+	}, " Effective Details ", " Effective Applicability ")
 }
 
 // RuleDetailsText renders the non-tabular rule detail fields.
@@ -736,10 +827,18 @@ func NewApplicabilityTableWithStyle(rows []netpol.ApplicabilityRow, style config
 }
 
 func newApplicabilityTable(rows []netpol.ApplicabilityRow, colors reachabilityColors) *tview.Table {
+	return newApplicabilityTableWithTitle(rows, colors, " Applicability ")
+}
+
+func newApplicabilityTableWithTitle(
+	rows []netpol.ApplicabilityRow,
+	colors reachabilityColors,
+	title string,
+) *tview.Table {
 	table := tview.NewTable().
 		SetSelectable(true, false).
 		SetFixed(1, 0)
-	table.SetBorder(true).SetTitle(" Applicability ")
+	table.SetBorder(true).SetTitle(title)
 	headers := []string{"Primitive", "Peer", "Opposite", "State", "Ports"}
 	for column, header := range headers {
 		table.SetCell(0, column, tview.NewTableCell(header).

@@ -237,6 +237,27 @@ Binaries for Linux, Windows and Mac are available as tarballs in the [release pa
   docker run --rm -it -v ~/.kube/config:/root/.kube/config k9s-docker:0.1
   ```
 
+#### Building a local versioned image
+
+  The `scripts/docker-build.sh` helper rebuilds the k9s Docker image locally
+  with `docker build` and tags it with the next patch version. It scans
+  existing local `k9s:X.Y.Z` image tags, picks the highest version, and
+  increments the patch component. If no versioned tag exists, it starts at
+  `0.0.1`. The script does not tag `latest`.
+
+  ```shell
+  ./scripts/docker-build.sh
+  ```
+
+  Set `IMAGE_NAME` to build and scan tags for a different local image name:
+
+  ```shell
+  IMAGE_NAME=my-k9s ./scripts/docker-build.sh
+  ```
+
+  After a successful build the script prints a ready-to-paste `docker run`
+  command for the version it just built.
+
 #### Building a multi-platform image
 
   The `make imgx` target builds for `linux/amd64` and `linux/arm64` via Docker
@@ -489,7 +510,9 @@ pods; Namespace subjects list the namespace's deployments, replicasets,
 statefulsets, daemonsets, jobs, and pods. Rows are sorted by namespace and name
 and capped at 300.
 
-Each direction has two display modes:
+Each direction has two display modes, but the projection mode is shared
+between ingress and egress: pressing `m` switches both directions at once.
+Per-direction filters, selection, and scroll position remain independent.
 
 - **Rules** lists the NetworkPolicy rules selecting the subject, including
   synthetic unrestricted/default-deny explanations where applicable.
@@ -503,21 +526,21 @@ Each direction has two display modes:
 |---|---|
 | `i` | Show or hide ingress |
 | `e` | Show or hide egress |
-| `m` | Toggle Rules/Primitives for the focused direction |
-| `M` | Apply the focused mode to both visible directions |
+| `m` | Toggle Rules/Primitives for both directions |
 | `s` | Change the reachability subject |
 | `f` | Configure CIDR/Pod/Namespace/Deployment/Job filters |
 | `Up` / `Down` | Select the previous/next rule or primitive |
 | `PageUp` / `PageDown` | Move selection by one page |
 | `Home` / `End` | Select the first/last item |
 | `Left` / `Right` | Focus ingress/egress |
-| `Tab` / `Shift-Tab` | Cycle visible directions and details |
-| `Enter` | Expand aggregate details or focus rule applicability |
+| `Tab` / `Shift-Tab` | Cycle subject, directions, details, and applicability |
+| `Enter` | Open the selected resource |
+| `o` | Open the selected resource |
 | `y` | Open YAML for selected policy evidence |
 | `/` | Filter visible items by text |
 | `r` | Enable or disable auto-refresh (disabled by default) |
 | `Ctrl-R` | Reevaluate reachability now |
-| `Esc` | Close a dialog/filter or return to the previous view |
+| `Esc` | Clear focused selection; with none selected, close dialog/filter or go back |
 
 Reachability is evaluated once when the view opens. Auto-refresh is **off** by
 default: press `r` to reevaluate every 5 seconds, or `Ctrl-R` for a one-off
@@ -525,9 +548,17 @@ refresh. The current state is shown in the subject summary line. Refreshing
 preserves the selected rule, primitive, applicability row, subject workload,
 and scroll position.
 
-Hiding a direction does not discard its mode, filters, selection, or scroll
-position. If both directions are hidden, the subject and details remain
-visible.
+Hiding a direction does not discard its filters, selection, or scroll
+position. The Rules/Primitives mode is global, so it remains shared even while
+one direction is hidden. If both directions are hidden, the subject and details
+remain visible.
+
+Press `Enter` or `o` to open the Kubernetes resource behind the selected row.
+Rules mode opens the NetworkPolicy; Primitives mode opens the selected Pod,
+Namespace, Deployment, or Job. CIDR primitives are not Kubernetes resources and
+cannot be opened. The reachability view appears in the breadcrumb trail as
+`<npg>`, so opening a resource pushes it onto the stack and `Esc` walks back
+through breadcrumbs such as `<npg> <pods> <containers>`.
 
 ### Results and details
 
@@ -547,6 +578,17 @@ the table's effective result also checks policy on the opposite endpoint.
 NetworkPolicy has additive allow rules, not explicit deny rules, so a
 disallowed result means an endpoint is isolated and no matching allow rule was
 found.
+
+Pressing `Esc` clears the selection in the focused direction. With nothing
+selected, the details panel shows that direction's effective reachability: the
+state of every primitive after all rules have been applied, rather than one
+rule's contribution. The header reports the direction, current mode, enabled
+primitive kinds, and a per-state count that always sums to the number of
+primitives shown; the table
+below lists each primitive with its effective state and ports. This is the
+aggregate of every evaluated rule. Selecting a rule or primitive returns to the
+per-item view. Effective details work in Rules and Primitives mode and cover
+the focused direction only.
 
 Named ports are resolved against destination pod container ports when they can
 be determined safely. Ambiguous named ports and unsupported semantics are

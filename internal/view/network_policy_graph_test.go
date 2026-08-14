@@ -6,6 +6,7 @@ package view
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -220,21 +221,38 @@ func TestNetworkPolicyGraphModesKeepIndependentState(t *testing.T) {
 
 	view.applySearch("allow-api")
 	view.savePanelState(netpol.Ingress)
-	view.switchMode(netpol.Ingress)
-	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Ingress].mode)
+	view.switchMode()
+	assert.Equal(t, ui.PrimitivesProjection, view.mode)
+	assert.Equal(t, ui.PrimitivesProjection, ingress.Projection())
+	assert.Equal(t, ui.PrimitivesProjection, view.panels[netpol.Egress].Projection())
 	assert.Empty(t, ingress.Filter())
 
 	view.applySearch("peer")
 	primitiveID := ingress.SelectedID()
-	view.switchMode(netpol.Ingress)
-	assert.Equal(t, ui.RulesProjection, view.state[netpol.Ingress].mode)
+	require.NotEmpty(t, primitiveID)
+	view.focusDirection(netpol.Egress)
+	assert.Empty(t, view.panels[netpol.Egress].Filter())
+	view.applySearch("egress-peer")
+
+	view.switchMode()
+	assert.Equal(t, ui.RulesProjection, view.mode)
 	assert.Equal(t, "allow-api", ingress.Filter())
 	assert.Equal(t, ruleID, ingress.SelectedID())
+	assert.Empty(t, view.panels[netpol.Egress].Filter())
 
-	view.switchMode(netpol.Ingress)
+	view.focusDirection(netpol.Egress)
+	view.applySearch("egress-rule")
+
+	view.switchMode()
+	assert.Equal(t, ui.PrimitivesProjection, view.mode)
 	assert.Equal(t, "peer", ingress.Filter())
 	assert.Equal(t, primitiveID, ingress.SelectedID())
-	assert.Equal(t, ui.RulesProjection, view.state[netpol.Egress].mode)
+	assert.Equal(t, "egress-peer", view.panels[netpol.Egress].Filter())
+
+	view.switchMode()
+	assert.Equal(t, ui.RulesProjection, view.mode)
+	assert.Equal(t, "allow-api", ingress.Filter())
+	assert.Equal(t, "egress-rule", view.panels[netpol.Egress].Filter())
 }
 
 func TestNetworkPolicyGraphGlobalKindsAndEmptySelection(t *testing.T) {
@@ -250,10 +268,9 @@ func TestNetworkPolicyGraphGlobalKindsAndEmptySelection(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 1, ruleDetails.Applicability.GetRowCount(), "global kind filters constrain applicability")
 
-	view.switchMode(netpol.Ingress)
+	view.switchMode()
 	assert.Contains(t, view.panels[netpol.Ingress].GetCell(0, 0).Text, "No primitive kinds selected")
 	assert.True(t, view.panels[netpol.Ingress].GetCell(0, 0).NotSelectable)
-	view.switchMode(netpol.Egress)
 	assert.Contains(t, view.panels[netpol.Egress].GetCell(0, 0).Text, "No primitive kinds selected")
 
 	view.kinds = sets.New(netpol.PrimitivePod)
@@ -289,7 +306,7 @@ func TestNetworkPolicyGraphDetailsUseGlobalKindsAndExposeWarnings(t *testing.T) 
 
 	view.kinds = netpol.AllPrimitiveKinds()
 	view.loadPanel(netpol.Ingress)
-	view.switchMode(netpol.Ingress)
+	view.switchMode()
 	primitiveText, ok := view.detailItem.(*tview.TextView)
 	require.True(t, ok)
 	text := primitiveText.GetText(true)
@@ -307,18 +324,16 @@ func TestNetworkPolicyGraphKeyboardModesFocusAndNavigation(t *testing.T) {
 	view.applyResult(testSubjectResult())
 
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'm', tcell.ModNone)))
-	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Ingress].mode)
-	// Shift-M propagates the focused mode; it must not toggle it first.
-	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'M', tcell.ModShift)))
-	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Ingress].mode)
-	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Egress].mode)
+	assert.Equal(t, ui.PrimitivesProjection, view.mode)
+	assert.Equal(t, ui.PrimitivesProjection, view.panels[netpol.Ingress].Projection())
+	assert.Equal(t, ui.PrimitivesProjection, view.panels[netpol.Egress].Projection())
 
 	// Applicability focus only exists in Rules mode, so return both panels to it
 	// before exercising the focus cycle below.
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'm', tcell.ModNone)))
-	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'M', tcell.ModShift)))
-	assert.Equal(t, ui.RulesProjection, view.state[netpol.Ingress].mode)
-	assert.Equal(t, ui.RulesProjection, view.state[netpol.Egress].mode)
+	assert.Equal(t, ui.RulesProjection, view.mode)
+	assert.Equal(t, ui.RulesProjection, view.panels[netpol.Ingress].Projection())
+	assert.Equal(t, ui.RulesProjection, view.panels[netpol.Egress].Projection())
 
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModNone)))
 	assert.Equal(t, netpol.Egress, view.focus)
@@ -340,10 +355,9 @@ func TestNetworkPolicyGraphKeyboardModesFocusAndNavigation(t *testing.T) {
 	assert.Equal(t, focusIngress, view.focusTarget)
 
 	view.focusDirection(netpol.Ingress)
-	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
-	assert.Equal(t, focusDetails, view.focusTarget)
-	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
-	assert.Equal(t, focusApplicability, view.focusTarget)
+	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+	assert.Equal(t, enter, view.keyboard(enter))
+	assert.Equal(t, focusIngress, view.focusTarget)
 
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'i', tcell.ModNone)))
 	assert.False(t, view.state[netpol.Ingress].visible)
@@ -351,29 +365,344 @@ func TestNetworkPolicyGraphKeyboardModesFocusAndNavigation(t *testing.T) {
 	assert.NotNil(t, view.keyboard(tcell.NewEventKey(tcell.KeyUp, 0, tcell.ModNone)))
 }
 
-func TestNetworkPolicyGraphShiftMDoesNotModifyHiddenPanelMode(t *testing.T) {
+func TestNetworkPolicyGraphSwitchModeIsGlobal(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
-	view.toggleDirection(netpol.Egress)
 
-	view.switchMode(netpol.Ingress)
-	view.switchVisibleModesFromFocus()
-	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Ingress].mode)
-	assert.Equal(t, ui.RulesProjection, view.state[netpol.Egress].mode)
+	view.focusDirection(netpol.Egress)
+	view.switchMode()
+	assert.Equal(t, ui.PrimitivesProjection, view.mode)
+	assert.Equal(t, ui.PrimitivesProjection, view.panels[netpol.Ingress].Projection())
+	assert.Equal(t, ui.PrimitivesProjection, view.panels[netpol.Egress].Projection())
+
+	view.focusDirection(netpol.Ingress)
+	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'm', tcell.ModNone)))
+	assert.Equal(t, ui.RulesProjection, view.mode)
+	assert.Equal(t, ui.RulesProjection, view.panels[netpol.Ingress].Projection())
+	assert.Equal(t, ui.RulesProjection, view.panels[netpol.Egress].Projection())
 }
 
-func TestNetworkPolicyGraphShiftMPropagatesFocusedModeWithoutToggling(t *testing.T) {
+func TestNetworkPolicyGraphOpenResourceKeys(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
+
+	open, ok := view.actions.Get(ui.KeyO)
+	require.True(t, ok)
+	assert.Equal(t, "Open Resource", open.Description)
+	assert.True(t, open.Opts.Visible)
+	enterAction, ok := view.actions.Get(tcell.KeyEnter)
+	require.True(t, ok)
+	assert.Equal(t, "Open Resource", enterAction.Description)
+	assert.False(t, enterAction.Opts.Visible)
+
+	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+	assert.Equal(t, enter, view.keyboard(enter), "nil-app rule navigation falls through without panicking")
+	o := tcell.NewEventKey(tcell.KeyRune, 'o', tcell.ModNone)
+	assert.Equal(t, o, view.keyboard(o), "nil-app rule navigation falls through without panicking")
+
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
+	assert.Equal(t, enter, view.keyboard(enter), "nil-app primitive navigation falls through without panicking")
+	assert.Equal(t, o, view.keyboard(o), "nil-app primitive navigation falls through without panicking")
+}
+
+func TestNetworkPolicyGraphName(t *testing.T) {
+	assert.Equal(t, "npg", newTestNetworkPolicyGraph().Name())
+}
+
+func TestNetworkPolicyGraphEscapeClearsSelectionBeforeBack(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	require.True(t, view.panels[netpol.Ingress].HasSelection())
+	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
+
+	evt := tcell.NewEventKey(tcell.KeyEscape, 0, tcell.ModNone)
+	assert.Nil(t, view.escapeCmd(evt))
+	assert.Equal(t, netpol.Ingress, view.focus)
+	assert.Empty(t, view.panels[netpol.Ingress].SelectedID())
+	assert.False(t, view.panels[netpol.Ingress].HasSelection())
+
+	assert.Equal(t, evt, view.escapeCmd(evt))
+}
+
+func TestNetworkPolicyGraphEffectiveDetailsWithoutSelection(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
 
-	view.switchMode(netpol.Ingress)
-	require.Equal(t, ui.PrimitivesProjection, view.state[netpol.Ingress].mode)
+	for _, projection := range []ui.ReachabilityProjection{ui.RulesProjection, ui.PrimitivesProjection} {
+		t.Run(projection.String(), func(t *testing.T) {
+			if view.mode != projection {
+				view.switchMode()
+			}
+			view.panels[netpol.Ingress].ClearSelection()
+			view.updateDetails(netpol.Ingress)
 
-	view.switchVisibleModesFromFocus()
-	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Ingress].mode,
-		"the focused panel must keep its mode")
-	assert.Equal(t, ui.PrimitivesProjection, view.state[netpol.Egress].mode,
-		"the other visible panel must adopt the focused mode")
+			details, ok := view.detailItem.(*ui.RuleDetails)
+			require.True(t, ok)
+			text := details.Text.GetText(true)
+			assert.Contains(t, text, "Selection: none")
+			assert.Contains(t, text, "Primitives:")
+			assert.Greater(t, details.Applicability.GetRowCount(), 1)
+		})
+	}
+}
+
+func TestNetworkPolicyGraphEffectiveDetailsAreFocusable(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.panels[netpol.Ingress].ClearSelection()
+	view.updateDetails(netpol.Ingress)
+
+	assert.Contains(t, view.focusTargets(), focusDetails)
+}
+
+// The per-state breakdown must account for every row, including Unknown,
+// otherwise the printed counts silently fail to add up to the total.
+func TestNetworkPolicyGraphEffectiveDetailsCountsSumToTotal(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+
+	rows := []netpol.ApplicabilityRow{
+		{EffectiveState: netpol.AccessAllowed},
+		{EffectiveState: netpol.AccessPartial},
+		{EffectiveState: netpol.AccessDisallowed},
+		{EffectiveState: netpol.AccessUnknown},
+		{EffectiveState: netpol.AccessPartialData},
+		{EffectiveState: netpol.AccessUnknown},
+	}
+	text := view.effectiveDetailsText(netpol.Ingress, rows)
+
+	line := ""
+	for _, candidate := range strings.Split(text, "\n") {
+		if strings.HasPrefix(candidate, "Primitives:") {
+			line = candidate
+			break
+		}
+	}
+	require.NotEmpty(t, line, "effective details must report a primitive breakdown")
+	assert.Contains(t, line, "unknown 2", "Unknown results must be counted")
+
+	segments := strings.Split(line, " · ")
+	require.Greater(t, len(segments), 1)
+	total, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(segments[0], "Primitives:")))
+	require.NoError(t, err)
+	assert.Equal(t, len(rows), total)
+
+	sum := 0
+	for _, segment := range segments[1:] {
+		fields := strings.Fields(segment)
+		require.NotEmpty(t, fields)
+		value, convErr := strconv.Atoi(fields[len(fields)-1])
+		require.NoError(t, convErr)
+		sum += value
+	}
+	assert.Equal(t, total, sum, "per-state counts must sum to the primitive total: %s", line)
+}
+
+// A cleared selection must round-trip through the saved panel state, otherwise
+// the next evaluation silently re-selects a rule and hides the effective view.
+func TestNetworkPolicyGraphClearedSelectionSurvivesRefresh(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	require.Nil(t, view.escapeCmd(tcell.NewEventKey(tcell.KeyEscape, 0, tcell.ModNone)))
+	require.Empty(t, view.panels[netpol.Ingress].SelectedID())
+
+	view.applyResult(testSubjectResult())
+
+	assert.Empty(t, view.panels[netpol.Ingress].SelectedID(), "refresh must not re-select a cleared panel")
+	assert.False(t, view.panels[netpol.Ingress].HasSelection())
+	_, ok := view.detailItem.(*ui.RuleDetails)
+	assert.True(t, ok, "details keep rendering the effective pane after a refresh")
+	assert.NotEmpty(t, view.panels[netpol.Egress].SelectedID(), "clearing one direction must not clear the other")
+}
+
+func TestNetworkPolicyGraphClearedSelectionModeStateIsolation(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.panels[netpol.Ingress].ClearSelection()
+	require.False(t, view.panels[netpol.Ingress].HasSelection())
+
+	view.switchMode()
+	assert.Equal(t, ui.PrimitivesProjection, view.mode)
+	assert.True(t, view.panels[netpol.Ingress].HasSelection(), "the other mode has independent selection state")
+
+	view.switchMode()
+	assert.Equal(t, ui.RulesProjection, view.mode)
+	assert.Empty(t, view.panels[netpol.Ingress].SelectedID())
+	assert.False(t, view.panels[netpol.Ingress].HasSelection())
+}
+
+func TestNetworkPolicyGraphClearedSelectionSurvivesDirectionToggle(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.panels[netpol.Ingress].ClearSelection()
+
+	view.toggleDirection(netpol.Ingress)
+	require.False(t, view.state[netpol.Ingress].visible)
+	view.toggleDirection(netpol.Ingress)
+
+	assert.True(t, view.state[netpol.Ingress].visible)
+	assert.Empty(t, view.panels[netpol.Ingress].SelectedID())
+	assert.False(t, view.panels[netpol.Ingress].HasSelection())
+}
+
+func TestNetworkPolicyGraphClearedPrimitiveSelectionSurvivesEmptyKinds(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	view.panels[netpol.Ingress].ClearSelection()
+
+	view.kinds = sets.New[netpol.PrimitiveKind]()
+	view.loadPanel(netpol.Ingress)
+	assert.Contains(t, view.panels[netpol.Ingress].GetCell(0, 0).Text, "No primitive kinds selected")
+	assert.Empty(t, view.panels[netpol.Ingress].SelectedID())
+	assert.False(t, view.panels[netpol.Ingress].HasSelection())
+
+	view.kinds = netpol.AllPrimitiveKinds()
+	view.loadPanel(netpol.Ingress)
+	assert.Empty(t, view.panels[netpol.Ingress].SelectedID())
+	assert.False(t, view.panels[netpol.Ingress].HasSelection())
+}
+
+func TestNetworkPolicyGraphBothClearedSurviveRefreshAndDetailsFollowFocus(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.panels[netpol.Ingress].ClearSelection()
+	view.panels[netpol.Egress].ClearSelection()
+
+	view.applyResult(testSubjectResult())
+
+	assert.Empty(t, view.panels[netpol.Ingress].SelectedID())
+	assert.Empty(t, view.panels[netpol.Egress].SelectedID())
+	details, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	assert.Contains(t, details.Text.GetText(true), "Direction: Ingress")
+	assert.Contains(t, details.Text.GetText(true), "Selection: none")
+
+	view.focusDirection(netpol.Egress)
+	details, ok = view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	assert.Contains(t, details.Text.GetText(true), "Direction: Egress")
+	assert.Contains(t, details.Text.GetText(true), "Selection: none")
+}
+
+func TestNetworkPolicyGraphSubjectChangeResetsClearedSelection(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.panels[netpol.Ingress].ClearSelection()
+	require.False(t, view.panels[netpol.Ingress].HasSelection())
+
+	next := netpol.SubjectRef{
+		Kind: netpol.SubjectNamespace, Name: "other", UID: types.UID("other-uid"),
+	}
+	view.applySubject(next)
+	result := testSubjectResult()
+	result.Subject.Ref = next
+	view.applyResult(result)
+
+	assert.True(t, view.panels[netpol.Ingress].HasSelection())
+	assert.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
+}
+
+func TestNetworkPolicyGraphClearedSelectionFocusCycleIncludesApplicability(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.panels[netpol.Ingress].ClearSelection()
+	view.updateDetails(netpol.Ingress)
+
+	targets := view.focusTargets()
+	assert.Contains(t, targets, focusDetails)
+	assert.Contains(t, targets, focusApplicability)
+
+	view.focusTarget = focusIngress
+	view.cycleFocus(false)
+	assert.Equal(t, focusEgress, view.focusTarget)
+	view.cycleFocus(false)
+	assert.Equal(t, focusDetails, view.focusTarget)
+	view.cycleFocus(false)
+	assert.Equal(t, focusApplicability, view.focusTarget)
+}
+
+func TestNetworkPolicyGraphEscapeWhenBothDirectionsHiddenFallsThrough(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.toggleDirection(netpol.Ingress)
+	view.toggleDirection(netpol.Egress)
+	require.NotNil(t, view.placeholder)
+
+	evt := tcell.NewEventKey(tcell.KeyEscape, 0, tcell.ModNone)
+	assert.Equal(t, evt, view.escapeCmd(evt))
+}
+
+// Clearing the selection only hides the cursor; navigation brings it back.
+func TestNetworkPolicyGraphClearedSelectionRecoversOnNavigation(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	panel := view.panels[netpol.Ingress]
+	original := panel.SelectedID()
+	require.NotEmpty(t, original)
+
+	require.Nil(t, view.escapeCmd(tcell.NewEventKey(tcell.KeyEscape, 0, tcell.ModNone)))
+	require.Empty(t, panel.SelectedID())
+
+	panel.InputHandler()(tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone), func(tview.Primitive) {})
+
+	assert.Equal(t, original, panel.SelectedID())
+	assert.True(t, panel.HasSelection())
+}
+
+// Open Resource resolves the NetworkPolicy in Rules mode and the primitive's
+// own resource in Primitives mode.
+func TestNetworkPolicyGraphOpenResourceTargets(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+
+	namespace, name, ok := view.selectedPolicy()
+	require.True(t, ok)
+	assert.Equal(t, "payments", namespace)
+	assert.Equal(t, "allow-api", name)
+
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	primitive, ok := view.selectedPrimitive(netpol.Ingress, view.panels[netpol.Ingress].SelectedID())
+	require.True(t, ok)
+	command, path := primitiveCommand(&primitive.Ref)
+	assert.Equal(t, "pods", command)
+	assert.Equal(t, "payments/peer", path)
+
+	// With nothing selected there is no resource to open.
+	view.panels[netpol.Ingress].ClearSelection()
+	_, _, ok = view.selectedPolicy()
+	assert.False(t, ok)
+}
+
+// Synthetic default-deny/unrestricted rows have no backing NetworkPolicy, so
+// Open Resource must say so rather than silently swallowing the key.
+func TestNetworkPolicyGraphOpenResourceReportsUnopenableSelection(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.app = NewApp(config.NewConfig(nil))
+	result := testSubjectResult()
+	result.Ingress.Rules = []netpol.RuleResult{{
+		ID: netpol.RuleID{
+			Direction: netpol.Ingress, SyntheticKind: "default-deny",
+		},
+		Synthetic: true, SubjectPodCount: 1, SubjectMatchCount: 1, PeerSummary: "none",
+	}}
+	view.applyResult(result)
+	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
+
+	namespace, name, ok := view.selectedPolicy()
+	require.False(t, ok, "a synthetic rule references no NetworkPolicy")
+	require.Empty(t, namespace)
+	require.Empty(t, name)
+
+	evt := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+	assert.Nil(t, view.openResourceCmd(evt), "the key must be consumed, not silently ignored")
+	message := <-view.app.Flash().Channel()
+	assert.Contains(t, message.Text, "does not reference a NetworkPolicy")
 }
 
 func TestNetworkPolicyGraphSubjectInfoReportsState(t *testing.T) {
@@ -449,9 +778,9 @@ func TestNetworkPolicyGraphRefreshKeepsPanelSelection(t *testing.T) {
 	// Simulate a stale snapshot: the saved scroll state lags behind the live
 	// cursor whenever the panel moves without notifying the view.
 	state := view.state[netpol.Ingress]
-	modeState := state.states[state.mode]
+	modeState := state.states[view.mode]
 	modeState.scroll = ui.ReachabilityScrollState{SelectedID: result.Ingress.Rules[0].StableID()}
-	state.states[state.mode] = modeState
+	state.states[view.mode] = modeState
 
 	view.applyResult(multiRuleSubjectResult())
 

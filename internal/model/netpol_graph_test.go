@@ -363,6 +363,9 @@ func (*netPolGraphEvaluator) Rules(netpol.SubjectResult, netpol.Direction) []net
 func (*netPolGraphEvaluator) Primitives(netpol.SubjectResult, netpol.Direction, sets.Set[netpol.PrimitiveKind]) []netpol.PrimitiveResult {
 	return nil
 }
+func (*netPolGraphEvaluator) DirectionApplicability(netpol.SubjectResult, netpol.Direction, sets.Set[netpol.PrimitiveKind]) []netpol.ApplicabilityRow {
+	return nil
+}
 func (*netPolGraphEvaluator) RuleApplicability(netpol.SubjectResult, netpol.Direction, netpol.RuleID, sets.Set[netpol.PrimitiveKind]) []netpol.ApplicabilityRow {
 	return nil
 }

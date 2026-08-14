@@ -70,6 +70,40 @@ func (_ *engine) Primitives(result SubjectResult, direction Direction, kinds set
 }
 
 //nolint:gocritic // SubjectResult is part of the public Evaluator contract.
+func (e *engine) DirectionApplicability(result SubjectResult, direction Direction, kinds sets.Set[PrimitiveKind]) []ApplicabilityRow {
+	var rows []ApplicabilityRow
+	primitives := e.Primitives(result, direction, kinds)
+	for primitiveIndex := range primitives {
+		primitive := &primitives[primitiveIndex]
+		row := ApplicabilityRow{
+			Primitive:          *primitive,
+			EffectiveState:     primitive.State,
+			Permissions:        canonicalPermissions(primitive.Permissions),
+			PeerMatches:        false,
+			OppositeSideAllows: len(primitive.PairDecisions) > 0,
+		}
+		for pairIndex := range primitive.PairDecisions {
+			pair := &primitive.PairDecisions[pairIndex]
+			if evidenceHasDirection(pair.Decision.Evidence, direction) {
+				row.PeerMatches = true
+			}
+			if primitive.Ref.Kind == PrimitiveCIDR {
+				if pair.Decision.State != AccessAllowed {
+					row.OppositeSideAllows = false
+				}
+				continue
+			}
+			if _, found := evidencePermissionsForDirection(pair.Decision.Evidence, opposite(direction)); !found {
+				row.OppositeSideAllows = false
+			}
+		}
+		row.OppositeSideAllows = row.PeerMatches && row.OppositeSideAllows
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+//nolint:gocritic // SubjectResult is part of the public Evaluator contract.
 func (e *engine) RuleApplicability(result SubjectResult, direction Direction, id RuleID, kinds sets.Set[PrimitiveKind]) []ApplicabilityRow {
 	var rows []ApplicabilityRow
 	primitives := e.Primitives(result, direction, kinds)
@@ -1014,6 +1048,22 @@ func evidenceContains(evidence []PolicyEvidence, id *RuleID) bool {
 		if evidence[index].RuleID.String() == id.String() {
 			return true
 		}
+	}
+	return false
+}
+
+// evidenceHasDirection reports whether a real (non default-deny) rule in the
+// given direction covers the pair. Synthetic default-deny evidence is present
+// on every denied pair, so counting it would make peer matching degenerate to
+// "always true". This mirrors evidencePermissionsForDirection, which skips the
+// same synthetic kind.
+func evidenceHasDirection(evidence []PolicyEvidence, direction Direction) bool {
+	for index := range evidence {
+		item := &evidence[index]
+		if item.RuleID.Direction != direction || item.RuleID.SyntheticKind == syntheticDefaultDeny {
+			continue
+		}
+		return true
 	}
 	return false
 }

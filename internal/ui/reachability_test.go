@@ -108,6 +108,108 @@ func TestDirectionPanelNavigationSkipsSeparators(t *testing.T) {
 	assert.Equal(t, 0, row)
 }
 
+func TestDirectionPanelClearSelection(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(testRules())
+	require.True(t, panel.HasSelection())
+	require.NotEmpty(t, panel.SelectedID())
+
+	panel.ClearSelection()
+
+	assert.Empty(t, panel.SelectedID())
+	assert.False(t, panel.HasSelection())
+}
+
+func TestDirectionPanelClearSelectionBeforeDataKeepsClearedState(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	require.False(t, panel.HasSelection())
+
+	panel.ClearSelection()
+	panel.SetData(testRules(), testPrimitives())
+
+	assert.Empty(t, panel.SelectedID())
+	assert.False(t, panel.HasSelection())
+	assert.True(t, panel.ScrollState().Cleared)
+}
+
+func TestDirectionPanelClearSelectionNotifiesEmptyID(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(testRules())
+	selected := "unchanged"
+	panel.SetSelectionChangedFunc(func(id string) { selected = id })
+
+	panel.ClearSelection()
+
+	assert.Empty(t, selected)
+}
+
+func TestDirectionPanelClearSelectionCallbackIsIdempotent(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(testRules())
+	var calls int
+	panel.SetSelectionChangedFunc(func(string) { calls++ })
+
+	panel.ClearSelection()
+	panel.ClearSelection()
+
+	assert.Equal(t, 1, calls)
+}
+
+func TestDirectionPanelClearedSelectionSurvivesRebuilds(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetData(testRules(), testPrimitives())
+	panel.ClearSelection()
+
+	panel.SetData(testRules(), testPrimitives())
+	assert.Empty(t, panel.SelectedID())
+	assert.False(t, panel.HasSelection())
+
+	panel.SetFilter("allow")
+	assert.Empty(t, panel.SelectedID())
+	assert.False(t, panel.HasSelection())
+
+	panel.SetProjection(PrimitivesProjection)
+	assert.Empty(t, panel.SelectedID())
+	assert.False(t, panel.HasSelection())
+}
+
+func TestDirectionPanelClearedSelectionSurvivesEmptyFilterAndReturn(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(testRules())
+	panel.ClearSelection()
+
+	panel.SetFilter("does-not-match-anything")
+	assert.Empty(t, panel.SelectedID())
+	assert.False(t, panel.HasSelection())
+	assert.Zero(t, len(panel.blocks))
+
+	panel.SetFilter("")
+	assert.Empty(t, panel.SelectedID())
+	assert.False(t, panel.HasSelection())
+	assert.Len(t, panel.blocks, len(testRules()))
+}
+
+func TestDirectionPanelClearedSelectionSurvivesDifferentDataUntilExplicitSelect(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(testRules())
+	panel.ClearSelection()
+
+	changed := []netpol.RuleResult{{
+		ID:              netpol.RuleID{PolicyNamespace: "other", PolicyName: "allow-other", Direction: netpol.Ingress, Index: 9},
+		SubjectPodCount: 1, SubjectMatchCount: 1,
+	}}
+	panel.SetRules(changed)
+	validID := changed[0].StableID()
+
+	assert.Empty(t, panel.SelectedID())
+	assert.False(t, panel.HasSelection())
+	assert.False(t, panel.SelectID("missing"))
+	assert.Empty(t, panel.SelectedID())
+	assert.True(t, panel.SelectID(validID))
+	assert.Equal(t, validID, panel.SelectedID())
+	assert.True(t, panel.HasSelection())
+}
+
 func TestDirectionPanelRestoresStableSelectionAndNearestFallback(t *testing.T) {
 	rules := testRules()
 	panel := NewDirectionPanel(netpol.Ingress)
@@ -122,6 +224,28 @@ func TestDirectionPanelRestoresStableSelectionAndNearestFallback(t *testing.T) {
 
 	panel.SetRules([]netpol.RuleResult{rules[2], rules[0]})
 	assert.Equal(t, rules[0].StableID(), panel.SelectedID(), "missing selection falls back to nearest index")
+}
+
+func TestDirectionPanelScrollStateRestoresClearedSelection(t *testing.T) {
+	rules := testRules()
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(rules)
+	panel.ClearSelection()
+	state := panel.ScrollState()
+	require.True(t, state.Cleared)
+	require.Empty(t, state.SelectedID)
+
+	restored := NewDirectionPanel(netpol.Ingress)
+	restored.SetRules(rules)
+	restored.RestoreScrollState(state)
+	assert.Empty(t, restored.SelectedID())
+	assert.False(t, restored.HasSelection())
+
+	state.Cleared = false
+	state.SelectedID = rules[1].StableID()
+	restored.RestoreScrollState(state)
+	assert.Equal(t, rules[1].StableID(), restored.SelectedID())
+	assert.True(t, restored.HasSelection())
 }
 
 func TestDirectionPanelScrollStateHelpers(t *testing.T) {
@@ -145,6 +269,51 @@ func TestDirectionPanelScrollStateHelpers(t *testing.T) {
 	state.SelectedRow = 3
 	restored.RestoreScrollState(state)
 	assert.Equal(t, rules[1].StableID(), restored.SelectedID())
+}
+
+func TestDirectionPanelNavigationReselectsAfterClear(t *testing.T) {
+	rules := testRules()
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(rules)
+
+	panel.ClearSelection()
+	require.Nil(t, panel.captureInput(tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone)))
+	assert.Equal(t, rules[0].StableID(), panel.SelectedID())
+	assert.True(t, panel.HasSelection())
+
+	panel.ClearSelection()
+	require.Nil(t, panel.captureInput(tcell.NewEventKey(tcell.KeyUp, 0, tcell.ModNone)))
+	assert.Equal(t, rules[2].StableID(), panel.SelectedID())
+	assert.True(t, panel.HasSelection())
+}
+
+func TestDirectionPanelNavigationWhileClearedAndEmptyFallsThrough(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.ClearSelection()
+
+	for _, key := range []tcell.Key{tcell.KeyDown, tcell.KeyUp, tcell.KeyPgDn, tcell.KeyPgUp, tcell.KeyHome, tcell.KeyEnd} {
+		event := tcell.NewEventKey(key, 0, tcell.ModNone)
+		assert.Equal(t, event, panel.captureInput(event), key)
+		assert.Empty(t, panel.SelectedID())
+		assert.False(t, panel.HasSelection())
+	}
+}
+
+func TestDirectionPanelClearedSelectionSurvivesStyleRebuilds(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(testRules())
+	panel.ClearSelection()
+
+	panel.SetASCII(true)
+	panel.SetStyles(config.NewStyles())
+	panel.SetReachabilityStyle(config.Reachability{
+		AllowedColor:     config.Color("green"),
+		DisallowedColor:  config.Color("red"),
+		PartialDataColor: config.Color("orange"),
+	})
+
+	assert.Empty(t, panel.SelectedID())
+	assert.False(t, panel.HasSelection())
 }
 
 func TestDirectionPanelSelectionCallbackAndStyleKeepsResultAsTextColor(t *testing.T) {
@@ -229,6 +398,36 @@ func TestPrimitiveAndRuleDetails(t *testing.T) {
 	assert.Equal(t, "Partial", details.Applicability.GetCell(1, 3).Text)
 	assert.Equal(t, reachabilityDisallowedColor, details.Applicability.GetCell(1, 0).Color)
 	assert.True(t, details.Applicability.GetCell(1, 0).Transparent)
+}
+
+func TestNewEffectiveDetailsWithStyle(t *testing.T) {
+	primitives := testPrimitives()
+	rows := []netpol.ApplicabilityRow{
+		{
+			Primitive:          primitives[0],
+			PeerMatches:        true,
+			OppositeSideAllows: false,
+			EffectiveState:     netpol.AccessAllowed,
+			Permissions:        primitives[0].Permissions,
+		},
+		{
+			Primitive:          primitives[1],
+			PeerMatches:        false,
+			OppositeSideAllows: true,
+			EffectiveState:     netpol.AccessPartial,
+		},
+	}
+
+	details := NewEffectiveDetailsWithStyle("effective body", rows, config.Reachability{
+		AllowedColor:     config.Color("green"),
+		DisallowedColor:  config.Color("red"),
+		PartialDataColor: config.Color("orange"),
+	})
+
+	assert.Equal(t, "effective body", details.Text.GetText(true))
+	assert.Equal(t, " Effective Details ", details.Text.GetTitle())
+	assert.Equal(t, " Effective Applicability ", details.Applicability.GetTitle())
+	assert.Equal(t, len(rows)+1, details.Applicability.GetRowCount())
 }
 
 func TestPrimitiveDetailsUsesNormalizedState(t *testing.T) {

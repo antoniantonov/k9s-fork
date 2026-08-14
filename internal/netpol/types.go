@@ -335,6 +335,7 @@ type Evaluator interface {
 	EvaluateSubject(SubjectRef, Snapshot, Options) (SubjectResult, error)
 	Rules(SubjectResult, Direction) []RuleResult
 	Primitives(SubjectResult, Direction, sets.Set[PrimitiveKind]) []PrimitiveResult
+	DirectionApplicability(SubjectResult, Direction, sets.Set[PrimitiveKind]) []ApplicabilityRow
 	RuleApplicability(SubjectResult, Direction, RuleID, sets.Set[PrimitiveKind]) []ApplicabilityRow
 }
 

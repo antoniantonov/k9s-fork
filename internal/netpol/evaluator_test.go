@@ -239,6 +239,188 @@ func TestRuleApplicabilityRequiresPortOverlap(t *testing.T) {
 	require.False(t, row.OppositeSideAllows)
 }
 
+func TestDirectionApplicabilityEffectiveStates(t *testing.T) {
+	tests := []struct {
+		name      string
+		snapshot  Snapshot
+		kind      PrimitiveKind
+		namespace string
+		primitive string
+		want      AccessState
+	}{
+		{
+			name: "allowed",
+			snapshot: func() Snapshot {
+				snapshot := testSnapshot()
+				snapshot.NetworkPolicies = []netv1.NetworkPolicy{ingressPolicy("allow-client", "server", []netv1.NetworkPolicyIngressRule{{
+					From: []netv1.NetworkPolicyPeer{{NamespaceSelector: selector(map[string]string{"team": "client"})}},
+				}})}
+				return snapshot
+			}(),
+			kind: PrimitivePod, namespace: "client", primitive: "client", want: AccessAllowed,
+		},
+		{
+			name: "disallowed",
+			snapshot: func() Snapshot {
+				snapshot := testSnapshot()
+				snapshot.NetworkPolicies = []netv1.NetworkPolicy{ingressPolicy("deny-client", "server", []netv1.NetworkPolicyIngressRule{})}
+				return snapshot
+			}(),
+			kind: PrimitivePod, namespace: "client", primitive: "client", want: AccessDisallowed,
+		},
+		{
+			name: "partial",
+			snapshot: func() Snapshot {
+				snapshot := testSnapshot()
+				snapshot.Pods = append(snapshot.Pods, corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+					Namespace: "client", Name: "other", UID: "other", Labels: map[string]string{"role": "other"},
+				}})
+				snapshot.NetworkPolicies = []netv1.NetworkPolicy{ingressPolicy("allow-client", "server", []netv1.NetworkPolicyIngressRule{{
+					From: []netv1.NetworkPolicyPeer{{NamespaceSelector: selector(map[string]string{"team": "client"}), PodSelector: selector(map[string]string{"role": "client"})}},
+				}})}
+				return snapshot
+			}(),
+			kind: PrimitiveNamespace, primitive: "client", want: AccessPartial,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := NewEvaluator().EvaluateSubject(
+				SubjectRef{Kind: SubjectPod, Namespace: "server", Name: "server"}, test.snapshot, Options{},
+			)
+			require.NoError(t, err)
+			rows := NewEvaluator().DirectionApplicability(result, Ingress, sets.New(test.kind))
+			var row ApplicabilityRow
+			found := false
+			for index := range rows {
+				candidate := &rows[index]
+				if candidate.Primitive.Ref.Namespace == test.namespace && candidate.Primitive.Ref.Name == test.primitive {
+					row = *candidate
+					found = true
+					break
+				}
+			}
+			require.True(t, found)
+			require.Equal(t, test.want, row.EffectiveState)
+		})
+	}
+}
+
+// A peer that matches no rule must report PeerMatches=false in the aggregate,
+// exactly as it does per-rule. Synthetic default-deny evidence is attached to
+// every denied pair, so counting it would make this column always true and
+// contradict the State column.
+func TestDirectionApplicabilityPeerMatchesExcludesDefaultDeny(t *testing.T) {
+	snapshot := testSnapshot()
+	snapshot.NetworkPolicies = []netv1.NetworkPolicy{
+		ingressPolicy("narrow", "server", []netv1.NetworkPolicyIngressRule{{
+			From: []netv1.NetworkPolicyPeer{{
+				PodSelector:       selector(map[string]string{"role": "absent"}),
+				NamespaceSelector: &metav1.LabelSelector{},
+			}},
+		}}),
+	}
+	result, err := NewEvaluator().EvaluateSubject(
+		SubjectRef{Kind: SubjectPod, Namespace: "server", Name: "server"}, snapshot, Options{},
+	)
+	require.NoError(t, err)
+
+	var ruleID RuleID
+	for _, rule := range result.Ingress.Rules {
+		if rule.ID.PolicyName == "narrow" {
+			ruleID = rule.ID
+		}
+	}
+	directionRows := NewEvaluator().DirectionApplicability(result, Ingress, sets.New(PrimitivePod))
+	ruleRows := NewEvaluator().RuleApplicability(result, Ingress, ruleID, sets.New(PrimitivePod))
+	require.NotEmpty(t, directionRows)
+	require.Len(t, ruleRows, len(directionRows))
+
+	for index := range directionRows {
+		row := &directionRows[index]
+		require.Equal(t, AccessDisallowed, row.EffectiveState, "no peer is selected by the rule")
+		require.False(t, row.PeerMatches,
+			"peer %q matches no rule, so the aggregate must not claim a peer match", row.Primitive.Ref.Name)
+		require.False(t, row.OppositeSideAllows,
+			"a peer with no matching rule cannot be reported as fully allowed")
+		require.Equal(t, ruleRows[index].PeerMatches, row.PeerMatches,
+			"aggregate and per-rule peer matching must agree when only one rule exists")
+	}
+}
+
+func TestDirectionApplicabilityCIDRMatchesRuleConvention(t *testing.T) {
+	snapshot := testSnapshot()
+	snapshot.NetworkPolicies = []netv1.NetworkPolicy{ingressPolicy("cidr", "server", []netv1.NetworkPolicyIngressRule{{From: []netv1.NetworkPolicyPeer{{
+		IPBlock: &netv1.IPBlock{CIDR: "10.0.0.0/8"},
+	}}}})}
+	result, err := NewEvaluator().EvaluateSubject(
+		SubjectRef{Kind: SubjectPod, Namespace: "server", Name: "server"}, snapshot, Options{},
+	)
+	require.NoError(t, err)
+	var ruleID RuleID
+	for _, rule := range result.Ingress.Rules {
+		if rule.ID.PolicyName == "cidr" {
+			ruleID = rule.ID
+		}
+	}
+	directionRows := NewEvaluator().DirectionApplicability(result, Ingress, sets.New(PrimitiveCIDR))
+	ruleRows := NewEvaluator().RuleApplicability(result, Ingress, ruleID, sets.New(PrimitiveCIDR))
+	require.Len(t, directionRows, 1)
+	require.Len(t, ruleRows, 1)
+	require.Equal(t, ruleRows[0].PeerMatches, directionRows[0].PeerMatches)
+	require.Equal(t, ruleRows[0].OppositeSideAllows, directionRows[0].OppositeSideAllows)
+	require.Equal(t, ruleRows[0].EffectiveState, directionRows[0].EffectiveState)
+}
+
+func TestDirectionApplicabilityPreservesPartialData(t *testing.T) {
+	snapshot := testSnapshot()
+	snapshot.Incomplete = map[string]error{"pods": errors.New("list timed out")}
+	result, err := NewEvaluator().EvaluateSubject(
+		SubjectRef{Kind: SubjectPod, Namespace: "server", Name: "server"}, snapshot, Options{},
+	)
+	require.NoError(t, err)
+	row := findApplicability(t, NewEvaluator().DirectionApplicability(result, Ingress, sets.New(PrimitivePod)))
+	require.Equal(t, AccessPartialData, row.Primitive.State)
+	require.Equal(t, AccessPartialData, row.EffectiveState)
+}
+
+func TestDirectionApplicabilityFiltersKinds(t *testing.T) {
+	result, err := NewEvaluator().EvaluateSubject(
+		SubjectRef{Kind: SubjectPod, Namespace: "server", Name: "server"}, testSnapshot(), Options{},
+	)
+	require.NoError(t, err)
+	rows := NewEvaluator().DirectionApplicability(result, Ingress, sets.New(PrimitivePod))
+	require.NotEmpty(t, rows)
+	for _, row := range rows {
+		require.Equal(t, PrimitivePod, row.Primitive.Ref.Kind)
+	}
+	require.Empty(t, NewEvaluator().DirectionApplicability(result, Ingress, sets.New[PrimitiveKind]()))
+}
+
+func TestDirectionApplicabilityMatchesSingleRuleApplicability(t *testing.T) {
+	snapshot := testSnapshot()
+	snapshot.NetworkPolicies = []netv1.NetworkPolicy{ingressPolicy("allow-all", "server", []netv1.NetworkPolicyIngressRule{{}})}
+	result, err := NewEvaluator().EvaluateSubject(
+		SubjectRef{Kind: SubjectPod, Namespace: "server", Name: "server"}, snapshot, Options{},
+	)
+	require.NoError(t, err)
+	var ruleID RuleID
+	for _, rule := range result.Ingress.Rules {
+		if rule.ID.PolicyName == "allow-all" {
+			ruleID = rule.ID
+		}
+	}
+	directionRows := NewEvaluator().DirectionApplicability(result, Ingress, sets.New(PrimitivePod, PrimitiveCIDR))
+	ruleRows := NewEvaluator().RuleApplicability(result, Ingress, ruleID, sets.New(PrimitivePod, PrimitiveCIDR))
+	require.Len(t, directionRows, len(ruleRows))
+	for index := range ruleRows {
+		require.Equal(t, ruleRows[index].Primitive.Ref, directionRows[index].Primitive.Ref)
+		require.Equal(t, ruleRows[index].EffectiveState, directionRows[index].EffectiveState)
+		require.Equal(t, ruleRows[index].PeerMatches, directionRows[index].PeerMatches)
+	}
+}
+
 func TestCIDRSetSemanticsAndEmptyPeers(t *testing.T) {
 	block := &netv1.IPBlock{CIDR: "10.0.0.0/8", Except: []string{"10.0.0.0/9"}}
 	require.True(t, ipBlockIntersects(block, &PrimitiveRef{Kind: PrimitiveCIDR, CIDR: "10.128.0.0/9"}))
