@@ -20,7 +20,7 @@
 #   Owners        Deployment/ReplicaSet, Job, StatefulSet, DaemonSet, bare pod
 #
 # Usage:
-#   ./scripts/netpol-demo-workloads.sh [options]
+#   ./.github/skills/netpol-graph-testing/scripts/netpol-demo-workloads.sh [options]
 #
 # Options:
 #   --kubeconfig PATH    kubeconfig to use (default: exported kind kubeconfig)
@@ -32,6 +32,7 @@
 #   --image REF          container image to use (default: busybox:1.36)
 #   --no-cluster         skip kind bootstrap and use the current kubeconfig/context
 #   --delete-cluster     delete the kind cluster and exported kubeconfigs, then exit
+#   --check, --status    verify the demo topology is already applied and ready; no mutations
 #   --no-wait            do not wait for pods to become ready
 #   --timeout DURATION   readiness wait timeout (default: 180s)
 #   --delete             delete everything this script creates, then exit
@@ -41,7 +42,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
 PREFIX="netpol-demo"
 IMAGE="busybox:1.36"
@@ -54,6 +55,7 @@ WAIT=1
 TIMEOUT="180s"
 DELETE=0
 DELETE_CLUSTER=0
+CHECK=0
 
 usage() {
   awk '
@@ -76,9 +78,26 @@ require_command() {
   command -v "$1" >/dev/null || { echo "$1 not found in PATH" >&2; exit 1; }
 }
 
+duration_to_seconds() {
+  local value="$1" number unit
+  if [[ "$value" =~ ^([0-9]+)(s|m|h)?$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]:-s}"
+    case "$unit" in
+      s) echo "$number" ;;
+      m) echo $((number * 60)) ;;
+      h) echo $((number * 3600)) ;;
+    esac
+    return 0
+  fi
+  echo "180"
+}
+
 wait_for_api_server() {
-  echo "==> waiting for Kubernetes API server"
-  for _ in {1..90}; do
+  echo "==> waiting for Kubernetes API server (timeout: $TIMEOUT)"
+  local deadline now
+  deadline=$((SECONDS + $(duration_to_seconds "$TIMEOUT")))
+  while (( SECONDS < deadline )); do
     if "${KUBECTL[@]}" version -o json >/dev/null 2>&1; then
       return 0
     fi
@@ -96,6 +115,69 @@ export_kind_kubeconfigs() {
   echo "==> exported kubeconfigs:"
   echo "    $HOST_KUBECONFIG"
   echo "    $INTERNAL_KUBECONFIG"
+}
+
+
+check_resource() {
+  local description="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf '  [ok]   %s\n' "$description"
+    return 0
+  fi
+  printf '  [miss] %s\n' "$description"
+  return 1
+}
+
+check_ready_pod_for_selector() {
+  local description="$1" namespace="$2" selector="$3" ready
+  ready=$("${KUBECTL[@]}" get pods -n "$namespace" -l "$selector" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{range .status.containerStatuses[*]}{.ready}{"\n"}{end}{end}' 2>/dev/null || true)
+  if printf '%s\n' "$ready" | grep -qx true; then
+    printf '  [ok]   %s\n' "$description"
+    return 0
+  fi
+  printf '  [miss] %s\n' "$description"
+  return 1
+}
+
+check_topology() {
+  local failures=0 ns
+  echo "==> checking NetworkPolicy demo topology (prefix: $PREFIX)"
+
+  for ns in "${ALL_NS[@]}"; do
+    check_resource "namespace $ns" "${KUBECTL[@]}" get namespace "$ns" || failures=$((failures + 1))
+  done
+
+  check_resource "app deployments" "${KUBECTL[@]}" get deployment -n "$NS_APP" api db ambiguous-ports scaled-to-zero || failures=$((failures + 1))
+  check_resource "app jobs" "${KUBECTL[@]}" get job -n "$NS_APP" db-migration report-generator || failures=$((failures + 1))
+  check_resource "app statefulset cache" "${KUBECTL[@]}" get statefulset -n "$NS_APP" cache || failures=$((failures + 1))
+  check_resource "app daemonset log-collector" "${KUBECTL[@]}" get daemonset -n "$NS_APP" log-collector || failures=$((failures + 1))
+  check_resource "app bare pod standalone-debug" "${KUBECTL[@]}" get pod -n "$NS_APP" standalone-debug || failures=$((failures + 1))
+  check_resource "web deployments" "${KUBECTL[@]}" get deployment -n "$NS_WEB" frontend legacy || failures=$((failures + 1))
+  check_resource "monitoring deployment" "${KUBECTL[@]}" get deployment -n "$NS_MON" prometheus || failures=$((failures + 1))
+  check_resource "untrusted deployment" "${KUBECTL[@]}" get deployment -n "$NS_UNTRUSTED" client || failures=$((failures + 1))
+  check_resource "open deployment" "${KUBECTL[@]}" get deployment -n "$NS_OPEN" open-app || failures=$((failures + 1))
+
+  check_resource "app network policies" "${KUBECTL[@]}" get networkpolicy -n "$NS_APP" default-deny-all allow-frontend-ingress allow-monitoring-ingress allow-cidr-ingress allow-dns-egress allow-api-egress-db allow-db-ingress-api allow-api-egress-external allow-api-egress-ambiguous allow-ambiguous-ingress-api allow-cache-ingress-all || failures=$((failures + 1))
+  check_resource "web network policies" "${KUBECTL[@]}" get networkpolicy -n "$NS_WEB" web-default-deny-egress frontend-egress-to-api || failures=$((failures + 1))
+  check_resource "untrusted network policy" "${KUBECTL[@]}" get networkpolicy -n "$NS_UNTRUSTED" deny-all-egress || failures=$((failures + 1))
+
+  for ns in "$NS_APP" "$NS_WEB" "$NS_MON" "$NS_UNTRUSTED" "$NS_OPEN"; do
+    check_resource "deployments ready in $ns" "${KUBECTL[@]}" wait --for=condition=Available deployment --all -n "$ns" --timeout=1s || failures=$((failures + 1))
+  done
+  check_resource "statefulset cache rolled out" "${KUBECTL[@]}" rollout status statefulset/cache -n "$NS_APP" --timeout=1s || failures=$((failures + 1))
+  check_resource "daemonset log-collector rolled out" "${KUBECTL[@]}" rollout status daemonset/log-collector -n "$NS_APP" --timeout=1s || failures=$((failures + 1))
+  check_ready_pod_for_selector "report-generator has a running ready pod" "$NS_APP" "job-name=report-generator" || failures=$((failures + 1))
+  check_resource "standalone-debug pod ready" "${KUBECTL[@]}" wait --for=condition=Ready pod/standalone-debug -n "$NS_APP" --timeout=1s || failures=$((failures + 1))
+  check_resource "db-migration completed" "${KUBECTL[@]}" wait --for=condition=Complete job/db-migration -n "$NS_APP" --timeout=1s || failures=$((failures + 1))
+
+  if (( failures == 0 )); then
+    echo "==> demo topology is applied and ready"
+    return 0
+  fi
+  echo "==> demo topology is incomplete or not ready ($failures check(s) failed)" >&2
+  return 1
 }
 
 bootstrap_kind_cluster() {
@@ -140,6 +222,7 @@ while [[ $# -gt 0 ]]; do
     --no-wait) WAIT=0; shift ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --delete) DELETE=1; shift ;;
+    --check|--status) CHECK=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -167,6 +250,23 @@ if [[ "$DELETE_CLUSTER" -eq 1 ]]; then
 fi
 
 require_command kubectl
+
+if [[ "$CHECK" -eq 1 ]]; then
+  if [[ "$NO_CLUSTER" -eq 0 && -z "$KUBECONFIG_ARG" ]]; then
+    if [[ -f "$HOST_KUBECONFIG" ]]; then
+      KUBECONFIG_ARG="$HOST_KUBECONFIG"
+    elif [[ -z "$CONTEXT_ARG" ]]; then
+      CONTEXT_ARG="kind-${CLUSTER}"
+    fi
+  fi
+  build_kubectl
+  "${KUBECTL[@]}" version -o json >/dev/null 2>&1 || {
+    echo "cannot reach the cluster; check --kubeconfig/--context or run without --check to bootstrap" >&2
+    exit 1
+  }
+  check_topology
+  exit $?
+fi
 
 if [[ "$NO_CLUSTER" -eq 0 ]]; then
   require_command docker

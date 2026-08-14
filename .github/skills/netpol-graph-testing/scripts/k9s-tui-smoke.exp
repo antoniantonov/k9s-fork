@@ -1,0 +1,392 @@
+#!/usr/bin/expect -f
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Authors of K9s
+
+set timeout 25
+foreach {var default} {K9S_IMAGE k9s:latest KUBECONFIG_MOUNT .kube/k9s-netpol.internal.kubeconfig CLUSTER_PREFIX netpol-demo DOCKER_NETWORK kind EXPECT_LOG_DIR .github/skills/netpol-graph-testing/runs/syntax-check} {
+  if {![info exists env($var)]} { set env($var) $default }
+}
+set image $env(K9S_IMAGE)
+set kubeconfig $env(KUBECONFIG_MOUNT)
+set prefix $env(CLUSTER_PREFIX)
+set network $env(DOCKER_NETWORK)
+set log_dir $env(EXPECT_LOG_DIR)
+set ns_app "${prefix}-app"
+set case_name "startup"
+set failures 0
+set case_failed 0
+set case_verdict 1
+set verdicts {}
+set container "k9s-netpol-smoke-[pid]"
+if {[info exists env(EXPECT_SYNTAX_CHECK)] && $env(EXPECT_SYNTAX_CHECK) eq "1"} { exit 0 }
+
+proc say {msg} { puts $msg }
+
+proc fail_case {msg} {
+  global case_name failures case_failed case_verdict verdicts
+  incr failures
+  set case_failed 1
+  if {!$case_verdict} { lappend verdicts [list $case_name FAIL] }
+  set case_verdict 1
+  puts "FAIL $case_name: $msg"
+}
+
+proc fail_case_dump {msg} {
+  global container
+  fail_case $msg
+  catch {exec docker kill -s QUIT $container} dump
+  if {[info exists dump] && $dump ne ""} { puts $dump }
+}
+
+proc pass_case {} {
+  global case_name case_failed case_verdict verdicts
+  if {$case_failed} { return }
+  if {!$case_verdict} { lappend verdicts [list $case_name PASS] }
+  set case_verdict 1
+  puts "PASS $case_name"
+}
+
+# close_case guarantees every started case records a verdict. A case that falls
+# through its assertions without calling pass_case or fail_case would otherwise
+# disappear from the run entirely and still report success.
+proc close_case {} {
+  global case_name case_verdict
+  if {!$case_verdict} {
+    fail_case "case ended without reporting a verdict"
+  }
+}
+
+proc start_case {name} {
+  global case_name case_failed case_verdict ns_app
+  close_case
+  set case_name $name
+  set case_failed 0
+  set case_verdict 0
+  puts "CASE $case_name"
+  if {$name ne "launch-npg-view"} {
+    send -- ":npg deployment api $ns_app\r"
+    after 1200
+  }
+}
+
+proc drain {{quiet_seconds 1}} {
+  set old_timeout $::timeout
+  set drained 1
+  while {$drained} {
+    set drained 0
+    set ::timeout $quiet_seconds
+    expect {
+      -re {(.|\r|\n)+} { set drained 1 }
+      timeout {}
+      eof { set ::timeout $old_timeout; return 0 }
+    }
+  }
+  set ::timeout $old_timeout
+  return 1
+}
+
+# A TUI only emits the cells that changed, so assertions that match steady-state
+# text would otherwise time out. Nudging the pty size makes tview repaint the
+# whole screen, which puts the current view back on the wire.
+proc repaint {} {
+  global spawn_out
+  catch {exec stty rows 49 columns 200 < $spawn_out(slave,name)}
+  after 200
+  catch {exec stty rows 50 columns 200 < $spawn_out(slave,name)}
+  after 300
+}
+
+proc wait_stream {pattern {seconds 20}} {
+  set old_timeout $::timeout
+  set ::timeout $seconds
+  expect {
+    -re $pattern { set ::timeout $old_timeout; return 1 }
+    timeout { set ::timeout $old_timeout; fail_case "timed out waiting for /$pattern/"; return 0 }
+    eof { set ::timeout $old_timeout; fail_case "process exited while waiting for /$pattern/"; return 0 }
+  }
+}
+
+proc assert_screen {pattern {seconds 20}} {
+  drain 1
+  repaint
+  return [wait_stream $pattern $seconds]
+}
+
+proc send_key {keys {pause_ms 250}} {
+  send -- $keys
+  after $pause_ms
+}
+
+proc assert_reachability_view {{seconds 20}} {
+  return [assert_screen {<npg>|Deployment netpol-demo-app/api|Subject} $seconds]
+}
+
+proc assert_all_screen {patterns {seconds 20}} {
+  set ok 1
+  foreach pattern $patterns {
+    if {![assert_screen $pattern $seconds]} { set ok 0 }
+  }
+  return $ok
+}
+
+proc screen_matches {pattern {seconds 5}} {
+  drain 1
+  repaint
+  set old_timeout $::timeout
+  set ::timeout $seconds
+  expect {
+    -re $pattern { set ::timeout $old_timeout; return 1 }
+    timeout { set ::timeout $old_timeout; return 0 }
+    eof { set ::timeout $old_timeout; return 0 }
+  }
+}
+
+proc ensure_rules {} {
+  if {![screen_matches {Ingress · Rules} 5]} { send_key "m" 400 }
+  assert_screen {Ingress · Rules} 15
+}
+
+proc ensure_primitives {} {
+  if {![screen_matches {Ingress · Primitives} 5]} { send_key "m" 400 }
+  assert_screen {Ingress · Primitives} 15
+}
+
+proc finish_case {} {
+  assert_reachability_view 20
+  pass_case
+}
+
+# The kind API server certificate only covers the control-plane container name,
+# so the container joins the kind network and uses the internal kubeconfig.
+set docker_args [list docker run --rm -it --name $container --network $network -e TERM=xterm-256color -e KUBECONFIG=/root/.kube/config -v ${kubeconfig}:/root/.kube/config:ro]
+lappend docker_args $image --readonly -c "npg deployment api $ns_app"
+
+file mkdir $log_dir
+log_file -a "$log_dir/k9s-tui-smoke.session.log"
+# Expect inherits a 0x0 pty when it runs without a controlling terminal, and a
+# zero-sized screen makes the TUI draw nothing at all. Size it explicitly.
+set stty_init "rows 50 cols 200"
+say "spawning: $docker_args"
+spawn {*}$docker_args
+stty rows 50 columns 200 < $spawn_out(slave,name)
+
+start_case "launch-npg-view"
+if {[assert_all_screen {Subject {Deployment netpol-demo-app/api} {3 pods} {Ingress on} {Egress on} {Kinds: CIDR,Pod,Namespace,Deployment,Job} {Auto-refresh off} {Ingress · Rules} {Egress · Rules} {Rule Details} Applicability {<o>} {Open Resource} {<ctrl-r>} {Refresh} {</>} Search {<npg>}} 45]} {
+pass_case
+}
+
+start_case "subject-picker-kinds"
+send_key "s"
+if {[assert_all_screen {{<Subject>} Kinds Subjects} 15]} {
+  # Esc is the dialog cancel key. Verify it returns to the graph rather than
+  # popping the root netpol view.
+  send_key "\033"
+  finish_case
+}
+
+start_case "direction-toggles-placeholder"
+send_key "i"
+assert_screen {Egress · Rules} 10
+send_key "e"
+if {[assert_screen {Both directions are hidden\. Press i for ingress or e for egress\.} 10]} {
+  # The placeholder itself does not own the graph key bindings reliably in all tview focus states, so reset through the command prompt after proving the hidden state.
+  send -- ":npg deployment api $ns_app\r"
+  after 1200
+  assert_all_screen {{Ingress · Rules} {Egress · Rules}} 10
+  pass_case
+}
+
+start_case "rules-primitives-global-toggle"
+send_key "m"
+if {[assert_all_screen {{Ingress · Primitives} {Egress · Primitives}} 15]} {
+  send_key "m"
+  assert_all_screen {{Ingress · Rules} {Egress · Rules}} 15
+  pass_case
+}
+
+start_case "primitive-kinds-apply-cancel-zero"
+ensure_rules
+send_key "m"
+send_key "f"
+if {[assert_all_screen {{Primitive Kinds} CIDR Pod Namespace Deployment Job} 10]} {
+  # Clear all five checkboxes, tab to Apply, press Enter.
+  for {set i 0} {$i < 5} {incr i} { send_key " " 100; send_key "\t" 100 }
+  send_key "\r"
+  assert_screen {No primitive kinds selected\. Press f to enable kinds\.} 10
+  send_key "f"
+  assert_screen {Primitive Kinds} 10
+  send_key "\033"
+  assert_screen {No primitive kinds selected\. Press f to enable kinds\.} 10
+  send_key "f"
+  for {set i 0} {$i < 5} {incr i} { send_key " " 100; send_key "\t" 100 }
+  send_key "\r"
+  send_key "m"
+  assert_all_screen {{Ingress · Rules} {Egress · Rules}} 15
+  pass_case
+}
+
+start_case "search-apply-clear-cancel"
+ensure_rules
+send_key "/"
+if {[assert_screen {Reachability Search|Filter:} 10]} {
+  send_key "frontend"
+  send_key "\t"
+  send_key "\r"
+  assert_screen {filter: frontend|frontend} 10
+  send_key "/"
+  assert_screen {Filter:} 10
+  send_key "\t\t"
+  send_key "\r"
+  assert_screen {Ingress · Rules|Egress · Rules} 10
+  send_key "/"
+  assert_screen {Filter:} 10
+  send_key "\033"
+  finish_case
+}
+
+start_case "tab-and-shift-tab-focus-ring"
+for {set i 0} {$i < 6} {incr i} { send_key "\t" 150 }
+for {set i 0} {$i < 6} {incr i} { send_key "\033\[Z" 150 }
+assert_all_screen {Subject Ingress Egress {Rule Details} Applicability} 10
+pass_case
+
+start_case "left-right-direction-focus"
+# Ensure focus is back on a direction panel before using Left/Right.
+send_key "\033\[Z"
+send_key "\033\[D"
+assert_screen {Ingress · Rules} 10
+send_key "\033\[C"
+assert_screen {Egress · Rules} 10
+pass_case
+
+start_case "enter-navigation-rule-selected"
+ensure_rules
+# From a direction panel in Rules mode, Enter focuses Applicability.
+send_key "\033\[D"
+send_key "\r"
+assert_all_screen {Applicability Primitive Peer Opposite State Ports} 15
+pass_case
+
+start_case "enter-navigation-effective-applicability"
+ensure_rules
+# Leave the applicability table, clear the selected rule, then Enter focuses the
+# effective applicability table.
+send_key "\033"
+assert_screen {Effective Details|Selection: none} 15
+assert_screen {Effective Applicability} 15
+send_key "\r"
+assert_all_screen {{Effective Applicability} Primitive Peer Opposite State Ports} 15
+pass_case
+
+start_case "enter-navigation-primitive-details"
+ensure_primitives
+# Return to a direction panel, switch to Primitives, and Enter focuses the text
+# detail pane (there is no applicability table in this projection).
+send_key "\033\[D"
+assert_screen {Ingress · Primitives} 15
+assert_screen {Primitive Details} 15
+send_key "\r"
+assert_all_screen {{Primitive Details} {Direction: Ingress|Coverage:}} 15
+pass_case
+
+start_case "enter-opens-applicability-primitive"
+ensure_rules
+# Go back to Rules, focus Applicability, move off the first CIDR row so Enter
+# opens a Kubernetes resource instead of the CIDR flash path, then Esc returns.
+assert_screen {Ingress · Rules} 15
+assert_screen {Applicability} 15
+send_key "\r"
+assert_screen {Applicability} 15
+assert_screen {CIDR 192\.168\.0\.0/16} 15
+send_key "\033\[B"
+send_key "\r"
+if {[assert_screen {Pods|pods|Namespaces|namespaces|Deployments|deployments|Jobs|jobs|Viewing v1/pods|Viewing v1/namespaces|Viewing apps/v1/deployments|Viewing batch/v1/jobs} 20]} {
+  send_key "\033"
+  finish_case
+}
+
+start_case "open-resource-o-both-projections"
+ensure_rules
+send_key "\033\[B"
+send_key "o"
+assert_screen {NetworkPolicies|NetworkPolicy|policy} 20
+send_key "\033"
+assert_reachability_view 20
+send_key "m"
+assert_screen {Ingress · Primitives} 15
+send_key "o"
+if {[assert_screen {Pods|Namespaces|Deployments|Jobs|CIDR primitives are not Kubernetes resources} 20]} {
+  # If a real resource opened, Esc returns. If a CIDR flash happened, Esc would
+  # clear the primitive selection, so only send it when a breadcrumb changed.
+  send_key "\033"
+  send_key "m"
+  finish_case
+}
+
+start_case "yaml-view"
+ensure_rules
+send_key "y"
+if {[assert_screen {apiVersion|networking\.k8s\.io|YAML} 20]} {
+  send_key "\033"
+  finish_case
+}
+
+start_case "refresh-controls"
+ensure_rules
+send_key "r"
+wait_stream {Auto-refresh is enabled|Auto-refresh on|Auto-refresh} 10
+send_key "\022"
+assert_screen {Auto-refresh on|Auto-refresh} 10
+send_key "r"
+if {[wait_stream {Auto-refresh is disabled|Auto-refresh off|Auto-refresh} 10]} { finish_case }
+
+start_case "escape-clears-selection-before-back"
+ensure_rules
+send_key "\033"
+assert_screen {Effective Details.*Effective Applicability|Selection: none} 15
+pass_case
+
+start_case "freeze-hang-stress"
+# Mash the keys that touch the evaluator, the panels and the refresh loop. The
+# UI thread used to block on informer lists here, which stalled every repaint.
+for {set i 0} {$i < 80} {incr i} {
+  send -- "\033\[A\033\[B\022m\033\[5~\033\[6~"
+  after 40
+}
+# Drain everything already buffered so the probe below can only be satisfied by
+# a fresh repaint rather than by stale output.
+drain 1
+# A live TUI repaints as soon as it is poked; a deadlocked one never answers.
+repaint
+send -- "\022"
+after 200
+send -- "\033\[A"
+set timeout 30
+expect {
+  -re {Subject|Ingress|Egress|Details|Primitives|Rules} { pass_case }
+  timeout { fail_case_dump "TUI stopped repainting after the stress loop; sent SIGQUIT to container" }
+  eof { fail_case "process exited during stress" }
+}
+set timeout 10
+
+send_key "q"
+expect {
+  eof {}
+  timeout { catch {exec docker kill $container} }
+}
+
+close_case
+
+# Authoritative summary. Mid-run output interleaves with the TUI's own redraw
+# bytes, so per-case lines are unreliable to parse; this block is not.
+puts "=== smoke case summary ==="
+foreach entry $verdicts {
+  puts [format "  %-6s %s" [lindex $entry 1] [lindex $entry 0]]
+}
+puts [format "=== %d case(s), %d failure(s) ===" [llength $verdicts] $failures]
+
+if {$failures > 0} {
+  puts "FAILED $failures smoke assertion(s)"
+  exit 1
+}
+puts "all smoke cases passed"

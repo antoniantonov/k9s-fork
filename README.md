@@ -258,6 +258,25 @@ Binaries for Linux, Windows and Mac are available as tarballs in the [release pa
   After a successful build the script prints a ready-to-paste `docker run`
   command for the version it just built.
 
+#### Testing the reachability view end to end
+
+  `.github/skills/netpol-graph-testing/` bundles everything needed to exercise
+  the NetworkPolicy reachability view against a local kind cluster: a demo
+  topology covering every result state and primitive kind, a phase-based
+  orchestrator, and an `expect` harness that drives the real TUI in Docker.
+
+  ```shell
+  # Populate the cluster only when it is not already set up.
+  ./.github/skills/netpol-graph-testing/scripts/netpol-demo-workloads.sh --check
+
+  # Preflight, cluster, workloads, image build, Go tests and TUI smoke tests.
+  ./.github/skills/netpol-graph-testing/scripts/run-tests.sh
+  ```
+
+  Individual phases can be selected with `--only`, `--skip` and `--from`. Logs
+  land under `runs/<timestamp>/`. See the skill's `SKILL.md` for details and
+  `references/test-matrix.md` for the coverage matrix.
+
 #### Building a multi-platform image
 
   The `make imgx` target builds for `linux/amd64` and `linux/arm64` via Docker
@@ -532,9 +551,9 @@ Per-direction filters, selection, and scroll position remain independent.
 | `Up` / `Down` | Select the previous/next rule or primitive |
 | `PageUp` / `PageDown` | Move selection by one page |
 | `Home` / `End` | Select the first/last item |
-| `Left` / `Right` | Focus ingress/egress |
+| `Left` / `Right` | Focus ingress/egress (falls through to the details pane once it has focus) |
 | `Tab` / `Shift-Tab` | Cycle subject, directions, details, and applicability |
-| `Enter` | Open the selected resource |
+| `Enter` | Step into the details pane; press again to open the highlighted primitive |
 | `o` | Open the selected resource |
 | `y` | Open YAML for selected policy evidence |
 | `/` | Filter visible items by text |
@@ -553,12 +572,20 @@ position. The Rules/Primitives mode is global, so it remains shared even while
 one direction is hidden. If both directions are hidden, the subject and details
 remain visible.
 
-Press `Enter` or `o` to open the Kubernetes resource behind the selected row.
-Rules mode opens the NetworkPolicy; Primitives mode opens the selected Pod,
-Namespace, Deployment, or Job. CIDR primitives are not Kubernetes resources and
-cannot be opened. The reachability view appears in the breadcrumb trail as
-`<npg>`, so opening a resource pushes it onto the stack and `Esc` walks back
-through breadcrumbs such as `<npg> <pods> <containers>`.
+Press `o` to open the Kubernetes resource behind the selected row. Rules mode
+opens the NetworkPolicy; Primitives mode opens the selected Pod, Namespace,
+Deployment, or Job. CIDR primitives are not Kubernetes resources and cannot be
+opened. The reachability view appears in the breadcrumb trail as `<npg>`, so
+opening a resource pushes it onto the stack and `Esc` walks back through
+breadcrumbs such as `<npg> <pods> <containers>`.
+
+`Enter` navigates instead of opening. With ingress or egress focused it moves
+focus into the details pane so the applicability rows can be scrolled — onto
+the applicability table when one is rendered, and onto the details text
+otherwise. It works with **no** rule selected too, because the details pane then
+shows the direction's effective applicability. Pressing `Enter` again, with the
+applicability table focused, opens the highlighted row's primitive in its own
+view; `Esc` returns.
 
 ### Results and details
 

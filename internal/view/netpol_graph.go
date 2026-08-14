@@ -5,6 +5,7 @@ package view
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -69,6 +70,32 @@ const (
 	focusApplicability
 )
 
+// projectionCache memoizes the per-direction projections derived from the last
+// evaluated result. The evaluator clones its whole slice on every call and the
+// detail pane derives it several times per keystroke, which is enough work to
+// stall the UI on a large subject.
+type projectionCache struct {
+	generation uint64
+	kindMask   uint32
+	rules      []netpol.RuleResult
+	ruleIndex  map[string]int
+	primitives []netpol.PrimitiveResult
+	primIndex  map[string]int
+}
+
+// applicabilityMemo caches the last applicability projection. Rendering the
+// detail pane recomputes it, and a single keystroke repaints the pane more than
+// once.
+type applicabilityMemo struct {
+	generation uint64
+	kindMask   uint32
+	direction  netpol.Direction
+	ruleID     netpol.RuleID
+	effective  bool
+	valid      bool
+	rows       []netpol.ApplicabilityRow
+}
+
 // NetworkPolicyGraph displays evaluated ingress and egress NetworkPolicy reachability.
 type NetworkPolicyGraph struct {
 	*tview.Flex
@@ -98,6 +125,33 @@ type NetworkPolicyGraph struct {
 	cancel      context.CancelFunc
 	listening   bool
 	mx          sync.Mutex
+
+	// Workload rows are collected from the informers, which can block, so they
+	// are gathered off the UI goroutine and published back into these fields.
+	// Everything here is only ever touched on the UI goroutine.
+	workloads        []ui.SubjectWorkload
+	workloadNotes    []string
+	workloadsLoading bool
+	workloadSeq      uint64
+	// collectWorkloads overrides the workload collector. It exists so tests can
+	// stall collection and prove the UI path never waits on the informers.
+	collectWorkloads func(netpol.SubjectRef, []netpol.PodRef) ([]ui.SubjectWorkload, []string)
+
+	// dataGen invalidates the projection caches whenever the evaluated result
+	// or the enabled primitive kinds change.
+	dataGen     uint64
+	projections map[netpol.Direction]*projectionCache
+	rows        applicabilityMemo
+
+	// pendingResult and pendingErr hold the newest queued notification of each
+	// kind. The model reports a result and a partial-data failure back to back
+	// for the same refresh, so a single slot would let the failure discard the
+	// evaluation entirely.
+	pendingResult *netpol.SubjectResult
+	pendingErr    error
+	updateQueued  bool
+	refreshing    bool
+	refreshQueued bool
 }
 
 var (
@@ -127,6 +181,7 @@ func newNetworkPolicyGraph(subject netpol.SubjectRef, evaluator netpol.Evaluator
 		details:     tview.NewFlex(),
 		panels:      make(map[netpol.Direction]*ui.DirectionPanel, 2),
 		state:       make(map[netpol.Direction]*reachabilityDirectionState, 2),
+		projections: make(map[netpol.Direction]*projectionCache, 2),
 		kinds:       netpol.AllPrimitiveKinds(),
 		mode:        ui.RulesProjection,
 		focus:       netpol.Ingress,
@@ -247,15 +302,38 @@ func (v *NetworkPolicyGraph) defaultCtx() context.Context {
 // AutoRefresh reports whether the graph is periodically reevaluated.
 func (v *NetworkPolicyGraph) AutoRefresh() bool { return v.autoRefresh }
 
-// Refresh immediately reevaluates the graph.
+// Refresh immediately reevaluates the graph. Repeated presses collapse into a
+// single follow-up evaluation instead of queueing an unbounded number of
+// full-cluster snapshots behind the model's refresh lock.
 func (v *NetworkPolicyGraph) Refresh() {
 	if v.app == nil {
 		return
 	}
+	v.mx.Lock()
+	if v.refreshing {
+		v.refreshQueued = true
+		v.mx.Unlock()
+		return
+	}
+	v.refreshing = true
+	v.mx.Unlock()
+
 	ctx := v.defaultCtx()
 	go func() {
-		if err := v.model.Refresh(ctx); err != nil {
-			slog.Warn("NetworkPolicy graph refresh failed", slogs.Error, err)
+		for {
+			if err := v.model.Refresh(ctx); err != nil {
+				slog.Warn("NetworkPolicy graph refresh failed", slogs.Error, err)
+			}
+			v.mx.Lock()
+			again := v.refreshQueued
+			v.refreshQueued = false
+			if !again {
+				v.refreshing = false
+			}
+			v.mx.Unlock()
+			if !again {
+				return
+			}
 		}
 	}()
 }
@@ -285,7 +363,7 @@ func (v *NetworkPolicyGraph) NetPolGraphChanged(result netpol.SubjectResult) {
 		v.applyResult(&result)
 		return
 	}
-	v.app.QueueUpdateDraw(func() { v.applyResult(&result) })
+	v.queueUpdate(&result, nil)
 }
 
 // NetPolGraphFailed reports failures while retaining any usable partial result.
@@ -294,7 +372,48 @@ func (v *NetworkPolicyGraph) NetPolGraphFailed(err error) {
 		v.applyError(err)
 		return
 	}
-	v.app.QueueUpdateDraw(func() { v.applyError(err) })
+	v.queueUpdate(nil, err)
+}
+
+// queueUpdate coalesces model notifications. Evaluations can complete faster
+// than the UI can render them, and every queued update spawns a goroutine that
+// contends for tview's fixed-size update queue; replaying stale notifications
+// made the view appear permanently stuck.
+//
+// Results and failures are tracked separately on purpose. A partial-data
+// refresh fires NetPolGraphChanged immediately followed by NetPolGraphFailed,
+// and the queued drain cannot have run in between, so a single slot would let
+// the failure overwrite - and silently discard - the evaluated result.
+func (v *NetworkPolicyGraph) queueUpdate(result *netpol.SubjectResult, err error) {
+	v.mx.Lock()
+	if result != nil {
+		v.pendingResult = result
+	}
+	if err != nil {
+		v.pendingErr = err
+	}
+	queue := !v.updateQueued
+	v.updateQueued = true
+	v.mx.Unlock()
+	if !queue {
+		return
+	}
+	v.app.QueueUpdateDraw(v.drainPendingUpdate)
+}
+
+// drainPendingUpdate applies the newest queued notifications, the result first
+// so a partial-data failure annotates it instead of replacing it.
+func (v *NetworkPolicyGraph) drainPendingUpdate() {
+	v.mx.Lock()
+	result, err := v.pendingResult, v.pendingErr
+	v.pendingResult, v.pendingErr, v.updateQueued = nil, nil, false
+	v.mx.Unlock()
+	if result != nil {
+		v.applyResult(result)
+	}
+	if err != nil {
+		v.applyError(err)
+	}
 }
 
 func (v *NetworkPolicyGraph) applyError(err error) {
@@ -310,6 +429,7 @@ func (v *NetworkPolicyGraph) applyError(err error) {
 func (v *NetworkPolicyGraph) applyResult(result *netpol.SubjectResult) {
 	capturePanelState := v.haveResult
 	v.result, v.haveResult, v.lastError = *result, true, nil
+	v.invalidateProjections()
 	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
 		// Capture the live cursor first: loadPanel restores from the saved
 		// state, which would otherwise reset the panel to whatever position was
@@ -319,6 +439,7 @@ func (v *NetworkPolicyGraph) applyResult(result *netpol.SubjectResult) {
 		}
 		v.loadPanel(direction)
 	}
+	v.scheduleWorkloads()
 	v.updateSubject()
 	v.updateDetails(v.focus)
 }
@@ -331,11 +452,9 @@ func (v *NetworkPolicyGraph) loadPanel(direction netpol.Direction) {
 	if v.mode == ui.PrimitivesProjection && len(v.kinds) == 0 {
 		panel.SetData(nil, nil).SetEmptyMessage("No primitive kinds selected. Press f to enable kinds.")
 	} else {
+		cache := v.projection(direction)
 		panel.SetEmptyMessage("No reachability results match this view.").
-			SetData(
-				v.evaluator.Rules(v.result, direction),
-				v.evaluator.Primitives(v.result, direction, v.kinds),
-			)
+			SetData(cache.rules, cache.primitives)
 	}
 	panel.RestoreScrollState(modeState.scroll)
 }
@@ -363,20 +482,19 @@ func (v *NetworkPolicyGraph) rebuildDirections() {
 			SetText("Both directions are hidden. Press i for ingress or e for egress.")
 		v.placeholder.SetBorder(true).SetTitle(" Directions ")
 		v.directions.AddItem(v.placeholder, 0, 1, true)
+		// Both panels just left the widget tree. Focus has to move with them or
+		// tview drops the whole view out of the focus chain and every key dies.
+		v.focusTarget = v.directionFocusTarget()
+		if v.app != nil {
+			v.app.SetFocus(v.placeholder)
+		}
 		return
 	}
 	v.placeholder = nil
 	if !v.state[v.focus].visible {
 		v.focus = v.firstVisibleDirection()
-		if v.focus == netpol.Ingress {
-			v.focusTarget = focusIngress
-		} else {
-			v.focusTarget = focusEgress
-		}
 	}
-	if v.app != nil {
-		v.app.SetFocus(v.panels[v.focus])
-	}
+	v.focusActiveDirection()
 }
 
 func (v *NetworkPolicyGraph) firstVisibleDirection() netpol.Direction {
@@ -472,6 +590,11 @@ func (v *NetworkPolicyGraph) focusTargets() []reachabilityFocus {
 	return targets
 }
 
+// applyFocusTarget moves focus to a target, falling back when the requested
+// target no longer exists. tview only dispatches keys while the root reports
+// focus, and a Flex reports focus only for its current items, so leaving focus
+// on a widget that details.Clear() detached would silently kill every binding
+// in the view.
 func (v *NetworkPolicyGraph) applyFocusTarget(target reachabilityFocus) {
 	v.focusTarget = target
 	switch target {
@@ -485,6 +608,10 @@ func (v *NetworkPolicyGraph) applyFocusTarget(target reachabilityFocus) {
 	case focusEgress:
 		v.focus = netpol.Egress
 	case focusDetails:
+		if v.detailItem == nil {
+			v.applyFocusTarget(v.directionFocusTarget())
+			return
+		}
 		if v.app != nil {
 			if detail, ok := v.detailItem.(*ui.RuleDetails); ok {
 				v.app.SetFocus(detail.Text)
@@ -494,17 +621,51 @@ func (v *NetworkPolicyGraph) applyFocusTarget(target reachabilityFocus) {
 		}
 		return
 	case focusApplicability:
+		if _, ok := v.detailItem.(*ui.RuleDetails); !ok {
+			// The pane was rebuilt without a table, e.g. by toggling to
+			// Primitives mode while the table had focus.
+			v.applyFocusTarget(focusDetails)
+			return
+		}
 		if v.app != nil {
-			if detail, ok := v.detailItem.(*ui.RuleDetails); ok {
-				v.app.SetFocus(detail.Applicability)
-			}
+			v.app.SetFocus(v.detailItem.(*ui.RuleDetails).Applicability)
 		}
 		return
 	}
 	if v.app != nil {
-		v.app.SetFocus(v.panels[v.focus])
+		// With both directions hidden the panels are no longer in the widget
+		// tree, so focusing one would drop the view out of tview's focus chain
+		// and kill every binding.
+		if v.placeholder != nil {
+			v.app.SetFocus(v.placeholder)
+		} else {
+			v.app.SetFocus(v.panels[v.focus])
+		}
 	}
 	v.updateDetails(v.focus)
+}
+
+// directionFocusTarget returns the focus target for the active direction panel.
+func (v *NetworkPolicyGraph) directionFocusTarget() reachabilityFocus {
+	if v.focus == netpol.Ingress {
+		return focusIngress
+	}
+	return focusEgress
+}
+
+// focusActiveDirection returns focus to the active direction panel and records
+// it. Dialogs must go through this rather than SetFocus, or focusTarget keeps
+// pointing at a detail pane that no longer has focus and the next Enter or
+// arrow key acts on the wrong pane.
+func (v *NetworkPolicyGraph) focusActiveDirection() {
+	v.applyFocusTarget(v.directionFocusTarget())
+}
+
+// refocusDetail re-anchors focus after the detail pane has been rebuilt.
+func (v *NetworkPolicyGraph) refocusDetail() {
+	if v.focusTarget == focusDetails || v.focusTarget == focusApplicability {
+		v.applyFocusTarget(v.focusTarget)
+	}
 }
 
 func (v *NetworkPolicyGraph) updateSubject() {
@@ -531,8 +692,10 @@ func (v *NetworkPolicyGraph) updateSubject() {
 	if v.lastError != nil {
 		extras = append(extras, "ERROR: "+v.lastError.Error())
 	}
-	workloads, workloadNotes := v.subjectWorkloads()
-	extras = append(extras, workloadNotes...)
+	extras = append(extras, v.workloadNotes...)
+	if v.workloadsLoading {
+		extras = append(extras, "workloads loading...")
+	}
 	summary := fmt.Sprintf("%s %s · %d %s · Ingress %s · Egress %s · Kinds: %s · Auto-refresh %s",
 		subject.Kind, path, podCount, pluralize("pod", podCount),
 		onOff(v.state[netpol.Ingress].visible),
@@ -543,28 +706,67 @@ func (v *NetworkPolicyGraph) updateSubject() {
 	if len(extras) > 0 {
 		summary += " · " + strings.Join(extras, " · ")
 	}
-	v.subjectInfo.SetSubject(subject, podCount).SetSummary(summary).SetWorkloads(workloads)
+	v.subjectInfo.SetSubject(subject, podCount).SetSummary(summary).SetWorkloads(v.workloads)
 }
 
-func (v *NetworkPolicyGraph) subjectWorkloads() ([]ui.SubjectWorkload, []string) {
+// scheduleWorkloads recollects the subject workload rows off the UI goroutine.
+// The listers behind the factory perform RBAC round trips and can block for
+// seconds waiting on a cold informer cache, so collecting them inline froze the
+// whole application on every evaluation.
+func (v *NetworkPolicyGraph) scheduleWorkloads() {
+	v.workloadSeq++
 	if !v.haveResult {
-		return nil, nil
+		v.workloads, v.workloadNotes, v.workloadsLoading = nil, nil, false
+		return
+	}
+	collect := v.workloadCollector()
+	if collect == nil || v.app == nil {
+		v.workloads, v.workloadNotes, v.workloadsLoading = nil, []string{"workloads unavailable: no resource factory"}, false
+		return
+	}
+	seq, subject := v.workloadSeq, v.subject
+	pods := slices.Clone(v.result.Subject.Pods)
+	v.workloadsLoading = true
+	go func() {
+		workloads, notes := collect(subject, pods)
+		v.app.QueueUpdateDraw(func() {
+			// A newer evaluation already superseded this collection.
+			if seq != v.workloadSeq {
+				return
+			}
+			v.workloads, v.workloadNotes, v.workloadsLoading = workloads, notes, false
+			v.updateSubject()
+		})
+	}()
+}
+
+// workloadCollector returns the collector used to gather subject workload rows,
+// or nil when no resource factory is available.
+func (v *NetworkPolicyGraph) workloadCollector() func(netpol.SubjectRef, []netpol.PodRef) ([]ui.SubjectWorkload, []string) {
+	if v.collectWorkloads != nil {
+		return v.collectWorkloads
 	}
 	if v.app == nil || v.app.factory == nil {
-		return nil, []string{"workloads unavailable: no resource factory"}
+		return nil
 	}
-	switch v.subject.Kind {
+	factory := v.app.factory
+	return func(subject netpol.SubjectRef, pods []netpol.PodRef) ([]ui.SubjectWorkload, []string) {
+		return collectSubjectWorkloads(factory, subject, pods)
+	}
+}
+
+func collectSubjectWorkloads(factory dao.Factory, subject netpol.SubjectRef, pods []netpol.PodRef) ([]ui.SubjectWorkload, []string) {
+	switch subject.Kind {
 	case netpol.SubjectNamespace:
-		return v.namespaceSubjectWorkloads(v.subject.Name)
+		return namespaceSubjectWorkloads(factory, subject.Name)
 	case netpol.SubjectPod, netpol.SubjectDeployment, netpol.SubjectJob:
-		return v.subjectPodWorkloads()
+		return subjectPodWorkloads(factory, pods)
 	default:
 		return nil, nil
 	}
 }
 
-func (v *NetworkPolicyGraph) subjectPodWorkloads() ([]ui.SubjectWorkload, []string) {
-	pods := v.result.Subject.Pods
+func subjectPodWorkloads(factory dao.Factory, pods []netpol.PodRef) ([]ui.SubjectWorkload, []string) {
 	if len(pods) == 0 {
 		return nil, nil
 	}
@@ -575,7 +777,7 @@ func (v *NetworkPolicyGraph) subjectPodWorkloads() ([]ui.SubjectWorkload, []stri
 	statuses := make(map[string]string, len(pods))
 	notes := []string{}
 	for namespace := range byNamespace {
-		objects, err := v.listUnstructured(client.PodGVR, namespace)
+		objects, err := listUnstructured(factory, client.PodGVR, namespace)
 		if err != nil {
 			return nil, []string{fmt.Sprintf("workloads unavailable: pod list in %s failed: %v", namespace, err)}
 		}
@@ -603,7 +805,7 @@ func (v *NetworkPolicyGraph) subjectPodWorkloads() ([]ui.SubjectWorkload, []stri
 	return workloads, notes
 }
 
-func (v *NetworkPolicyGraph) namespaceSubjectWorkloads(namespace string) ([]ui.SubjectWorkload, []string) {
+func namespaceSubjectWorkloads(factory dao.Factory, namespace string) ([]ui.SubjectWorkload, []string) {
 	specs := []struct {
 		gvr  *client.GVR
 		kind string
@@ -623,7 +825,7 @@ func (v *NetworkPolicyGraph) namespaceSubjectWorkloads(namespace string) ([]ui.S
 			truncated = true
 			break
 		}
-		objects, err := v.listUnstructured(spec.gvr, namespace)
+		objects, err := listUnstructured(factory, spec.gvr, namespace)
 		if err != nil {
 			return nil, []string{fmt.Sprintf("workloads unavailable: %s list failed: %v", spec.kind, err)}
 		}
@@ -649,8 +851,8 @@ func (v *NetworkPolicyGraph) namespaceSubjectWorkloads(namespace string) ([]ui.S
 // listUnstructured returns namespace/name sorted objects. The informer cache
 // iterates a map, so an unsorted list reshuffles the subject workload rows on
 // every refresh and makes the row cap pick an arbitrary subset.
-func (v *NetworkPolicyGraph) listUnstructured(gvr *client.GVR, namespace string) ([]*unstructured.Unstructured, error) {
-	objects, err := v.app.factory.List(gvr, namespace, true, labels.Everything())
+func listUnstructured(factory dao.Factory, gvr *client.GVR, namespace string) ([]*unstructured.Unstructured, error) {
+	objects, err := factory.List(gvr, namespace, true, labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -816,6 +1018,7 @@ func (v *NetworkPolicyGraph) updateDetails(direction netpol.Direction) {
 	v.detailShown = detailScrollState{}
 	if !v.haveResult || !v.state[direction].visible {
 		v.showMessage("No selected reachability result.")
+		v.refocusDetail()
 		return
 	}
 	id := v.panels[direction].SelectedID()
@@ -828,9 +1031,10 @@ func (v *NetworkPolicyGraph) updateDetails(direction netpol.Direction) {
 		rule, ok := v.selectedRule(direction, id)
 		if !ok {
 			v.showMessage("Selected rule is no longer available.")
+			v.refocusDetail()
 			return
 		}
-		rows := v.evaluator.RuleApplicability(v.result, direction, rule.ID, v.kinds)
+		rows := v.ruleApplicability(direction, rule.ID)
 		ruleDetail := ui.NewRuleDetailsWithStyle(rule, rows, v.reachabilityStyle())
 		v.applyDetailFocusStyle(ruleDetail)
 		var text strings.Builder
@@ -844,6 +1048,7 @@ func (v *NetworkPolicyGraph) updateDetails(direction netpol.Direction) {
 		primitive, ok := v.selectedPrimitive(direction, id)
 		if !ok {
 			v.showMessage("Selected primitive is no longer available.")
+			v.refocusDetail()
 			return
 		}
 		text := ui.NewPrimitiveDetails(primitive)
@@ -855,24 +1060,20 @@ func (v *NetworkPolicyGraph) updateDetails(direction netpol.Direction) {
 	v.detailItem = detail
 	v.detailShown = detailScrollState{direction: direction, selectionID: id}
 	v.restoreDetailState(previous)
-	if v.focusTarget == focusDetails || v.focusTarget == focusApplicability {
-		v.applyFocusTarget(v.focusTarget)
-	}
+	v.refocusDetail()
 }
 
 // showEffectiveDetails renders the direction's reachability after every rule has
 // been applied. It is what the details pane shows when nothing is selected.
 func (v *NetworkPolicyGraph) showEffectiveDetails(direction netpol.Direction, previous detailScrollState) {
-	rows := v.evaluator.DirectionApplicability(v.result, direction, v.kinds)
+	rows := v.directionApplicability(direction)
 	detail := ui.NewEffectiveDetailsWithStyle(v.effectiveDetailsText(direction, rows), rows, v.reachabilityStyle())
 	v.applyDetailFocusStyle(detail)
 	v.details.AddItem(detail, 0, 1, false)
 	v.detailItem = detail
 	v.detailShown = detailScrollState{direction: direction, effective: true}
 	v.restoreDetailState(previous)
-	if v.focusTarget == focusDetails || v.focusTarget == focusApplicability {
-		v.applyFocusTarget(v.focusTarget)
-	}
+	v.refocusDetail()
 }
 
 func (v *NetworkPolicyGraph) effectiveDetailsText(direction netpol.Direction, rows []netpol.ApplicabilityRow) string {
@@ -1012,25 +1213,102 @@ func (v *NetworkPolicyGraph) showMessage(message string) {
 }
 
 func (v *NetworkPolicyGraph) selectedRule(direction netpol.Direction, id string) (netpol.RuleResult, bool) {
-	rules := v.evaluator.Rules(v.result, direction)
-	for index := range rules {
-		rule := &rules[index]
-		if rule.StableID() == id {
-			return *rule, true
-		}
+	cache := v.projection(direction)
+	index, ok := cache.ruleIndex[id]
+	if !ok {
+		return netpol.RuleResult{}, false
 	}
-	return netpol.RuleResult{}, false
+	return cache.rules[index], true
 }
 
 func (v *NetworkPolicyGraph) selectedPrimitive(direction netpol.Direction, id string) (netpol.PrimitiveResult, bool) {
-	primitives := v.evaluator.Primitives(v.result, direction, v.kinds)
-	for index := range primitives {
-		primitive := &primitives[index]
-		if primitive.StableID() == id {
-			return *primitive, true
-		}
+	cache := v.projection(direction)
+	index, ok := cache.primIndex[id]
+	if !ok {
+		return netpol.PrimitiveResult{}, false
 	}
-	return netpol.PrimitiveResult{}, false
+	return cache.primitives[index], true
+}
+
+// invalidateProjections drops the memoized projections. It must be called
+// whenever the evaluated result or the subject changes. Changing the enabled
+// kinds needs no call: they are part of the cache key.
+func (v *NetworkPolicyGraph) invalidateProjections() {
+	v.dataGen++
+	v.rows.valid = false
+}
+
+// kindMask encodes the enabled primitive kinds so the caches key on them
+// directly rather than relying on every mutation site to invalidate.
+func (v *NetworkPolicyGraph) kindMask() uint32 {
+	var mask uint32
+	for kind := range v.kinds {
+		mask |= 1 << kind
+	}
+	return mask
+}
+
+// projection returns the memoized rule and primitive projections for a
+// direction, rebuilding them only when the underlying data changed.
+func (v *NetworkPolicyGraph) projection(direction netpol.Direction) *projectionCache {
+	mask := v.kindMask()
+	if cache, ok := v.projections[direction]; ok && cache.generation == v.dataGen && cache.kindMask == mask {
+		return cache
+	}
+	cache := &projectionCache{
+		generation: v.dataGen,
+		kindMask:   mask,
+		rules:      v.evaluator.Rules(v.result, direction),
+		primitives: v.evaluator.Primitives(v.result, direction, v.kinds),
+	}
+	cache.ruleIndex = make(map[string]int, len(cache.rules))
+	for index := range cache.rules {
+		cache.ruleIndex[cache.rules[index].StableID()] = index
+	}
+	cache.primIndex = make(map[string]int, len(cache.primitives))
+	for index := range cache.primitives {
+		cache.primIndex[cache.primitives[index].StableID()] = index
+	}
+	v.projections[direction] = cache
+	return cache
+}
+
+// ruleApplicability returns the applicability rows contributed by a single
+// rule, reusing the last computation when the pane repaints unchanged.
+func (v *NetworkPolicyGraph) ruleApplicability(direction netpol.Direction, id netpol.RuleID) []netpol.ApplicabilityRow {
+	mask := v.kindMask()
+	if v.rows.valid && v.rows.generation == v.dataGen && v.rows.kindMask == mask &&
+		v.rows.direction == direction && !v.rows.effective && v.rows.ruleID == id {
+		return v.rows.rows
+	}
+	v.rows = applicabilityMemo{
+		generation: v.dataGen,
+		kindMask:   mask,
+		direction:  direction,
+		ruleID:     id,
+		valid:      true,
+		rows:       v.evaluator.RuleApplicability(v.result, direction, id, v.kinds),
+	}
+	return v.rows.rows
+}
+
+// directionApplicability returns the effective applicability rows for a whole
+// direction, reusing the last computation when the pane repaints unchanged.
+func (v *NetworkPolicyGraph) directionApplicability(direction netpol.Direction) []netpol.ApplicabilityRow {
+	mask := v.kindMask()
+	if v.rows.valid && v.rows.generation == v.dataGen && v.rows.kindMask == mask &&
+		v.rows.direction == direction && v.rows.effective {
+		return v.rows.rows
+	}
+	v.rows = applicabilityMemo{
+		generation: v.dataGen,
+		kindMask:   mask,
+		direction:  direction,
+		effective:  true,
+		valid:      true,
+		rows:       v.evaluator.DirectionApplicability(v.result, direction, v.kinds),
+	}
+	return v.rows.rows
 }
 
 func (v *NetworkPolicyGraph) openKindsDialog() {
@@ -1046,10 +1324,10 @@ func (v *NetworkPolicyGraph) openKindsDialog() {
 		}
 		v.updateSubject()
 		v.updateDetails(v.focus)
-		v.app.SetFocus(v.panels[v.focus])
+		v.focusActiveDirection()
 	}, func() {
 		v.app.Content.RemovePage(netPolKindsDialogPage)
-		v.app.SetFocus(v.panels[v.focus])
+		v.focusActiveDirection()
 	})
 	styleForm(dialog.Form, &styles)
 	modal := tview.NewModalForm("<Primitive Kinds (global)>", dialog.Form)
@@ -1080,18 +1358,18 @@ func (v *NetworkPolicyGraph) openSearchDialog() {
 		}).
 		AddButton("Cancel", func() {
 			v.app.Content.RemovePage(netPolSearchPage)
-			v.app.SetFocus(v.panels[v.focus])
+			v.focusActiveDirection()
 		})
 	form.SetCancelFunc(func() {
 		v.app.Content.RemovePage(netPolSearchPage)
-		v.app.SetFocus(v.panels[v.focus])
+		v.focusActiveDirection()
 	})
 	styleForm(form, &styles)
 	modal := tview.NewModalForm("<Reachability Search>", form)
 	modal.SetBackgroundColor(styles.BgColor.Color()).SetTextColor(styles.FgColor.Color())
 	modal.SetDoneFunc(func(int, string) {
 		v.app.Content.RemovePage(netPolSearchPage)
-		v.app.SetFocus(v.panels[v.focus])
+		v.focusActiveDirection()
 	})
 	v.app.Content.AddPage(netPolSearchPage, modal, false, false)
 	v.app.Content.ShowPage(netPolSearchPage)
@@ -1119,13 +1397,17 @@ func (v *NetworkPolicyGraph) openSubjectDialog() {
 		return
 	}
 	styles := v.app.Styles.Dialog()
-	picker := ui.NewSubjectPicker(&styles, subjectKinds(), v.loadSubjects, func(ref netpol.SubjectRef) {
-		v.app.Content.RemovePage(netPolSubjectPage)
-		v.applySubject(ref)
-	}, func() {
-		v.app.Content.RemovePage(netPolSubjectPage)
-		v.app.SetFocus(v.panels[v.focus])
-	})
+	picker := ui.NewSubjectPickerWithPublisher(&styles, subjectKinds(), v.loadSubjects,
+		// Listing subjects hits the informers, which can block for seconds; the
+		// picker loads them off the UI goroutine and publishes back through here.
+		v.app.QueueUpdateDraw,
+		func(ref netpol.SubjectRef) {
+			v.app.Content.RemovePage(netPolSubjectPage)
+			v.applySubject(ref)
+		}, func() {
+			v.app.Content.RemovePage(netPolSubjectPage)
+			v.focusActiveDirection()
+		})
 	v.app.Content.AddPage(netPolSubjectPage, picker, false, false)
 	v.app.Content.ShowPage(netPolSubjectPage)
 	v.app.SetFocus(picker)
@@ -1135,6 +1417,7 @@ func (v *NetworkPolicyGraph) applySubject(ref netpol.SubjectRef) {
 	v.subject = ref
 	v.model.SetSubject(ref)
 	v.result, v.haveResult, v.lastError = netpol.SubjectResult{}, false, nil
+	v.invalidateProjections()
 	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
 		state := v.state[direction]
 		for projection, modeState := range state.states {
@@ -1143,11 +1426,13 @@ func (v *NetworkPolicyGraph) applySubject(ref netpol.SubjectRef) {
 		}
 		v.loadPanel(direction)
 	}
+	v.scheduleWorkloads()
 	v.updateSubject()
+	v.focusActiveDirection()
+	// After focusActiveDirection: its updateDetails would otherwise replace this
+	// with "No selected reachability result.", which reads as a prompt to select
+	// something rather than as a pending evaluation.
 	v.showMessage("Waiting for NetworkPolicy evaluation...")
-	if v.app != nil {
-		v.app.SetFocus(v.panels[v.focus])
-	}
 	// Without a watch loop nothing consumes the model refresh request, so the
 	// new subject would never be evaluated while auto-refresh is disabled.
 	if !v.autoRefresh {
@@ -1231,9 +1516,7 @@ func (v *NetworkPolicyGraph) applySearch(filter string) {
 	v.panels[v.focus].SetFilter(filter)
 	v.savePanelState(v.focus)
 	v.updateDetails(v.focus)
-	if v.app != nil {
-		v.app.SetFocus(v.panels[v.focus])
-	}
+	v.focusActiveDirection()
 }
 
 func (v *NetworkPolicyGraph) yamlCmd(_ *tcell.EventKey) *tcell.EventKey {
@@ -1283,6 +1566,106 @@ func (v *NetworkPolicyGraph) escapeCmd(evt *tcell.EventKey) *tcell.EventKey {
 		return v.app.PrevCmd(evt)
 	}
 	return evt
+}
+
+// focusDirectionCmd focuses a direction panel, but only while the arrows still
+// belong to the view. Once focus sits inside the detail pane the event is
+// handed to the widget so its text and table can scroll horizontally.
+func (v *NetworkPolicyGraph) focusDirectionCmd(direction netpol.Direction) func(*tcell.EventKey) *tcell.EventKey {
+	return func(evt *tcell.EventKey) *tcell.EventKey {
+		if v.focusTarget == focusDetails || v.focusTarget == focusApplicability {
+			return evt
+		}
+		v.focusDirection(direction)
+		return nil
+	}
+}
+
+// enterCmd walks focus into the detail pane so applicability rows can be
+// scrolled, then opens the highlighted resource on a second press. Open
+// Resource remains directly available from anywhere on "o".
+func (v *NetworkPolicyGraph) enterCmd(evt *tcell.EventKey) *tcell.EventKey {
+	switch v.focusTarget {
+	case focusIngress, focusEgress:
+		return v.focusDetailPane(evt)
+	case focusApplicability:
+		return v.openApplicabilityCmd(evt)
+	case focusDetails:
+		return v.openResourceCmd(evt)
+	default:
+		return evt
+	}
+}
+
+// focusDetailPane moves focus onto the applicability table when one is
+// rendered, and onto the detail text otherwise. It works with an empty panel
+// selection because the effective pane also renders an applicability table, and
+// it never swallows the key without moving focus or explaining why.
+func (v *NetworkPolicyGraph) focusDetailPane(evt *tcell.EventKey) *tcell.EventKey {
+	targets := v.focusTargets()
+	if slices.Contains(targets, focusApplicability) {
+		v.applyFocusTarget(focusApplicability)
+		return nil
+	}
+	if slices.Contains(targets, focusDetails) {
+		v.applyFocusTarget(focusDetails)
+		return nil
+	}
+	if v.app != nil {
+		v.app.Flash().Info("No details to focus")
+		return nil
+	}
+	return evt
+}
+
+var (
+	errNoApplicabilityTable = errors.New("the detail pane renders no applicability table")
+	errNoApplicabilityRow   = errors.New("no applicability row is highlighted")
+	errPrimitiveUnavailable = errors.New("the highlighted primitive is no longer available")
+	errPrimitiveNotResource = errors.New("the highlighted primitive is not a Kubernetes resource")
+)
+
+// applicabilityTarget resolves the highlighted applicability row to the k9s
+// command and resource path that renders its primitive. Applicability rows are
+// built from the same kind-filtered primitive set as the panels, so the row's
+// stable ID always resolves against that projection.
+func (v *NetworkPolicyGraph) applicabilityTarget() (command, path string, err error) {
+	detail, ok := v.detailItem.(*ui.RuleDetails)
+	if !ok {
+		return "", "", errNoApplicabilityTable
+	}
+	id := detail.SelectedApplicabilityID()
+	if id == "" {
+		return "", "", errNoApplicabilityRow
+	}
+	primitive, ok := v.selectedPrimitive(v.focus, id)
+	if !ok {
+		return "", "", errPrimitiveUnavailable
+	}
+	command, path = primitiveCommand(&primitive.Ref)
+	if command == "" {
+		return "", "", errPrimitiveNotResource
+	}
+	return command, path, nil
+}
+
+// openApplicabilityCmd opens the primitive backing the highlighted
+// applicability row.
+func (v *NetworkPolicyGraph) openApplicabilityCmd(evt *tcell.EventKey) *tcell.EventKey {
+	if v.app == nil {
+		return evt
+	}
+	command, path, err := v.applicabilityTarget()
+	if err != nil {
+		if errors.Is(err, errPrimitiveNotResource) {
+			v.app.Flash().Errf("CIDR primitives are not Kubernetes resources")
+		} else {
+			v.app.Flash().Info(err.Error())
+		}
+		return nil
+	}
+	v.app.gotoResource(command, path, false, true)
+	return nil
 }
 
 // openResourceCmd navigates to the Kubernetes resource backing the selection
@@ -1351,10 +1734,10 @@ func (v *NetworkPolicyGraph) bindKeys() {
 		ui.KeyR:          ui.NewKeyAction("Toggle Auto-Refresh", func(*tcell.EventKey) *tcell.EventKey { v.toggleAutoRefresh(); return nil }, true),
 		tcell.KeyCtrlR:   ui.NewKeyAction("Refresh", func(*tcell.EventKey) *tcell.EventKey { v.Refresh(); return nil }, true),
 		ui.KeyY:          ui.NewKeyAction("YAML", v.yamlCmd, true),
-		tcell.KeyEnter:   ui.NewKeyAction("Open Resource", v.openResourceCmd, false),
+		tcell.KeyEnter:   ui.NewKeyAction("Focus Details/Open", v.enterCmd, false),
 		tcell.KeyEscape:  ui.NewKeyAction("Clear Selection/Back", v.escapeCmd, false),
-		tcell.KeyLeft:    ui.NewKeyAction("Focus Ingress", func(*tcell.EventKey) *tcell.EventKey { v.focusDirection(netpol.Ingress); return nil }, false),
-		tcell.KeyRight:   ui.NewKeyAction("Focus Egress", func(*tcell.EventKey) *tcell.EventKey { v.focusDirection(netpol.Egress); return nil }, false),
+		tcell.KeyLeft:    ui.NewKeyAction("Focus Ingress", v.focusDirectionCmd(netpol.Ingress), false),
+		tcell.KeyRight:   ui.NewKeyAction("Focus Egress", v.focusDirectionCmd(netpol.Egress), false),
 		tcell.KeyTAB:     ui.NewKeyAction("Next Panel", func(*tcell.EventKey) *tcell.EventKey { v.cycleFocus(false); return nil }, false),
 		tcell.KeyBacktab: ui.NewKeyAction("Previous Panel", func(*tcell.EventKey) *tcell.EventKey { v.cycleFocus(true); return nil }, false),
 	})

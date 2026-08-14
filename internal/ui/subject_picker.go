@@ -27,6 +27,8 @@ type SubjectPicker struct {
 	kinds        []netpol.SubjectKind
 	instances    []netpol.SubjectRef
 	load         SubjectLoader
+	publish      func(func())
+	loadSeq      uint64
 	accept       func(netpol.SubjectRef)
 	cancel       func()
 	focusKinds   bool
@@ -40,10 +42,26 @@ func NewSubjectPicker(
 	accept func(netpol.SubjectRef),
 	cancel func(),
 ) *SubjectPicker {
+	return NewSubjectPickerWithPublisher(styles, kinds, load, nil, accept, cancel)
+}
+
+// NewSubjectPickerWithPublisher creates a subject selector that loads in the
+// background and applies results through publish. The publisher is installed
+// before the first kind is selected, so even the initial load stays off the UI
+// goroutine.
+func NewSubjectPickerWithPublisher(
+	styles *config.Dialog,
+	kinds []netpol.SubjectKind,
+	load SubjectLoader,
+	publish func(func()),
+	accept func(netpol.SubjectRef),
+	cancel func(),
+) *SubjectPicker {
 	p := &SubjectPicker{
 		Box:          tview.NewBox(),
 		kinds:        append([]netpol.SubjectKind(nil), kinds...),
 		load:         load,
+		publish:      publish,
 		accept:       accept,
 		cancel:       cancel,
 		focusKinds:   true,
@@ -87,13 +105,46 @@ func newSubjectPickerList(styles *config.Dialog, title string) *tview.List {
 	return list
 }
 
+// SetPublisher installs a callback used to apply loaded subjects on the UI
+// goroutine. With a publisher the loader runs in the background; without one
+// the picker loads synchronously.
+func (p *SubjectPicker) SetPublisher(publish func(func())) *SubjectPicker {
+	p.publish = publish
+	return p
+}
+
 func (p *SubjectPicker) reloadInstances(kind netpol.SubjectKind) {
 	p.instances = nil
 	p.instanceList.Clear()
 	if p.load == nil {
 		return
 	}
-	instances, err := p.load(kind)
+	p.loadSeq++
+	seq := p.loadSeq
+	if p.publish == nil {
+		instances, err := p.load(kind)
+		p.renderInstances(seq, instances, err)
+		return
+	}
+	// Loading subjects lists a whole resource kind through the informers, which
+	// blocks on RBAC checks and cache syncs. Running that inline froze the app
+	// for as long as the listing took.
+	p.instanceList.AddItem("Loading...", "", 0, nil)
+	publish := p.publish
+	load := p.load
+	go func() {
+		instances, err := load(kind)
+		publish(func() { p.renderInstances(seq, instances, err) })
+	}()
+}
+
+// renderInstances paints a completed load, discarding responses superseded by a
+// newer kind selection.
+func (p *SubjectPicker) renderInstances(seq uint64, instances []netpol.SubjectRef, err error) {
+	if seq != p.loadSeq {
+		return
+	}
+	p.instanceList.Clear()
 	if err != nil {
 		p.instanceList.AddItem("Error: "+err.Error(), "", 0, nil)
 		return

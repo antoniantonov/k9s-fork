@@ -1,0 +1,4 @@
+# Local test-run artifacts: logs, exported kubeconfigs and the image build cache.
+runs/
+.kube/
+.image-cache

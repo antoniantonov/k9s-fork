@@ -6,6 +6,7 @@ package ui
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/derailed/k9s/internal/netpol"
 	"github.com/derailed/tcell/v2"
@@ -149,4 +150,100 @@ func testSubjects(kind netpol.SubjectKind) []netpol.SubjectRef {
 
 func sendPickerKey(picker *SubjectPicker, key tcell.Key) {
 	picker.InputHandler()(tcell.NewEventKey(key, 0, tcell.ModNone), func(tview.Primitive) {})
+}
+
+// Listing subjects blocks on RBAC checks and informer cache syncs. With a
+// publisher installed the picker must load in the background so the UI stays
+// responsive while the dialog is open.
+func TestSubjectPickerLoadsAsynchronously(t *testing.T) {
+	release := make(chan struct{})
+	picker := newTestSubjectPicker(func(kind netpol.SubjectKind) ([]netpol.SubjectRef, error) {
+		// The constructor loads the first kind synchronously, before a
+		// publisher exists; only stall the kind under test.
+		if kind == netpol.SubjectDeployment {
+			<-release
+		}
+		return testSubjects(kind), nil
+	}, nil)
+
+	published := make(chan func(), 4)
+	picker.SetPublisher(func(apply func()) { published <- apply })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		picker.reloadInstances(netpol.SubjectDeployment)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the picker blocked the caller while loading subjects")
+	}
+	require.Equal(t, 1, picker.instanceList.GetItemCount())
+	loading, _ := picker.instanceList.GetItemText(0)
+	require.Equal(t, "Loading...", loading)
+	require.Empty(t, picker.instances)
+
+	close(release)
+	select {
+	case apply := <-published:
+		apply()
+	case <-time.After(10 * time.Second):
+		t.Fatal("the loaded subjects were never published")
+	}
+	require.Equal(t, testSubjects(netpol.SubjectDeployment), picker.instances)
+}
+
+// A response for a superseded kind must not repaint the list.
+func TestSubjectPickerDiscardsStaleLoads(t *testing.T) {
+	picker := newTestSubjectPicker(nil, nil)
+	published := make(chan func(), 4)
+	picker.SetPublisher(func(apply func()) { published <- apply })
+
+	picker.reloadInstances(netpol.SubjectDeployment)
+	stale := picker.loadSeq
+	picker.reloadInstances(netpol.SubjectJob)
+
+	// Drain both background publishes. The sequence guard, not arrival order,
+	// decides which one is allowed to repaint.
+	for range 2 {
+		select {
+		case apply := <-published:
+			apply()
+		case <-time.After(10 * time.Second):
+			t.Fatal("a load was never published")
+		}
+	}
+	require.Equal(t, testSubjects(netpol.SubjectJob), picker.instances)
+
+	// Replaying the superseded response must leave the list untouched.
+	picker.renderInstances(stale, testSubjects(netpol.SubjectDeployment), nil)
+	require.Equal(t, testSubjects(netpol.SubjectJob), picker.instances)
+}
+
+// The constructor selects the first kind, which triggers a load. With a
+// publisher supplied up front even that initial load must stay off the caller's
+// goroutine, otherwise opening the dialog freezes the UI.
+func TestSubjectPickerInitialLoadIsAsynchronous(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	published := make(chan func(), 4)
+
+	built := make(chan *SubjectPicker, 1)
+	go func() {
+		built <- NewSubjectPickerWithPublisher(nil, []netpol.SubjectKind{
+			netpol.SubjectPod,
+			netpol.SubjectDeployment,
+		}, func(kind netpol.SubjectKind) ([]netpol.SubjectRef, error) {
+			<-release
+			return testSubjects(kind), nil
+		}, func(apply func()) { published <- apply }, nil, nil)
+	}()
+
+	select {
+	case picker := <-built:
+		require.NotNil(t, picker)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the picker constructor blocked on the initial subject load")
+	}
 }

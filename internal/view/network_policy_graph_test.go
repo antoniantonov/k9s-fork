@@ -107,6 +107,11 @@ func (m *fakeNetPolGraphModel) Refresh(context.Context) error {
 func (m *fakeNetPolGraphModel) Peek() (netpol.SubjectResult, bool) {
 	return m.result, m.result.Subject.Ref.Name != ""
 }
+func (m *fakeNetPolGraphModel) refreshCount() int {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+	return m.refreshes
+}
 
 func TestNetworkPolicyGraphSubjectMapping(t *testing.T) {
 	tests := []struct {
@@ -356,9 +361,10 @@ func TestNetworkPolicyGraphKeyboardModesFocusAndNavigation(t *testing.T) {
 
 	view.focusDirection(netpol.Ingress)
 	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
-	assert.Equal(t, enter, view.keyboard(enter))
-	assert.Equal(t, focusIngress, view.focusTarget)
+	assert.Nil(t, view.keyboard(enter))
+	assert.Equal(t, focusApplicability, view.focusTarget, "Enter walks into the applicability table")
 
+	view.focusDirection(netpol.Ingress)
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'i', tcell.ModNone)))
 	assert.False(t, view.state[netpol.Ingress].visible)
 	assert.Equal(t, netpol.Egress, view.focus)
@@ -393,18 +399,22 @@ func TestNetworkPolicyGraphOpenResourceKeys(t *testing.T) {
 	assert.True(t, open.Opts.Visible)
 	enterAction, ok := view.actions.Get(tcell.KeyEnter)
 	require.True(t, ok)
-	assert.Equal(t, "Open Resource", enterAction.Description)
+	assert.Equal(t, "Focus Details/Open", enterAction.Description)
 	assert.False(t, enterAction.Opts.Visible)
 
+	// Enter now walks focus into the detail pane; only "o" opens directly.
 	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
-	assert.Equal(t, enter, view.keyboard(enter), "nil-app rule navigation falls through without panicking")
+	assert.Nil(t, view.keyboard(enter))
+	assert.Equal(t, focusApplicability, view.focusTarget)
 	o := tcell.NewEventKey(tcell.KeyRune, 'o', tcell.ModNone)
 	assert.Equal(t, o, view.keyboard(o), "nil-app rule navigation falls through without panicking")
 
+	view.focusDirection(netpol.Ingress)
 	view.switchMode()
 	require.Equal(t, ui.PrimitivesProjection, view.mode)
 	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
-	assert.Equal(t, enter, view.keyboard(enter), "nil-app primitive navigation falls through without panicking")
+	assert.Nil(t, view.keyboard(enter))
+	assert.Equal(t, focusDetails, view.focusTarget, "Primitives mode has no applicability table")
 	assert.Equal(t, o, view.keyboard(o), "nil-app primitive navigation falls through without panicking")
 }
 
@@ -991,4 +1001,335 @@ func TestNetworkPolicyGraphErrorWithoutResult(t *testing.T) {
 	view.applyError(errors.New("forbidden"))
 	details := view.detailItem.(*tview.TextView).GetText(true)
 	assert.True(t, strings.Contains(details, "failed") && strings.Contains(details, "forbidden"))
+}
+
+// Enter walks focus into the applicability table so the rows can be scrolled,
+// which is the whole point of separating it from Open Resource.
+func TestNetworkPolicyGraphEnterFocusesApplicability(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(multiPrimitiveSubjectResult())
+	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
+	require.Equal(t, focusIngress, view.focusTarget)
+
+	details, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	require.Greater(t, details.Applicability.GetRowCount(), 1)
+
+	assert.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
+	assert.Equal(t, focusApplicability, view.focusTarget)
+}
+
+// With nothing selected the detail pane renders the direction's effective
+// applicability, and Enter must reach it just the same.
+func TestNetworkPolicyGraphEnterFocusesEffectiveApplicabilityWithoutSelection(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(multiPrimitiveSubjectResult())
+	view.panels[netpol.Ingress].ClearSelection()
+	view.updateDetails(netpol.Ingress)
+	require.Empty(t, view.panels[netpol.Ingress].SelectedID())
+	require.True(t, view.detailShown.effective)
+
+	view.focusTarget = focusIngress
+	assert.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
+	assert.Equal(t, focusApplicability, view.focusTarget)
+}
+
+// Primitives mode renders a plain text pane, so Enter falls back to it rather
+// than becoming a silent no-op.
+func TestNetworkPolicyGraphEnterFallsBackToDetailText(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	_, isRuleDetails := view.detailItem.(*ui.RuleDetails)
+	require.False(t, isRuleDetails)
+
+	view.focusTarget = focusIngress
+	assert.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
+	assert.Equal(t, focusDetails, view.focusTarget)
+}
+
+// An applicability table with no data rows must not capture focus.
+func TestNetworkPolicyGraphEnterFallsBackWhenApplicabilityIsEmpty(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.kinds = sets.New[netpol.PrimitiveKind]()
+	view.updateDetails(netpol.Ingress)
+
+	details, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	require.Equal(t, 1, details.Applicability.GetRowCount(), "header only")
+
+	view.focusTarget = focusIngress
+	assert.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
+	assert.Equal(t, focusDetails, view.focusTarget)
+}
+
+// A second Enter, from the applicability table, opens the highlighted primitive.
+func TestNetworkPolicyGraphEnterOpensHighlightedPrimitive(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	require.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
+	require.Equal(t, focusApplicability, view.focusTarget)
+
+	command, path, err := view.applicabilityTarget()
+	require.NoError(t, err)
+	assert.Equal(t, "pods", command)
+	assert.Equal(t, "payments/peer", path)
+}
+
+// CIDR rows describe address ranges, not Kubernetes objects.
+func TestNetworkPolicyGraphEnterReportsCIDRApplicabilityRow(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.app = NewApp(config.NewConfig(nil))
+	result := testSubjectResult()
+	id := result.Ingress.Rules[0].ID
+	result.Ingress.Primitives = map[netpol.PrimitiveKind][]netpol.PrimitiveResult{
+		netpol.PrimitiveCIDR: {{
+			Ref:          netpol.PrimitiveRef{Kind: netpol.PrimitiveCIDR, Name: "10.0.0.0/8"},
+			State:        netpol.AccessAllowed,
+			AllowedPairs: 1,
+			TotalPairs:   1,
+			Permissions:  []netpol.PortPermission{{All: true}},
+			Evidence:     []netpol.PolicyEvidence{{RuleID: id, Summary: "cidr evidence"}},
+			PairDecisions: []netpol.PairDecision{{
+				Source:      netpol.PodRef{Namespace: "payments", Name: "api"},
+				Destination: netpol.PodRef{Name: "10.0.0.1"},
+				Decision: netpol.Decision{
+					State:       netpol.AccessAllowed,
+					Permissions: []netpol.PortPermission{{All: true}},
+					Evidence:    []netpol.PolicyEvidence{{RuleID: id, Summary: "Ingress evidence"}},
+				},
+			}},
+		}},
+	}
+	view.applyResult(result)
+
+	require.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
+	require.Equal(t, focusApplicability, view.focusTarget)
+
+	_, _, err := view.applicabilityTarget()
+	require.ErrorIs(t, err, errPrimitiveNotResource)
+
+	assert.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
+	message := <-view.app.Flash().Channel()
+	assert.Contains(t, message.Text, "CIDR primitives are not Kubernetes resources")
+}
+
+// Once focus sits inside the detail pane the arrows belong to the widget so its
+// text and table can scroll horizontally.
+func TestNetworkPolicyGraphArrowsReachTheDetailPane(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+
+	left := tcell.NewEventKey(tcell.KeyLeft, 0, tcell.ModNone)
+	assert.Nil(t, view.keyboard(left), "arrows switch direction while a panel is focused")
+
+	view.applyFocusTarget(focusApplicability)
+	assert.Equal(t, left, view.keyboard(left), "arrows fall through to the focused detail widget")
+	right := tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModNone)
+	assert.Equal(t, right, view.keyboard(right))
+}
+
+// blockingWorkloads stalls workload collection, standing in for a cold informer
+// cache that has not synced yet.
+func blockingWorkloads(started chan<- struct{}, release <-chan struct{}) func(netpol.SubjectRef, []netpol.PodRef) ([]ui.SubjectWorkload, []string) {
+	return func(netpol.SubjectRef, []netpol.PodRef) ([]ui.SubjectWorkload, []string) {
+		close(started)
+		<-release
+		return nil, nil
+	}
+}
+
+// Collecting subject workloads lists several resource kinds through the
+// informers, which blocks on RBAC checks and cache syncs. Doing that inline
+// froze the whole application on every evaluation.
+func TestNetworkPolicyGraphUIPathNeverWaitsOnWorkloadCollection(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+
+	view := newTestNetworkPolicyGraph()
+	view.app = NewApp(config.NewConfig(nil))
+	view.collectWorkloads = blockingWorkloads(started, release)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		view.applyResult(testSubjectResult())
+		view.updateDetails(netpol.Ingress)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the UI path blocked waiting on workload collection")
+	}
+
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("workloads were never collected in the background")
+	}
+	assert.Contains(t, view.subjectInfo.SummaryText(), "workloads loading")
+}
+
+// Evaluations can complete faster than the UI renders them; replaying every
+// queued result made the view appear permanently stuck.
+func TestNetworkPolicyGraphCoalescesQueuedUpdates(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.app = NewApp(config.NewConfig(nil))
+
+	first, second := testSubjectResult(), multiRuleSubjectResult()
+	view.queueUpdate(first, nil)
+	view.queueUpdate(second, nil)
+
+	view.drainPendingUpdate()
+	assert.Equal(t, len(second.Ingress.Rules), len(view.result.Ingress.Rules), "the newest result wins")
+
+	view.mx.Lock()
+	result, err, queued := view.pendingResult, view.pendingErr, view.updateQueued
+	view.mx.Unlock()
+	assert.Nil(t, result)
+	assert.NoError(t, err)
+	assert.False(t, queued)
+}
+
+// A partial-data refresh fires NetPolGraphChanged immediately followed by
+// NetPolGraphFailed. Coalescing them into one slot let the failure discard the
+// evaluated result, so the panels either never populated or froze on stale data.
+func TestNetworkPolicyGraphPartialDataKeepsTheResult(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.app = NewApp(config.NewConfig(nil))
+	require.False(t, view.haveResult)
+
+	// Exactly the model's ordering: the drain cannot run in between.
+	view.NetPolGraphChanged(*multiRuleSubjectResult())
+	view.NetPolGraphFailed(errors.New("network policy snapshot is incomplete"))
+	view.drainPendingUpdate()
+
+	require.True(t, view.haveResult, "the evaluated result must survive the partial-data failure")
+	assert.NotEmpty(t, view.panels[netpol.Ingress].SelectedID(), "panels must be populated")
+	require.Error(t, view.lastError)
+	assert.Contains(t, view.subjectInfo.SummaryText(), "ERROR: network policy snapshot is incomplete")
+}
+
+// Mashing Ctrl-R must not queue an unbounded number of full-cluster snapshots.
+func TestNetworkPolicyGraphCollapsesRepeatedRefreshes(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.app = NewApp(config.NewConfig(nil))
+	graph, ok := view.model.(*fakeNetPolGraphModel)
+	require.True(t, ok)
+
+	for range 10 {
+		view.Refresh()
+	}
+	assert.Eventually(t, func() bool {
+		view.mx.Lock()
+		defer view.mx.Unlock()
+		return !view.refreshing
+	}, 5*time.Second, 10*time.Millisecond)
+	assert.LessOrEqual(t, graph.refreshCount(), 2, "presses collapse into at most one follow-up refresh")
+}
+
+// Toggling to a pane without an applicability table while that table has focus
+// must not strand tview on the detached widget: a Flex only reports focus for
+// its current items, so the whole view would drop out of the focus chain and
+// every key binding would silently stop working.
+func TestNetworkPolicyGraphFocusFallsBackWhenTheTableDisappears(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	require.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
+	require.Equal(t, focusApplicability, view.focusTarget)
+
+	// Primitives mode renders a plain text pane with no applicability table.
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	_, isRuleDetails := view.detailItem.(*ui.RuleDetails)
+	require.False(t, isRuleDetails)
+	assert.Equal(t, focusDetails, view.focusTarget, "focus must follow the rebuilt pane")
+
+	// Hiding both directions removes the detail content entirely.
+	view.toggleDirection(netpol.Ingress)
+	view.toggleDirection(netpol.Egress)
+	assert.Contains(t, []reachabilityFocus{focusIngress, focusEgress}, view.focusTarget,
+		"focus must return to the view when there is nothing to focus")
+}
+
+// Dialogs restore focus to the direction panel, so focusTarget has to follow.
+// Otherwise the next Enter still believes the applicability table has focus and
+// navigates away instead of stepping into the detail pane.
+func TestNetworkPolicyGraphDialogsResetTheFocusTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		act  func(*NetworkPolicyGraph)
+	}{
+		{"search", func(v *NetworkPolicyGraph) { v.applySearch("") }},
+		{"subject", func(v *NetworkPolicyGraph) {
+			v.applySubject(netpol.SubjectRef{
+				Kind: netpol.SubjectNamespace, Name: "other", UID: types.UID("other-uid"),
+			})
+		}},
+		{"kinds", func(v *NetworkPolicyGraph) {
+			v.kinds = sets.New(netpol.PrimitivePod)
+			v.loadPanel(netpol.Ingress)
+			v.updateDetails(v.focus)
+			v.focusActiveDirection()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// A fresh view per case: the dialogs mutate shared view state.
+			view := newTestNetworkPolicyGraph()
+			view.applyResult(testSubjectResult())
+			view.applyFocusTarget(focusApplicability)
+			require.Equal(t, focusApplicability, view.focusTarget)
+
+			tc.act(view)
+			assert.Contains(t, []reachabilityFocus{focusIngress, focusEgress}, view.focusTarget)
+		})
+	}
+}
+
+// Changing subject must leave the pane explaining that an evaluation is
+// pending, not prompting for a selection that cannot exist yet.
+func TestNetworkPolicyGraphSubjectChangeShowsPendingMessage(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+
+	view.applySubject(netpol.SubjectRef{
+		Kind: netpol.SubjectNamespace, Name: "other", UID: types.UID("other-uid"),
+	})
+
+	text, ok := view.detailItem.(*tview.TextView)
+	require.True(t, ok)
+	assert.Contains(t, text.GetText(true), "Waiting for NetworkPolicy evaluation")
+}
+
+// With both directions hidden the panels leave the widget tree. Focusing one
+// anyway drops the view out of tview's focus chain, which silently kills every
+// key binding, so focus must land on the placeholder instead.
+func TestNetworkPolicyGraphHiddenDirectionsKeepFocusAttached(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.app = NewApp(config.NewConfig(nil))
+	view.applyResult(testSubjectResult())
+
+	view.toggleDirection(netpol.Ingress)
+	view.toggleDirection(netpol.Egress)
+	require.NotNil(t, view.placeholder, "both directions hidden renders the placeholder")
+	assert.Equal(t, tview.Primitive(view.placeholder), view.app.GetFocus())
+
+	// The subject picker is reachable while both directions are hidden, and its
+	// accept and cancel paths both restore focus.
+	view.applySubject(netpol.SubjectRef{
+		Kind: netpol.SubjectNamespace, Name: "other", UID: types.UID("other-uid"),
+	})
+	assert.Equal(t, tview.Primitive(view.placeholder), view.app.GetFocus())
+
+	view.focusActiveDirection()
+	assert.Equal(t, tview.Primitive(view.placeholder), view.app.GetFocus())
+
+	// Restoring a direction hands focus back to a real panel.
+	view.toggleDirection(netpol.Ingress)
+	require.Nil(t, view.placeholder)
+	assert.Equal(t, tview.Primitive(view.panels[netpol.Ingress]), view.app.GetFocus())
 }
