@@ -36,7 +36,101 @@ const (
 	netPolSearchPage      = "netpol-search"
 	netPolSubjectPage     = "netpol-subject"
 	subjectInfoRowLimit   = 300
+	openRuleHint          = "Open Rule"
 )
+
+// Section sizing. Every section above the applicability table is sized to its
+// own content, but capped so that a subject with hundreds of workloads or a
+// direction with hundreds of rules cannot squeeze the applicability table --
+// the table this view exists to show -- off the screen. The caps alone are not
+// enough: the rule detail text is long enough to hit its cap on almost every
+// rule, so the applicability table also reserves a share of the view up front
+// and the sections above it are trimmed from the bottom up to honour it.
+const (
+	subjectMaxPercent    = 25
+	directionMaxPercent  = 35
+	detailTextMaxPercent = 30
+	// applicabilityPercent is the share of the view the applicability table
+	// keeps before any section above it is allowed to grow into it.
+	applicabilityPercent = 28
+	// minSectionHeight is a border plus a single row of content.
+	minSectionHeight = 3
+	// minApplicabilityHeight is a border, the header row and two data rows.
+	minApplicabilityHeight = 5
+	// minDetailsHeight keeps the detail text and a usable applicability table
+	// on screen no matter how tall the sections above want to be.
+	minDetailsHeight = minSectionHeight + minApplicabilityHeight
+)
+
+// sectionRequest is one fixed-height section of a top-to-bottom stack.
+type sectionRequest struct {
+	desired int
+	min     int
+	// max caps the section. Zero means uncapped.
+	max int
+}
+
+// size returns the height the section would take on its own, before it competes
+// with anything else. A zero request stays zero so panes that ask for nothing
+// reserve nothing.
+func (s sectionRequest) size() int {
+	if s.desired == 0 && s.min == 0 {
+		return 0
+	}
+	size := s.desired
+	if s.max > 0 && size > s.max {
+		size = s.max
+	}
+	return max(size, s.min)
+}
+
+// solveSectionHeights sizes a stack of content-driven sections that share a
+// container with a trailing flexible section. Each section gets the height its
+// content asks for, clamped to its own bounds, and is then shrunk from the
+// bottom up until the flexible section keeps at least remainder rows.
+func solveSectionHeights(total, remainder int, requests []sectionRequest) []int {
+	sizes := make([]int, len(requests))
+	if total <= 0 {
+		return sizes
+	}
+	for index := range requests {
+		sizes[index] = max(0, requests[index].size())
+	}
+	// Give the flexible section its floor by trimming the sections above it,
+	// starting with the one nearest to it.
+	shrink(sizes, total-remainder, func(index int) int { return requests[index].min })
+	// The container is too small to honour even the minimums: keep the topmost
+	// sections and drop the ones that no longer fit at all.
+	shrink(sizes, total, func(int) int { return 0 })
+	return sizes
+}
+
+// shrink trims sizes from the bottom up until they sum to at most budget, never
+// taking a section below the floor reported for its index.
+func shrink(sizes []int, budget int, floor func(index int) int) {
+	for index := len(sizes) - 1; index >= 0; index-- {
+		excess := sum(sizes) - budget
+		if excess <= 0 {
+			return
+		}
+		room := min(sizes[index]-floor(index), excess)
+		if room > 0 {
+			sizes[index] -= room
+		}
+	}
+}
+
+func sum(values []int) int {
+	total := 0
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
+func percentOf(total, percent int) int {
+	return total * percent / 100
+}
 
 type netPolGraphModel interface {
 	SetSubject(netpol.SubjectRef)
@@ -209,13 +303,87 @@ func newNetworkPolicyGraph(subject netpol.SubjectRef, evaluator netpol.Evaluator
 	}
 	v.AddItem(v.subjectInfo, 0, 1, false)
 	v.AddItem(v.directions, 0, 3, true)
-	v.AddItem(v.details, 0, 2, false)
+	// The details pane is the flexible section: every section above it is
+	// resized to its content at draw time and this one absorbs the remainder.
+	v.AddItem(v.details, 0, 1, false)
 	v.bindKeys()
 	v.SetInputCapture(v.keyboard)
 	v.rebuildDirections()
 	v.updateSubject()
 	v.showMessage("Waiting for NetworkPolicy evaluation...")
 	return v
+}
+
+// Draw sizes every section from its own content before painting. tview flex
+// proportions cannot express "as tall as the content, but no taller than a
+// share of the screen", so the sizes are recomputed on each paint and pushed
+// into the flex. This runs on the UI goroutine and must stay side-effect free:
+// no focus changes, no detail pane rebuilds.
+func (v *NetworkPolicyGraph) Draw(screen tcell.Screen) {
+	v.applyLayout()
+	v.Flex.Draw(screen)
+}
+
+// applyLayout gives each section the height its content needs, capped so the
+// applicability table always keeps usable space, and hands whatever is left to
+// the details pane.
+func (v *NetworkPolicyGraph) applyLayout() {
+	_, _, width, height := v.GetInnerRect()
+	if width <= 0 || height <= 0 {
+		return
+	}
+	// The applicability table is reserved first so the sections above it
+	// compete for what is left rather than the other way round.
+	applicability := max(minApplicabilityHeight, percentOf(height, applicabilityPercent))
+	text := v.detailTextRequest(width, height)
+	sizes := solveSectionHeights(height, text.size()+applicability, []sectionRequest{
+		{desired: v.subjectInfo.ContentHeight(), min: minSectionHeight, max: percentOf(height, subjectMaxPercent)},
+		{desired: v.directionsContentHeight(), min: minSectionHeight, max: percentOf(height, directionMaxPercent)},
+	})
+	v.ResizeItem(v.subjectInfo, sizes[0], 0)
+	v.ResizeItem(v.directions, sizes[1], 0)
+	v.ResizeItem(v.details, 0, 1)
+	v.applyDetailLayout(applicability, height-sizes[0]-sizes[1], text)
+}
+
+// detailTextRequest sizes the rule detail text from its content. Panes that
+// render a single widget report no request: they already fill the pane.
+func (v *NetworkPolicyGraph) detailTextRequest(width, height int) sectionRequest {
+	detail, ok := v.detailItem.(*ui.RuleDetails)
+	if !ok {
+		return sectionRequest{}
+	}
+	return sectionRequest{
+		desired: detail.TextHeight(width),
+		min:     minSectionHeight,
+		max:     percentOf(height, detailTextMaxPercent),
+	}
+}
+
+// applyDetailLayout splits the details pane between the rule text and the
+// applicability table, which keeps everything the text does not need.
+func (v *NetworkPolicyGraph) applyDetailLayout(applicability, available int, text sectionRequest) {
+	detail, ok := v.detailItem.(*ui.RuleDetails)
+	if !ok || available <= 0 {
+		return
+	}
+	sizes := solveSectionHeights(available, applicability, []sectionRequest{text})
+	detail.ResizeItem(detail.Text, sizes[0], 0)
+	detail.ResizeItem(detail.Applicability, 0, 1)
+}
+
+// directionsContentHeight returns the tallest content among the visible
+// direction panels, which is what the row of panels needs to render fully.
+func (v *NetworkPolicyGraph) directionsContentHeight() int {
+	height := 0
+	if v.placeholder == nil {
+		for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+			if v.state[direction].visible {
+				height = max(height, v.panels[direction].ContentHeight())
+			}
+		}
+	}
+	return max(height, minSectionHeight)
 }
 
 // Init initializes the component.
@@ -421,6 +589,7 @@ func (v *NetworkPolicyGraph) applyError(err error) {
 	v.updateSubject()
 	if !v.haveResult {
 		v.showMessage("NetworkPolicy evaluation failed:\n" + err.Error())
+		v.syncActions()
 	} else {
 		v.updateDetails(v.focus)
 	}
@@ -602,6 +771,7 @@ func (v *NetworkPolicyGraph) applyFocusTarget(target reachabilityFocus) {
 		if v.app != nil {
 			v.app.SetFocus(v.subjectInfo)
 		}
+		v.syncActions()
 		return
 	case focusIngress:
 		v.focus = netpol.Ingress
@@ -619,6 +789,7 @@ func (v *NetworkPolicyGraph) applyFocusTarget(target reachabilityFocus) {
 				v.app.SetFocus(v.detailItem)
 			}
 		}
+		v.syncActions()
 		return
 	case focusApplicability:
 		if _, ok := v.detailItem.(*ui.RuleDetails); !ok {
@@ -630,6 +801,7 @@ func (v *NetworkPolicyGraph) applyFocusTarget(target reachabilityFocus) {
 		if v.app != nil {
 			v.app.SetFocus(v.detailItem.(*ui.RuleDetails).Applicability)
 		}
+		v.syncActions()
 		return
 	}
 	if v.app != nil {
@@ -736,6 +908,10 @@ func (v *NetworkPolicyGraph) scheduleWorkloads() {
 			}
 			v.workloads, v.workloadNotes, v.workloadsLoading = workloads, notes, false
 			v.updateSubject()
+			// The rows landing auto-selects one, which is what decides whether
+			// the Subject panel has any YAML to show. Without this the key
+			// stays retracted until an unrelated event happens to resync it.
+			v.syncActions()
 		})
 	}()
 }
@@ -1010,6 +1186,11 @@ func onOff(value bool) string {
 }
 
 func (v *NetworkPolicyGraph) updateDetails(direction netpol.Direction) {
+	v.renderDetails(direction)
+	v.syncActions()
+}
+
+func (v *NetworkPolicyGraph) renderDetails(direction netpol.Direction) {
 	// The detail pane is rebuilt from scratch on every refresh, so remember
 	// where the cursor was before dropping the old primitives.
 	previous := v.captureDetailState()
@@ -1037,6 +1218,9 @@ func (v *NetworkPolicyGraph) updateDetails(direction netpol.Direction) {
 		rows := v.ruleApplicability(direction, rule.ID)
 		ruleDetail := ui.NewRuleDetailsWithStyle(rule, rows, v.reachabilityStyle())
 		v.applyDetailFocusStyle(ruleDetail)
+		// Moving through the applicability rows changes what YAML is
+		// reachable, so the key hints have to follow the cursor.
+		ruleDetail.SetApplicabilityChangedFunc(func(string) { v.syncActions() })
 		var text strings.Builder
 		text.WriteString(v.detailPrefix(direction))
 		text.WriteString("\n")
@@ -1069,6 +1253,7 @@ func (v *NetworkPolicyGraph) showEffectiveDetails(direction netpol.Direction, pr
 	rows := v.directionApplicability(direction)
 	detail := ui.NewEffectiveDetailsWithStyle(v.effectiveDetailsText(direction, rows), rows, v.reachabilityStyle())
 	v.applyDetailFocusStyle(detail)
+	detail.SetApplicabilityChangedFunc(func(string) { v.syncActions() })
 	v.details.AddItem(detail, 0, 1, false)
 	v.detailItem = detail
 	v.detailShown = detailScrollState{direction: direction, effective: true}
@@ -1519,37 +1704,180 @@ func (v *NetworkPolicyGraph) applySearch(filter string) {
 	v.focusActiveDirection()
 }
 
+// openRuleTarget resolves the NetworkPolicy backing the focused direction
+// panel's selection. Only a real rule qualifies: the view is in Rules mode, a
+// direction panel holds focus, and the highlighted row is not one of the
+// synthetic default-deny/unrestricted rows, which describe evaluated behaviour
+// rather than a policy that could be opened.
+func (v *NetworkPolicyGraph) openRuleTarget() (namespace, name string, found bool) {
+	if v.mode != ui.RulesProjection {
+		return "", "", false
+	}
+	if v.focusTarget != focusIngress && v.focusTarget != focusEgress {
+		return "", "", false
+	}
+	return v.selectedRulePolicy(v.focus)
+}
+
+// selectedRulePolicy returns the policy behind the direction's selected rule.
+func (v *NetworkPolicyGraph) selectedRulePolicy(direction netpol.Direction) (namespace, name string, found bool) {
+	if !v.state[direction].visible {
+		return "", "", false
+	}
+	id := v.panels[direction].SelectedID()
+	if id == "" {
+		return "", "", false
+	}
+	rule, ok := v.selectedRule(direction, id)
+	if !ok || rule.Synthetic || rule.ID.PolicyName == "" {
+		return "", "", false
+	}
+	return rule.ID.PolicyNamespace, rule.ID.PolicyName, true
+}
+
+// openRuleCmd navigates to the NetworkPolicy backing the selected rule and
+// pushes it onto the view stack so Esc returns to the reachability view.
+func (v *NetworkPolicyGraph) openRuleCmd(evt *tcell.EventKey) *tcell.EventKey {
+	if v.app == nil {
+		return evt
+	}
+	namespace, name, ok := v.openRuleTarget()
+	if !ok {
+		v.app.Flash().Info("Select a NetworkPolicy rule to open it")
+		return nil
+	}
+	v.app.gotoResource("networkpolicies", objectKey(namespace, name), false, true)
+	return nil
+}
+
 func (v *NetworkPolicyGraph) yamlCmd(_ *tcell.EventKey) *tcell.EventKey {
-	namespace, name, ok := v.selectedPolicy()
+	gvr, path, ok := v.yamlTarget()
 	if !ok {
 		if v.app != nil {
-			v.app.Flash().Errf("selected item does not reference a NetworkPolicy")
+			v.app.Flash().Errf("the current selection has no YAML to show")
 		}
 		return nil
 	}
-	path := name
-	if namespace != "" {
-		path = namespace + "/" + name
+	if v.app == nil {
+		return nil
 	}
-	live := NewLiveView(v.app, yamlAction, model.NewYAML(client.NpGVR, path))
+	live := NewLiveView(v.app, yamlAction, model.NewYAML(gvr, path))
 	if err := v.app.inject(live, false); err != nil {
 		v.app.Flash().Err(err)
 	}
 	return nil
 }
 
-func (v *NetworkPolicyGraph) selectedPolicy() (namespace, name string, found bool) {
-	id := v.panels[v.focus].SelectedID()
+// yamlTarget resolves whatever the focused section has selected to the resource
+// whose YAML should be shown. Selections with no backing manifest -- CIDR
+// primitives, synthetic rules, an empty selection -- report no target so the
+// key stays hidden.
+func (v *NetworkPolicyGraph) yamlTarget() (gvr *client.GVR, path string, found bool) {
+	switch v.focusTarget {
+	case focusSubject:
+		return v.workloadYAMLTarget()
+	case focusApplicability:
+		return v.applicabilityYAMLTarget()
+	case focusIngress, focusEgress, focusDetails:
+		// The detail pane always mirrors the focused direction's selection.
+		return v.directionYAMLTarget(v.focus)
+	default:
+		return nil, "", false
+	}
+}
+
+func (v *NetworkPolicyGraph) workloadYAMLTarget() (*client.GVR, string, bool) {
+	id := v.subjectInfo.SelectedID()
+	if id == "" {
+		return nil, "", false
+	}
+	index := slices.IndexFunc(v.workloads, func(item ui.SubjectWorkload) bool { return item.ID() == id })
+	if index < 0 {
+		return nil, "", false
+	}
+	workload := v.workloads[index]
+	gvr, ok := workloadGVR(workload.Kind)
+	if !ok {
+		return nil, "", false
+	}
+	return gvr, objectKey(workload.Namespace, workload.Name), true
+}
+
+func (v *NetworkPolicyGraph) directionYAMLTarget(direction netpol.Direction) (*client.GVR, string, bool) {
+	if !v.state[direction].visible {
+		return nil, "", false
+	}
+	id := v.panels[direction].SelectedID()
+	if id == "" {
+		return nil, "", false
+	}
 	if v.mode == ui.RulesProjection {
-		rule, ok := v.selectedRule(v.focus, id)
-		return rule.ID.PolicyNamespace, rule.ID.PolicyName, ok && rule.ID.PolicyName != ""
+		namespace, name, ok := v.selectedRulePolicy(direction)
+		if !ok {
+			return nil, "", false
+		}
+		return client.NpGVR, objectKey(namespace, name), true
+	}
+	primitive, ok := v.selectedPrimitive(direction, id)
+	if !ok {
+		return nil, "", false
+	}
+	return primitiveGVR(&primitive.Ref)
+}
+
+func (v *NetworkPolicyGraph) applicabilityYAMLTarget() (*client.GVR, string, bool) {
+	detail, ok := v.detailItem.(*ui.RuleDetails)
+	if !ok {
+		return nil, "", false
+	}
+	id := detail.SelectedApplicabilityID()
+	if id == "" {
+		return nil, "", false
 	}
 	primitive, ok := v.selectedPrimitive(v.focus, id)
-	if !ok || len(primitive.Evidence) == 0 {
-		return "", "", false
+	if !ok {
+		return nil, "", false
 	}
-	idRef := primitive.Evidence[0].RuleID
-	return idRef.PolicyNamespace, idRef.PolicyName, idRef.PolicyName != ""
+	return primitiveGVR(&primitive.Ref)
+}
+
+// workloadGVR maps a subject workload kind to its GVR. The kinds are the ones
+// produced by the workload collector.
+func workloadGVR(kind string) (*client.GVR, bool) {
+	switch kind {
+	case "Pod":
+		return client.PodGVR, true
+	case "Deployment":
+		return client.DpGVR, true
+	case "ReplicaSet":
+		return client.RsGVR, true
+	case "StatefulSet":
+		return client.StsGVR, true
+	case "DaemonSet":
+		return client.DsGVR, true
+	case "Job":
+		return client.JobGVR, true
+	default:
+		return nil, false
+	}
+}
+
+// primitiveGVR maps a primitive to the resource whose YAML describes it. CIDR
+// primitives are not Kubernetes resources and report no target.
+func primitiveGVR(ref *netpol.PrimitiveRef) (*client.GVR, string, bool) {
+	command, path := primitiveCommand(ref)
+	switch command {
+	case "pods":
+		return client.PodGVR, path, true
+	case "namespaces":
+		return client.NsGVR, path, true
+	case "deployments":
+		return client.DpGVR, path, true
+	case "jobs":
+		return client.JobGVR, path, true
+	default:
+		return nil, "", false
+	}
 }
 
 // escapeCmd clears the focused panel selection so the details pane shows the
@@ -1582,8 +1910,8 @@ func (v *NetworkPolicyGraph) focusDirectionCmd(direction netpol.Direction) func(
 }
 
 // enterCmd walks focus into the detail pane so applicability rows can be
-// scrolled, then opens the highlighted resource on a second press. Open
-// Resource remains directly available from anywhere on "o".
+// scrolled, then opens the highlighted resource on a second press. Open Rule
+// remains directly available from a direction panel on "o".
 func (v *NetworkPolicyGraph) enterCmd(evt *tcell.EventKey) *tcell.EventKey {
 	switch v.focusTarget {
 	case focusIngress, focusEgress:
@@ -1591,10 +1919,39 @@ func (v *NetworkPolicyGraph) enterCmd(evt *tcell.EventKey) *tcell.EventKey {
 	case focusApplicability:
 		return v.openApplicabilityCmd(evt)
 	case focusDetails:
-		return v.openResourceCmd(evt)
+		// Primitives render a plain detail pane with no applicability table, so
+		// this is the only route to the resource behind the selection. "o" is
+		// deliberately not offered here: it only ever opens a NetworkPolicy.
+		return v.openPrimitiveCmd(evt)
 	default:
 		return evt
 	}
+}
+
+// openPrimitiveCmd navigates to the resource backing the selected primitive.
+func (v *NetworkPolicyGraph) openPrimitiveCmd(evt *tcell.EventKey) *tcell.EventKey {
+	if v.app == nil {
+		return evt
+	}
+	if v.mode != ui.PrimitivesProjection {
+		return evt
+	}
+	id := v.panels[v.focus].SelectedID()
+	if !v.state[v.focus].visible || id == "" {
+		return evt
+	}
+	primitive, ok := v.selectedPrimitive(v.focus, id)
+	if !ok {
+		v.app.Flash().Info("Selected primitive is no longer available")
+		return nil
+	}
+	command, path := primitiveCommand(&primitive.Ref)
+	if command == "" {
+		v.app.Flash().Errf("CIDR primitives are not Kubernetes resources")
+		return nil
+	}
+	v.app.gotoResource(command, path, false, true)
+	return nil
 }
 
 // focusDetailPane moves focus onto the applicability table when one is
@@ -1668,41 +2025,6 @@ func (v *NetworkPolicyGraph) openApplicabilityCmd(evt *tcell.EventKey) *tcell.Ev
 	return nil
 }
 
-// openResourceCmd navigates to the Kubernetes resource backing the selection
-// and pushes it onto the view stack so Esc returns to the reachability view.
-func (v *NetworkPolicyGraph) openResourceCmd(evt *tcell.EventKey) *tcell.EventKey {
-	if v.app == nil {
-		return evt
-	}
-	if !v.state[v.focus].visible || v.panels[v.focus].SelectedID() == "" {
-		v.app.Flash().Info("Select a rule or primitive to open its resource")
-		return nil
-	}
-	if v.mode == ui.RulesProjection {
-		namespace, name, ok := v.selectedPolicy()
-		if !ok {
-			// Synthetic default-deny/unrestricted rows explain evaluated
-			// behaviour; they have no backing NetworkPolicy to open.
-			v.app.Flash().Info("Selected rule does not reference a NetworkPolicy")
-			return nil
-		}
-		v.app.gotoResource("networkpolicies", namespace+"/"+name, false, true)
-		return nil
-	}
-	primitive, ok := v.selectedPrimitive(v.focus, v.panels[v.focus].SelectedID())
-	if !ok {
-		v.app.Flash().Info("Selected primitive is no longer available")
-		return nil
-	}
-	command, path := primitiveCommand(&primitive.Ref)
-	if command == "" {
-		v.app.Flash().Errf("CIDR primitives are not Kubernetes resources")
-		return nil
-	}
-	v.app.gotoResource(command, path, false, true)
-	return nil
-}
-
 func primitiveCommand(ref *netpol.PrimitiveRef) (command, resourcePath string) {
 	path := ref.Name
 	if ref.Namespace != "" {
@@ -1728,12 +2050,10 @@ func (v *NetworkPolicyGraph) bindKeys() {
 		ui.KeyE:          ui.NewKeyAction("Toggle Egress", func(*tcell.EventKey) *tcell.EventKey { v.toggleDirection(netpol.Egress); return nil }, true),
 		ui.KeyM:          ui.NewKeyAction("Toggle Mode", func(*tcell.EventKey) *tcell.EventKey { v.switchMode(); return nil }, true),
 		ui.KeyF:          ui.NewKeyAction("Primitive Kinds", func(*tcell.EventKey) *tcell.EventKey { v.openKindsDialog(); return nil }, true),
-		ui.KeyO:          ui.NewKeyAction("Open Resource", v.openResourceCmd, true),
 		ui.KeyS:          ui.NewKeyAction("Subject", func(*tcell.EventKey) *tcell.EventKey { v.openSubjectDialog(); return nil }, true),
 		ui.KeySlash:      ui.NewKeyAction("Search", func(*tcell.EventKey) *tcell.EventKey { v.openSearchDialog(); return nil }, true),
 		ui.KeyR:          ui.NewKeyAction("Toggle Auto-Refresh", func(*tcell.EventKey) *tcell.EventKey { v.toggleAutoRefresh(); return nil }, true),
 		tcell.KeyCtrlR:   ui.NewKeyAction("Refresh", func(*tcell.EventKey) *tcell.EventKey { v.Refresh(); return nil }, true),
-		ui.KeyY:          ui.NewKeyAction("YAML", v.yamlCmd, true),
 		tcell.KeyEnter:   ui.NewKeyAction("Focus Details/Open", v.enterCmd, false),
 		tcell.KeyEscape:  ui.NewKeyAction("Clear Selection/Back", v.escapeCmd, false),
 		tcell.KeyLeft:    ui.NewKeyAction("Focus Ingress", v.focusDirectionCmd(netpol.Ingress), false),
@@ -1741,6 +2061,29 @@ func (v *NetworkPolicyGraph) bindKeys() {
 		tcell.KeyTAB:     ui.NewKeyAction("Next Panel", func(*tcell.EventKey) *tcell.EventKey { v.cycleFocus(false); return nil }, false),
 		tcell.KeyBacktab: ui.NewKeyAction("Previous Panel", func(*tcell.EventKey) *tcell.EventKey { v.cycleFocus(true); return nil }, false),
 	})
+	v.syncActions()
+}
+
+// syncActions binds the selection sensitive keys only while they have something
+// to act on, so the menu never advertises an action that would just flash an
+// error. It must run after anything that changes focus, mode, or a selection.
+func (v *NetworkPolicyGraph) syncActions() {
+	if _, _, ok := v.openRuleTarget(); ok {
+		v.actions.Add(ui.KeyO, ui.NewKeyAction(openRuleHint, v.openRuleCmd, true))
+	} else {
+		v.actions.Delete(ui.KeyO)
+	}
+	if _, _, ok := v.yamlTarget(); ok {
+		v.actions.Add(ui.KeyY, ui.NewKeyAction("YAML", v.yamlCmd, true))
+	} else {
+		v.actions.Delete(ui.KeyY)
+	}
+	// Only the visible component owns the menu. Repainting it from a background
+	// evaluation that landed after the user navigated away would clobber the
+	// hints of whatever view is now on top.
+	if v.app != nil && v.listening {
+		v.app.Menu().HydrateMenu(v.Hints())
+	}
 }
 
 func (v *NetworkPolicyGraph) keyboard(evt *tcell.EventKey) *tcell.EventKey {
@@ -1791,7 +2134,10 @@ func (v *NetworkPolicyGraph) applyDetailFocusStyle(detail *ui.RuleDetails) {
 func (v *NetworkPolicyGraph) StylesChanged(styles *config.Styles) {
 	reachability := styles.Reachability()
 	for _, panel := range v.panels {
-		panel.SetReachabilityStyle(reachability)
+		// SetStyles rather than SetReachabilityStyle: it also refreshes the
+		// cursor colors and the neutral color used for synthetic rows, neither
+		// of which is carried by config.Reachability.
+		panel.SetStyles(styles)
 		panel.SetBorderFocusColor(reachability.FocusColor.Color())
 	}
 	v.SetBackgroundColor(styles.BgColor())

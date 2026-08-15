@@ -171,7 +171,7 @@ spawn {*}$docker_args
 stty rows 50 columns 200 < $spawn_out(slave,name)
 
 start_case "launch-npg-view"
-if {[assert_all_screen {Subject {Deployment netpol-demo-app/api} {3 pods} {Ingress on} {Egress on} {Kinds: CIDR,Pod,Namespace,Deployment,Job} {Auto-refresh off} {Ingress · Rules} {Egress · Rules} {Rule Details} Applicability {<o>} {Open Resource} {<ctrl-r>} {Refresh} {</>} Search {<npg>}} 45]} {
+if {[assert_all_screen {Subject {Deployment netpol-demo-app/api} {3 pods} {Ingress on} {Egress on} {Kinds: CIDR,Pod,Namespace,Deployment,Job} {Auto-refresh off} {Ingress · Rules} {Egress · Rules} {Rule Details} Applicability {<ctrl-r>} {Refresh} {</>} Search {<npg>}} 45]} {
 pass_case
 }
 
@@ -305,30 +305,64 @@ if {[assert_screen {Pods|pods|Namespaces|namespaces|Deployments|deployments|Jobs
   finish_case
 }
 
-start_case "open-resource-o-both-projections"
+start_case "open-rule-only-for-real-rules"
+ensure_rules
+# The first row is the synthetic default-deny, which is not a real rule and so
+# offers nothing to open.
+if {[screen_matches {<o>} 5]} {
+  fail_case "Open Rule is advertised for the synthetic default-deny row"
+} else {
+  send_key "\033\[B"
+  assert_all_screen {{<o>} {Open Rule}} 20
+  send_key "o"
+  assert_screen {NetworkPolicies|NetworkPolicy|policy} 20
+  send_key "\033"
+  assert_reachability_view 20
+  pass_case
+}
+
+start_case "open-rule-hidden-in-primitives"
 ensure_rules
 send_key "\033\[B"
-send_key "o"
-assert_screen {NetworkPolicies|NetworkPolicy|policy} 20
-send_key "\033"
-assert_reachability_view 20
+assert_screen {<o>} 20
 send_key "m"
 assert_screen {Ingress · Primitives} 15
-send_key "o"
-if {[assert_screen {Pods|Namespaces|Deployments|Jobs|CIDR primitives are not Kubernetes resources} 20]} {
-  # If a real resource opened, Esc returns. If a CIDR flash happened, Esc would
-  # clear the primitive selection, so only send it when a breadcrumb changed.
-  send_key "\033"
+if {[screen_matches {Open Rule} 5]} {
+  fail_case "Open Rule must not be offered in Primitives mode"
+} else {
   send_key "m"
   finish_case
 }
 
 start_case "yaml-view"
 ensure_rules
+# Move off the synthetic default-deny row: only a real rule has a manifest.
+send_key "\033\[B"
 send_key "y"
 if {[assert_screen {apiVersion|networking\.k8s\.io|YAML} 20]} {
   send_key "\033"
   finish_case
+}
+
+start_case "yaml-hidden-without-a-manifest"
+ensure_rules
+# The synthetic default-deny row references no NetworkPolicy.
+if {[screen_matches {<y>} 5]} {
+  fail_case "YAML is advertised for the synthetic default-deny row"
+} else {
+  send_key "\033\[B"
+  assert_screen {<y>} 20
+  # Walk into the applicability table and land on the CIDR row, which is not a
+  # Kubernetes resource and therefore has no manifest either.
+  send_key "\r"
+  assert_screen {CIDR 192\.168\.0\.0/16} 15
+  if {[screen_matches {<y>} 5]} {
+    fail_case "YAML is advertised for a CIDR applicability row"
+  } else {
+    send_key "\033\[B"
+    assert_screen {<y>} 20
+    pass_case
+  }
 }
 
 start_case "refresh-controls"

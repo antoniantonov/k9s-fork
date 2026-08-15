@@ -350,11 +350,22 @@ func TestRuleStateLabels(t *testing.T) {
 	assert.Equal(t, "Allowed", label)
 	_, label = ruleState(&rules[1])
 	assert.Equal(t, "[PARTIAL 1/2]", label)
-	_, label = ruleState(&rules[2])
-	assert.Equal(t, "[EMPTY]", label)
+	state, label = ruleState(&rules[2])
+	assert.Equal(t, netpol.AccessAllowed, state)
+	assert.Equal(t, "Allowed", label)
 	rules[0].Warnings = []string{"incomplete"}
 	_, label = ruleState(&rules[0])
 	assert.Equal(t, "Partial Data", label)
+
+	// A rule with no matching subjects is [EMPTY] regardless of projection
+	// filtering, whether that is because no subject pod is selected or
+	// because none of the selected pods matched a peer.
+	empty := netpol.RuleResult{SubjectPodCount: 2, SubjectMatchCount: 0}
+	_, label = ruleState(&empty)
+	assert.Equal(t, "[EMPTY]", label)
+	noPods := netpol.RuleResult{SubjectPodCount: 0, SubjectMatchCount: 0}
+	_, label = ruleState(&noPods)
+	assert.Equal(t, "[EMPTY]", label)
 }
 
 func TestPrimitiveAndRuleDetails(t *testing.T) {
@@ -450,11 +461,104 @@ func TestPartialAndEmptyLabelsAreSearchableAndRemainDisallowedColored(t *testing
 	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(0, 0).Color)
 	assert.True(t, panel.GetCell(0, 0).Transparent)
 
+	// A non-synthetic [EMPTY] rule is now hidden from the Rules projection
+	// entirely, so searching for its label no longer surfaces it.
 	panel.SetFilter("[EMPTY]")
-	require.Equal(t, 3, panel.GetRowCount())
-	assert.Equal(t, "[EMPTY]", panel.GetCell(0, 0).Text)
-	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(0, 0).Color)
+	assert.Zero(t, panel.GetRowCount())
+	assert.Empty(t, panel.blocks)
+}
+
+func TestDirectionPanelHidesNonApplicableNonSyntheticRule(t *testing.T) {
+	rules := []netpol.RuleResult{
+		{
+			ID:                netpol.RuleID{PolicyNamespace: "ns", PolicyName: "allow-web", Direction: netpol.Ingress, Index: 0},
+			SubjectPodCount:   2,
+			SubjectMatchCount: 2,
+		},
+		{
+			ID:                netpol.RuleID{PolicyNamespace: "ns", PolicyName: "no-match", Direction: netpol.Ingress, Index: 1},
+			SubjectPodCount:   2,
+			SubjectMatchCount: 0,
+		},
+	}
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(rules)
+
+	require.Len(t, panel.blocks, 1, "a non-synthetic rule with no matching subjects must be filtered out")
+	assert.Equal(t, rules[0].StableID(), panel.blocks[0].id)
+	assert.False(t, panel.SelectID(rules[1].StableID()), "the hidden rule must not be reachable by ID")
+}
+
+func TestDirectionPanelKeepsSyntheticEmptyRuleVisible(t *testing.T) {
+	rules := []netpol.RuleResult{{
+		ID:                netpol.RuleID{Direction: netpol.Ingress, Index: -1, SyntheticKind: "default-deny"},
+		Synthetic:         true,
+		SubjectPodCount:   2,
+		SubjectMatchCount: 0,
+		PeerSummary:       "default-deny",
+	}}
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(rules)
+
+	require.Len(t, panel.blocks, 1, "a synthetic rule must stay visible even when it has no matching subjects")
+	assert.True(t, panel.blocks[0].synthetic)
+	assert.Equal(t, "[EMPTY]", panel.blocks[0].label)
+	assert.Equal(t, "[EMPTY]", panel.GetCell(0, 0).Text, "synthetic rules still render their badge")
+}
+
+func TestDirectionPanelAllowedRuleBadgeIsBlankButStaysAllowedColoredAndSearchable(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(testRules()[:1])
+
+	require.Equal(t, "Allowed", panel.blocks[0].label, "the label is preserved for color and search")
+	assert.Empty(t, panel.GetCell(0, 0).Text, "the Allowed badge is redundant once only applicable rules are listed")
+	assert.Equal(t, reachabilityAllowedColor, panel.GetCell(0, 0).Color)
 	assert.True(t, panel.GetCell(0, 0).Transparent)
+
+	panel.SetFilter("allowed")
+	assert.Len(t, panel.blocks, 1, "the rule must remain searchable by its label even without a rendered badge")
+}
+
+func TestDirectionPanelPartialAndPartialDataBadgesStillRender(t *testing.T) {
+	rules := testRules()
+	rules[0].Warnings = []string{"incomplete"}
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(rules)
+
+	assert.Equal(t, "Partial Data", panel.GetCell(0, 0).Text)
+	assert.Equal(t, "[PARTIAL 1/2]", panel.GetCell(3, 0).Text)
+}
+
+func TestDirectionPanelSyntheticRuleUsesNeutralColorAndFollowsSetStyles(t *testing.T) {
+	rules := []netpol.RuleResult{{
+		ID:                netpol.RuleID{Direction: netpol.Ingress, Index: -1, SyntheticKind: "unrestricted"},
+		Synthetic:         true,
+		SubjectPodCount:   2,
+		SubjectMatchCount: 2,
+		PeerSummary:       "unrestricted",
+	}}
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(rules)
+
+	// Allowed + fully matched would normally color green, but synthetic rows
+	// always render neutral instead.
+	assert.Equal(t, tview.Styles.PrimaryTextColor, panel.GetCell(0, 0).Color)
+	assert.NotEqual(t, reachabilityAllowedColor, panel.GetCell(0, 0).Color)
+
+	styles := config.NewStyles()
+	styles.K9s.Body.FgColor = config.Color("fuchsia")
+	panel.SetStyles(styles)
+
+	assert.Equal(t, styles.FgColor(), panel.GetCell(0, 0).Color, "SetStyles must make synthetic rows follow the skin foreground color")
+
+	// SetReachabilityStyle alone (config.Reachability has no neutral field)
+	// must preserve the neutral color set above rather than resetting it.
+	panel.SetReachabilityStyle(config.Reachability{
+		AllowedColor:     config.Color("green"),
+		DisallowedColor:  config.Color("red"),
+		PartialDataColor: config.Color("orange"),
+	})
+	assert.Equal(t, styles.FgColor(), panel.GetCell(0, 0).Color, "SetReachabilityStyle must preserve the existing neutral color")
 }
 
 func TestDirectionPanelEmptyMessageIsNonSelectable(t *testing.T) {
@@ -514,6 +618,45 @@ func TestPrimitiveKindDialogOwnsStateAndCallbacks(t *testing.T) {
 	assert.True(t, empty.SelectedKinds().Has(netpol.PrimitiveJob))
 }
 
+func TestWrappedLineCount(t *testing.T) {
+	assert.Equal(t, 1, WrappedLineCount("", 10), "an empty string still occupies one line")
+	assert.Equal(t, 1, WrappedLineCount("hello", 10))
+	assert.Equal(t, 3, WrappedLineCount("line one\nline two\nline three", 80), "multi-line text that fits on each line")
+	assert.Equal(t, 6, WrappedLineCount("line one\nline two\nline three", 5), "each line wraps once at a narrow width")
+	assert.Equal(t, 2, WrappedLineCount("aaaa bbbb cccc dddd", 9), "a long line wraps across more than one row")
+	assert.Equal(t, 4, WrappedLineCount("multi\nline\n\nwith blank", 80), "a blank line still counts as one row")
+
+	// width <= 0 falls back to counting newline-separated lines without wrapping.
+	assert.Equal(t, 3, WrappedLineCount("a\nb\nc", 0))
+	assert.Equal(t, 3, WrappedLineCount("a\nb\nc", -3))
+	assert.Equal(t, 1, WrappedLineCount("", 0), "an empty string never returns less than one line")
+}
+
+func TestDirectionPanelContentHeight(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	assert.Equal(t, 3, panel.ContentHeight(), "border (2) plus one row reserved even with no blocks")
+
+	panel.SetRules(testRules()[:1])
+	assert.Equal(t, 5, panel.ContentHeight(), "border (2) plus 3 rows for a single block")
+
+	panel.SetRules(testRules())
+	assert.Equal(t, 11, panel.ContentHeight(), "border (2) plus 3 rows per block for every visible block")
+}
+
+func TestRuleDetailsTextHeight(t *testing.T) {
+	details := NewRuleDetails(testRules()[0], nil)
+	before := details.TextHeight(40)
+
+	// The view mutates its text after construction; TextHeight must reflect
+	// the live text rather than what NewRuleDetails originally rendered.
+	details.Text.SetText("line one\nline two\nline three")
+	assert.Equal(t, 5, details.TextHeight(40), "border (2) plus 3 wrapped lines at a width that needs no wrapping")
+	assert.NotEqual(t, before, details.TextHeight(40))
+
+	details.Text.SetText("aaaa bbbb cccc dddd")
+	assert.Equal(t, 4, details.TextHeight(11), "the inner width excludes the 2 border columns")
+}
+
 func testRules() []netpol.RuleResult {
 	return []netpol.RuleResult{
 		{
@@ -530,9 +673,10 @@ func testRules() []netpol.RuleResult {
 			PeerSummary:       "app=client",
 		},
 		{
-			ID:                netpol.RuleID{PolicyNamespace: "ns", PolicyName: "empty", Direction: netpol.Ingress, Index: 2},
+			ID:                netpol.RuleID{PolicyNamespace: "ns", PolicyName: "allow-rest", Direction: netpol.Ingress, Index: 2},
 			SubjectPodCount:   2,
-			SubjectMatchCount: 0,
+			SubjectMatchCount: 2,
+			PeerSummary:       "app=rest",
 		},
 	}
 }

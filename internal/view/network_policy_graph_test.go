@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/config"
 	"github.com/derailed/k9s/internal/model"
 	"github.com/derailed/k9s/internal/netpol"
@@ -388,14 +389,14 @@ func TestNetworkPolicyGraphSwitchModeIsGlobal(t *testing.T) {
 	assert.Equal(t, ui.RulesProjection, view.panels[netpol.Egress].Projection())
 }
 
-func TestNetworkPolicyGraphOpenResourceKeys(t *testing.T) {
+func TestNetworkPolicyGraphOpenRuleKeys(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
 	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
 
 	open, ok := view.actions.Get(ui.KeyO)
 	require.True(t, ok)
-	assert.Equal(t, "Open Resource", open.Description)
+	assert.Equal(t, "Open Rule", open.Description)
 	assert.True(t, open.Opts.Visible)
 	enterAction, ok := view.actions.Get(tcell.KeyEnter)
 	require.True(t, ok)
@@ -403,19 +404,25 @@ func TestNetworkPolicyGraphOpenResourceKeys(t *testing.T) {
 	assert.False(t, enterAction.Opts.Visible)
 
 	// Enter now walks focus into the detail pane; only "o" opens directly.
+	o := tcell.NewEventKey(tcell.KeyRune, 'o', tcell.ModNone)
+	assert.Equal(t, o, view.keyboard(o), "nil-app rule navigation falls through without panicking")
 	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
 	assert.Nil(t, view.keyboard(enter))
 	assert.Equal(t, focusApplicability, view.focusTarget)
-	o := tcell.NewEventKey(tcell.KeyRune, 'o', tcell.ModNone)
-	assert.Equal(t, o, view.keyboard(o), "nil-app rule navigation falls through without panicking")
+	_, ok = view.actions.Get(ui.KeyO)
+	assert.False(t, ok, "the direction panel no longer holds focus")
 
 	view.focusDirection(netpol.Ingress)
+	_, ok = view.actions.Get(ui.KeyO)
+	require.True(t, ok, "returning focus to the panel restores Open Rule")
+
 	view.switchMode()
 	require.Equal(t, ui.PrimitivesProjection, view.mode)
 	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
+	_, ok = view.actions.Get(ui.KeyO)
+	assert.False(t, ok, "Open Rule only ever opens a NetworkPolicy")
 	assert.Nil(t, view.keyboard(enter))
 	assert.Equal(t, focusDetails, view.focusTarget, "Primitives mode has no applicability table")
-	assert.Equal(t, o, view.keyboard(o), "nil-app primitive navigation falls through without panicking")
 }
 
 func TestNetworkPolicyGraphName(t *testing.T) {
@@ -664,34 +671,41 @@ func TestNetworkPolicyGraphClearedSelectionRecoversOnNavigation(t *testing.T) {
 	assert.True(t, panel.HasSelection())
 }
 
-// Open Resource resolves the NetworkPolicy in Rules mode and the primitive's
-// own resource in Primitives mode.
-func TestNetworkPolicyGraphOpenResourceTargets(t *testing.T) {
+// Open Rule resolves the NetworkPolicy behind the selected rule and is only
+// offered while a direction panel holds focus in Rules mode.
+func TestNetworkPolicyGraphOpenRuleTargets(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
 
-	namespace, name, ok := view.selectedPolicy()
+	namespace, name, ok := view.openRuleTarget()
 	require.True(t, ok)
 	assert.Equal(t, "payments", namespace)
 	assert.Equal(t, "allow-api", name)
 
 	view.switchMode()
 	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	_, _, ok = view.openRuleTarget()
+	assert.False(t, ok, "Primitives mode never opens a rule")
 	primitive, ok := view.selectedPrimitive(netpol.Ingress, view.panels[netpol.Ingress].SelectedID())
 	require.True(t, ok)
 	command, path := primitiveCommand(&primitive.Ref)
 	assert.Equal(t, "pods", command)
 	assert.Equal(t, "payments/peer", path)
 
-	// With nothing selected there is no resource to open.
+	// With nothing selected there is no rule to open.
+	view.switchMode()
+	require.Equal(t, ui.RulesProjection, view.mode)
 	view.panels[netpol.Ingress].ClearSelection()
-	_, _, ok = view.selectedPolicy()
+	view.syncActions()
+	_, _, ok = view.openRuleTarget()
+	assert.False(t, ok)
+	_, ok = view.actions.Get(ui.KeyO)
 	assert.False(t, ok)
 }
 
 // Synthetic default-deny/unrestricted rows have no backing NetworkPolicy, so
-// Open Resource must say so rather than silently swallowing the key.
-func TestNetworkPolicyGraphOpenResourceReportsUnopenableSelection(t *testing.T) {
+// Open Rule must not be offered for them at all.
+func TestNetworkPolicyGraphOpenRuleSkipsSyntheticSelection(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.app = NewApp(config.NewConfig(nil))
 	result := testSubjectResult()
@@ -704,15 +718,17 @@ func TestNetworkPolicyGraphOpenResourceReportsUnopenableSelection(t *testing.T) 
 	view.applyResult(result)
 	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
 
-	namespace, name, ok := view.selectedPolicy()
+	namespace, name, ok := view.openRuleTarget()
 	require.False(t, ok, "a synthetic rule references no NetworkPolicy")
 	require.Empty(t, namespace)
 	require.Empty(t, name)
+	_, ok = view.actions.Get(ui.KeyO)
+	assert.False(t, ok, "the key hint must be hidden, not just inert")
 
 	evt := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
-	assert.Nil(t, view.openResourceCmd(evt), "the key must be consumed, not silently ignored")
+	assert.Nil(t, view.openRuleCmd(evt), "an explicit call is consumed, not silently ignored")
 	message := <-view.app.Flash().Channel()
-	assert.Contains(t, message.Text, "does not reference a NetworkPolicy")
+	assert.Contains(t, message.Text, "Select a NetworkPolicy rule")
 }
 
 func TestNetworkPolicyGraphSubjectInfoReportsState(t *testing.T) {
@@ -1332,4 +1348,432 @@ func TestNetworkPolicyGraphHiddenDirectionsKeepFocusAttached(t *testing.T) {
 	view.toggleDirection(netpol.Ingress)
 	require.Nil(t, view.placeholder)
 	assert.Equal(t, tview.Primitive(view.panels[netpol.Ingress]), view.app.GetFocus())
+}
+
+func TestSolveSectionHeights(t *testing.T) {
+	uu := map[string]struct {
+		total     int
+		remainder int
+		requests  []sectionRequest
+		e         []int
+	}{
+		"content fits": {
+			total: 60, remainder: 8,
+			requests: []sectionRequest{
+				{desired: 5, min: 3, max: 15},
+				{desired: 12, min: 3, max: 24},
+			},
+			e: []int{5, 12},
+		},
+		"capped at the maximum share": {
+			total: 60, remainder: 8,
+			requests: []sectionRequest{
+				{desired: 40, min: 3, max: 15},
+				{desired: 90, min: 3, max: 24},
+			},
+			e: []int{15, 24},
+		},
+		"never below the minimum": {
+			total: 60, remainder: 8,
+			requests: []sectionRequest{
+				{desired: 0, min: 3, max: 15},
+				{desired: 1, min: 3, max: 24},
+			},
+			e: []int{3, 3},
+		},
+		"remainder wins over content": {
+			total: 30, remainder: 8,
+			requests: []sectionRequest{
+				{desired: 12, min: 3, max: 30},
+				{desired: 18, min: 3, max: 30},
+			},
+			// 30 - 8 = 22 for both sections: the lower one gives up first.
+			e: []int{12, 10},
+		},
+		"lower section shrinks to its minimum before the upper one": {
+			total: 20, remainder: 8,
+			requests: []sectionRequest{
+				{desired: 12, min: 3, max: 20},
+				{desired: 12, min: 3, max: 20},
+			},
+			e: []int{9, 3},
+		},
+		"too small for the minimums drops the lower sections": {
+			total: 4, remainder: 8,
+			requests: []sectionRequest{
+				{desired: 5, min: 3, max: 20},
+				{desired: 5, min: 3, max: 20},
+			},
+			e: []int{3, 1},
+		},
+		"zero height yields zero sections": {
+			total: 0, remainder: 8,
+			requests: []sectionRequest{{desired: 5, min: 3, max: 20}},
+			e:        []int{0},
+		},
+		"single section leaves the remainder": {
+			total: 20, remainder: 5,
+			requests: []sectionRequest{{desired: 40, min: 3, max: 7}},
+			e:        []int{7},
+		},
+	}
+
+	for k, u := range uu {
+		t.Run(k, func(t *testing.T) {
+			assert.Equal(t, u.e, solveSectionHeights(u.total, u.remainder, u.requests))
+		})
+	}
+}
+
+// drawGraph paints the view onto a simulation screen so the flex assigns real
+// rects to every section.
+func drawGraph(t *testing.T, view *NetworkPolicyGraph, width, height int) {
+	t.Helper()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	require.NoError(t, screen.Init())
+	t.Cleanup(screen.Fini)
+	screen.SetSize(width, height)
+	view.SetRect(0, 0, width, height)
+	view.Draw(screen)
+}
+
+func sectionHeight(p tview.Primitive) int {
+	_, _, _, height := p.GetRect()
+	return height
+}
+
+// Sections are sized to their own content so the applicability table keeps
+// everything that is left over.
+func TestNetworkPolicyGraphLayoutIsContentDriven(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	drawGraph(t, view, 120, 60)
+
+	subject := sectionHeight(view.subjectInfo)
+	directions := sectionHeight(view.directions)
+	details := sectionHeight(view.details)
+
+	assert.Equal(t, view.subjectInfo.ContentHeight(), subject, "one workload-less subject needs no more")
+	assert.Equal(t, view.directionsContentHeight(), directions, "a single rule needs no more")
+	assert.Equal(t, 60, subject+directions+details)
+	assert.Greater(t, details, subject+directions, "the leftover space goes to the details pane")
+
+	detail, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	text := sectionHeight(detail.Text)
+	applicability := sectionHeight(detail.Applicability)
+	assert.Equal(t, details, text+applicability)
+	assert.GreaterOrEqual(t, applicability, minApplicabilityHeight)
+	assert.LessOrEqual(t, text, percentOf(60, detailTextMaxPercent), "the detail text is capped")
+}
+
+// A subject or direction with far more content than fits is clamped so the
+// applicability table is never squeezed off the screen.
+func TestNetworkPolicyGraphLayoutCapsOversizedSections(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := multiRuleSubjectResult()
+	for index := range 40 {
+		result.Ingress.Rules = append(result.Ingress.Rules, netpol.RuleResult{
+			ID: netpol.RuleID{
+				PolicyNamespace: "payments", PolicyName: "bulk-" + strconv.Itoa(index),
+				Direction: netpol.Ingress, Index: index,
+			},
+			SubjectPodCount: 1, SubjectMatchCount: 1, PeerSummary: "peer",
+		})
+	}
+	view.applyResult(result)
+	workloads := make([]ui.SubjectWorkload, 0, 40)
+	for index := range 40 {
+		workloads = append(workloads, ui.SubjectWorkload{
+			Kind: "Pod", Namespace: "payments", Name: "api-" + strconv.Itoa(index), Status: "Running",
+		})
+	}
+	view.workloads = workloads
+	view.updateSubject()
+	drawGraph(t, view, 120, 60)
+
+	assert.LessOrEqual(t, sectionHeight(view.subjectInfo), percentOf(60, subjectMaxPercent))
+	assert.LessOrEqual(t, sectionHeight(view.directions), percentOf(60, directionMaxPercent))
+	assert.GreaterOrEqual(t, sectionHeight(view.details), minDetailsHeight)
+
+	detail, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	assert.LessOrEqual(t, sectionHeight(detail.Text), percentOf(60, detailTextMaxPercent))
+	// Content that wants the whole screen must not starve the applicability
+	// table: it keeps its reserved share no matter how much the rest asks for.
+	assert.GreaterOrEqual(t, sectionHeight(detail.Applicability), percentOf(60, applicabilityPercent))
+}
+
+// A terminal too small for every minimum must still paint without panicking.
+func TestNetworkPolicyGraphLayoutSurvivesTinyTerminals(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	for _, size := range [][2]int{{0, 0}, {10, 1}, {20, 6}, {40, 12}} {
+		drawGraph(t, view, size[0], size[1])
+		total := sectionHeight(view.subjectInfo) + sectionHeight(view.directions) + sectionHeight(view.details)
+		assert.LessOrEqual(t, total, max(0, size[1]), "sections never overflow the viewport")
+	}
+}
+
+// YAML follows whatever the focused section has selected.
+func TestNetworkPolicyGraphYAMLTargetFollowsFocus(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(multiPrimitiveSubjectResult())
+	view.workloads = []ui.SubjectWorkload{
+		{Kind: "Deployment", Namespace: "payments", Name: "api", Status: "1/1"},
+	}
+	view.updateSubject()
+
+	view.focusDirection(netpol.Ingress)
+	gvr, path, ok := view.yamlTarget()
+	require.True(t, ok, "a rule resolves to its NetworkPolicy")
+	assert.Equal(t, client.NpGVR, gvr)
+	assert.Equal(t, "payments/allow-api", path)
+
+	view.applyFocusTarget(focusSubject)
+	gvr, path, ok = view.yamlTarget()
+	require.True(t, ok, "a subject workload resolves to its own manifest")
+	assert.Equal(t, client.DpGVR, gvr)
+	assert.Equal(t, "payments/api", path)
+
+	view.focusDirection(netpol.Ingress)
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	selected, ok := view.selectedPrimitive(netpol.Ingress, view.panels[netpol.Ingress].SelectedID())
+	require.True(t, ok)
+	eGVR, ePath, ok := primitiveGVR(&selected.Ref)
+	require.True(t, ok)
+	gvr, path, ok = view.yamlTarget()
+	require.True(t, ok, "a primitive resolves to its own resource")
+	assert.Equal(t, eGVR, gvr)
+	assert.Equal(t, ePath, path)
+}
+
+// Selections with no manifest hide the key rather than flashing an error.
+func TestNetworkPolicyGraphYAMLHiddenWithoutAManifest(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := testSubjectResult()
+	result.Ingress.Rules = []netpol.RuleResult{{
+		ID:        netpol.RuleID{Direction: netpol.Ingress, SyntheticKind: "default-deny"},
+		Synthetic: true, SubjectPodCount: 1, SubjectMatchCount: 1, PeerSummary: "none",
+	}}
+	view.applyResult(result)
+
+	_, _, ok := view.yamlTarget()
+	assert.False(t, ok, "a synthetic rule has no manifest")
+	_, ok = view.actions.Get(ui.KeyY)
+	assert.False(t, ok)
+
+	// An empty selection has nothing to show either.
+	view.applyResult(testSubjectResult())
+	view.panels[netpol.Ingress].ClearSelection()
+	view.syncActions()
+	_, _, ok = view.yamlTarget()
+	assert.False(t, ok)
+	_, ok = view.actions.Get(ui.KeyY)
+	assert.False(t, ok)
+}
+
+// CIDR applicability rows are not Kubernetes resources, so moving onto one
+// retracts the YAML key.
+func TestNetworkPolicyGraphYAMLTracksApplicabilityCursor(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := multiPrimitiveSubjectResult()
+	id := result.Ingress.Rules[0].ID
+	result.Ingress.Primitives[netpol.PrimitiveCIDR] = []netpol.PrimitiveResult{{
+		Ref:          netpol.PrimitiveRef{Kind: netpol.PrimitiveCIDR, CIDR: "10.0.0.0/8"},
+		State:        netpol.AccessAllowed,
+		AllowedPairs: 1,
+		TotalPairs:   1,
+		Evidence:     []netpol.PolicyEvidence{{RuleID: id, Summary: "cidr evidence"}},
+		PairDecisions: []netpol.PairDecision{{
+			Source:      netpol.PodRef{Namespace: "payments", Name: "api"},
+			Destination: netpol.PodRef{Name: "10.0.0.0/8"},
+			Decision: netpol.Decision{
+				State:    netpol.AccessAllowed,
+				Evidence: []netpol.PolicyEvidence{{RuleID: id, Summary: "Ingress evidence"}},
+			},
+		}},
+	}}
+	view.applyResult(result)
+	view.applyFocusTarget(focusApplicability)
+	detail, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+
+	cidrID := result.Ingress.Primitives[netpol.PrimitiveCIDR][0].StableID()
+	require.True(t, detail.SelectApplicabilityID(cidrID))
+	_, _, found := view.yamlTarget()
+	assert.False(t, found, "a CIDR row has no manifest")
+	_, found = view.actions.Get(ui.KeyY)
+	assert.False(t, found, "moving onto a CIDR row retracts the key")
+
+	podID := result.Ingress.Primitives[netpol.PrimitivePod][0].StableID()
+	require.True(t, detail.SelectApplicabilityID(podID))
+	gvr, path, found := view.yamlTarget()
+	require.True(t, found)
+	assert.Equal(t, client.PodGVR, gvr)
+	assert.Equal(t, "payments/peer", path)
+	_, found = view.actions.Get(ui.KeyY)
+	assert.True(t, found)
+}
+
+func TestWorkloadAndPrimitiveGVRs(t *testing.T) {
+	uu := map[string]*client.GVR{
+		"Pod":         client.PodGVR,
+		"Deployment":  client.DpGVR,
+		"ReplicaSet":  client.RsGVR,
+		"StatefulSet": client.StsGVR,
+		"DaemonSet":   client.DsGVR,
+		"Job":         client.JobGVR,
+	}
+	for kind, e := range uu {
+		gvr, ok := workloadGVR(kind)
+		require.True(t, ok, kind)
+		assert.Equal(t, e, gvr)
+	}
+	_, ok := workloadGVR("CronJob")
+	assert.False(t, ok, "the collector never emits unmapped kinds")
+
+	gvr, path, ok := primitiveGVR(&netpol.PrimitiveRef{
+		Kind: netpol.PrimitiveNamespace, Name: "payments",
+	})
+	require.True(t, ok)
+	assert.Equal(t, client.NsGVR, gvr)
+	assert.Equal(t, "payments", path)
+
+	_, _, ok = primitiveGVR(&netpol.PrimitiveRef{Kind: netpol.PrimitiveCIDR, CIDR: "10.0.0.0/8"})
+	assert.False(t, ok)
+}
+
+// The applicability table is what this view exists to show, so a long rule
+// detail text must not push it down to its bare minimum.
+func TestNetworkPolicyGraphApplicabilityKeepsItsShare(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(multiPrimitiveSubjectResult())
+	detail, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	detail.Text.SetText(strings.Repeat("a long rule detail line\n", 200))
+
+	for _, height := range []int{24, 40, 50, 60, 80} {
+		drawGraph(t, view, 120, height)
+		applicability := sectionHeight(detail.Applicability)
+		assert.GreaterOrEqual(t, applicability, percentOf(height, applicabilityPercent),
+			"height %d starves the applicability table", height)
+		assert.GreaterOrEqual(t, applicability, minApplicabilityHeight)
+	}
+}
+
+// Workloads arrive asynchronously. Focusing the Subject panel before they land
+// retracts the YAML key, so the publish has to put it back.
+func TestNetworkPolicyGraphWorkloadArrivalRestoresYAML(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.app = NewApp(config.NewConfig(nil))
+	view.collectWorkloads = func(netpol.SubjectRef, []netpol.PodRef) ([]ui.SubjectWorkload, []string) {
+		return nil, nil
+	}
+	view.applyResult(testSubjectResult())
+
+	// Focus the Subject panel while collection is still in flight.
+	view.workloads, view.workloadsLoading = nil, true
+	view.updateSubject()
+	view.applyFocusTarget(focusSubject)
+	_, ok := view.actions.Get(ui.KeyY)
+	require.False(t, ok, "there is nothing to show yet")
+
+	// Replay what the collection callback does when the rows land.
+	view.workloads, view.workloadNotes, view.workloadsLoading = []ui.SubjectWorkload{
+		{Kind: "Deployment", Namespace: "payments", Name: "api", Status: "1/1"},
+	}, nil, false
+	view.updateSubject()
+	view.syncActions()
+
+	gvr, path, found := view.yamlTarget()
+	require.True(t, found)
+	assert.Equal(t, client.DpGVR, gvr)
+	assert.Equal(t, "payments/api", path)
+	_, ok = view.actions.Get(ui.KeyY)
+	assert.True(t, ok, "the key must come back once the rows land")
+
+	// The reverse transition retracts it again.
+	view.workloads = nil
+	view.updateSubject()
+	view.syncActions()
+	_, ok = view.actions.Get(ui.KeyY)
+	assert.False(t, ok)
+}
+
+// A skin change has to reach the panels, or synthetic rows keep rendering in
+// the previous skin's foreground color.
+func TestNetworkPolicyGraphStylesChangedReachesPanels(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := testSubjectResult()
+	result.Ingress.Rules = []netpol.RuleResult{{
+		ID:        netpol.RuleID{Direction: netpol.Ingress, SyntheticKind: "default-deny"},
+		Synthetic: true, SubjectPodCount: 1, SubjectMatchCount: 1, PeerSummary: "none",
+	}}
+	view.applyResult(result)
+
+	styles := config.NewStyles()
+	styles.K9s.Body.FgColor = config.Color("hotpink")
+	view.StylesChanged(styles)
+
+	panel := view.panels[netpol.Ingress]
+	assert.Equal(t, styles.FgColor(), panel.GetCell(0, 1).Color,
+		"the synthetic row follows the skin foreground")
+}
+
+// Primitives render no applicability table, so Enter on the detail pane is the
+// only route to the resource behind the selection.
+func TestNetworkPolicyGraphEnterOpensSelectedPrimitive(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
+
+	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+	require.Nil(t, view.enterCmd(enter))
+	require.Equal(t, focusDetails, view.focusTarget, "primitives have no applicability table")
+
+	// A second Enter routes to the primitive rather than dead-ending. With no
+	// app wired it falls through instead of navigating.
+	assert.Equal(t, enter, view.enterCmd(enter))
+	primitive, ok := view.selectedPrimitive(netpol.Ingress, view.panels[netpol.Ingress].SelectedID())
+	require.True(t, ok)
+	command, path := primitiveCommand(&primitive.Ref)
+	assert.Equal(t, "pods", command)
+	assert.Equal(t, "payments/peer", path)
+
+	// Rules mode keeps Enter on the applicability table instead.
+	view.focusDirection(netpol.Ingress)
+	view.switchMode()
+	require.Equal(t, ui.RulesProjection, view.mode)
+	assert.Equal(t, enter, view.openPrimitiveCmd(enter), "Rules mode has no primitive to open")
+}
+
+// CIDR primitives are not Kubernetes resources, so Enter reports that rather
+// than silently swallowing the key.
+func TestNetworkPolicyGraphEnterReportsCIDRPrimitive(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.app = NewApp(config.NewConfig(nil))
+	result := testSubjectResult()
+	result.Ingress.Primitives = map[netpol.PrimitiveKind][]netpol.PrimitiveResult{
+		netpol.PrimitiveCIDR: {{
+			Ref:          netpol.PrimitiveRef{Kind: netpol.PrimitiveCIDR, CIDR: "10.0.0.0/8"},
+			State:        netpol.AccessAllowed,
+			AllowedPairs: 1,
+			TotalPairs:   1,
+		}},
+	}
+	view.applyResult(result)
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
+
+	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+	require.Nil(t, view.enterCmd(enter))
+	require.Equal(t, focusDetails, view.focusTarget)
+	assert.Nil(t, view.enterCmd(enter), "the key must be consumed, not silently ignored")
+	message := <-view.app.Flash().Channel()
+	assert.Contains(t, message.Text, "not Kubernetes resources")
 }

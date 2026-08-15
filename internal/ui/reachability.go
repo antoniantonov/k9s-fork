@@ -20,6 +20,8 @@ const (
 	reachabilityDisallowedColor = tcell.ColorRed
 	reachabilityPartialColor    = tcell.ColorOrange
 	partialDataLabel            = "Partial Data"
+	emptyLabel                  = "[EMPTY]"
+	allowedLabel                = "Allowed"
 )
 
 // ReachabilityProjection identifies the data shown by a DirectionPanel.
@@ -51,6 +53,8 @@ type reachabilityBlock struct {
 	search    string
 	state     netpol.AccessState
 	label     string
+	badge     string
+	synthetic bool
 	primary   string
 	secondary string
 	detail    string
@@ -60,6 +64,7 @@ type reachabilityColors struct {
 	allowed     tcell.Color
 	disallowed  tcell.Color
 	partialData tcell.Color
+	neutral     tcell.Color
 }
 
 // DirectionPanel displays either rules or primitives as selectable row blocks.
@@ -116,6 +121,9 @@ func (p *DirectionPanel) SetStyles(styles *config.Styles) *DirectionPanel {
 	}
 	p.cursorFg = styles.Table().CursorFgColor.Color()
 	p.cursorBg = styles.Table().CursorBgColor.Color()
+	// Set before SetReachabilityStyle so its preserve-then-rebuild keeps this
+	// value instead of an earlier default, without triggering a second rebuild.
+	p.colors.neutral = styles.FgColor()
 	p.SetReachabilityStyle(styles.Reachability())
 	p.applySelectionStyle()
 	return p
@@ -127,6 +135,8 @@ func (p *DirectionPanel) SetReachabilityStyle(style config.Reachability) *Direct
 		allowed:     style.AllowedColor.Color(),
 		disallowed:  style.DisallowedColor.Color(),
 		partialData: style.PartialDataColor.Color(),
+		// config.Reachability has no neutral field; preserve the existing value.
+		neutral: p.colors.neutral,
 	}
 	p.rebuild()
 	return p
@@ -307,6 +317,16 @@ func (p *DirectionPanel) PanelTitle() string {
 	return title
 }
 
+// ContentHeight returns the height the panel needs to render every block
+// without scrolling, including its border.
+func (p *DirectionPanel) ContentHeight() int {
+	rows := len(p.blocks) * 3
+	if rows == 0 {
+		rows = 1
+	}
+	return rows + 2
+}
+
 func (p *DirectionPanel) rebuild() {
 	old := p.ScrollState()
 	p.blocks = p.project()
@@ -317,7 +337,12 @@ func (p *DirectionPanel) rebuild() {
 		row := index * 3
 		p.blockRows = append(p.blockRows, row)
 		color := reachabilityColor(block.state, block.label, p.colors)
-		p.setBlockCell(row, 0, block.label, block.id, color, false)
+		if block.synthetic {
+			// Synthetic default-deny/unrestricted rows are not real
+			// NetworkPolicy rules, so they render in a neutral color.
+			color = p.colors.neutral
+		}
+		p.setBlockCell(row, 0, block.badge, block.id, color, false)
 		p.setBlockCell(row, 1, block.primary, block.id, color, true)
 		p.setBlockCell(row, 2, block.secondary, block.id, color, true)
 		p.setBlockCell(row+1, 0, "", block.id, color, false)
@@ -382,11 +407,23 @@ func (p *DirectionPanel) project() []reachabilityBlock {
 		for index := range p.rules {
 			rule := &p.rules[index]
 			state, label := ruleState(rule)
+			// Non-applicable rules are noise unless they are synthetic
+			// (default-deny/unrestricted), which must always stay visible.
+			if label == emptyLabel && !rule.Synthetic {
+				continue
+			}
 			permissions := formatPermissions(rule.Permissions)
+			badge := label
+			if label == allowedLabel {
+				// Redundant now that only applicable rules are listed.
+				badge = ""
+			}
 			block := reachabilityBlock{
 				id:        rule.StableID(),
 				state:     state,
 				label:     label,
+				badge:     badge,
+				synthetic: rule.Synthetic,
 				primary:   formatRuleName(rule),
 				secondary: permissions,
 				detail:    fmt.Sprintf("subjects %d/%d · peer %s", rule.SubjectMatchCount, rule.SubjectPodCount, valueOrDash(rule.PeerSummary)),
@@ -406,6 +443,8 @@ func (p *DirectionPanel) project() []reachabilityBlock {
 			id:        primitive.StableID(),
 			state:     state,
 			label:     label,
+			badge:     label,
+			synthetic: false,
 			primary:   formatPrimitiveName(&primitive.Ref),
 			secondary: formatPermissions(primitive.Permissions),
 			detail:    fmt.Sprintf("pairs %d/%d · %s", primitive.AllowedPairs, primitive.TotalPairs, valueOrDash(primitive.Explanation)),
@@ -552,12 +591,12 @@ func ruleState(rule *netpol.RuleResult) (state netpol.AccessState, label string)
 		return netpol.AccessPartialData, partialDataLabel
 	}
 	if rule.SubjectPodCount == 0 || rule.SubjectMatchCount == 0 {
-		return netpol.AccessDisallowed, "[EMPTY]"
+		return netpol.AccessDisallowed, emptyLabel
 	}
 	if rule.SubjectMatchCount < rule.SubjectPodCount {
 		return netpol.AccessPartial, fmt.Sprintf("[PARTIAL %d/%d]", rule.SubjectMatchCount, rule.SubjectPodCount)
 	}
-	return netpol.AccessAllowed, "Allowed"
+	return netpol.AccessAllowed, allowedLabel
 }
 
 func primitiveState(primitive *netpol.PrimitiveResult) (state netpol.AccessState, label string) {
@@ -574,7 +613,7 @@ func primitiveState(primitive *netpol.PrimitiveResult) (state netpol.AccessState
 }
 
 func reachabilityColor(state netpol.AccessState, label string, colors reachabilityColors) tcell.Color {
-	if state == netpol.AccessAllowed && label == "Allowed" {
+	if state == netpol.AccessAllowed && label == allowedLabel {
 		return colors.allowed
 	}
 	if state == netpol.AccessPartialData || label == partialDataLabel {
@@ -588,6 +627,7 @@ func defaultReachabilityColors() reachabilityColors {
 		allowed:     reachabilityAllowedColor,
 		disallowed:  reachabilityDisallowedColor,
 		partialData: reachabilityPartialColor,
+		neutral:     tview.Styles.PrimaryTextColor,
 	}
 }
 
@@ -632,6 +672,20 @@ func valueOrDash(value string) string {
 		return "—"
 	}
 	return value
+}
+
+// WrappedLineCount returns the number of display lines text occupies when
+// wrapped at width. It never returns less than 1.
+func WrappedLineCount(text string, width int) int {
+	lines := strings.Split(text, "\n")
+	if width < 1 {
+		return max(1, len(lines))
+	}
+	total := 0
+	for _, line := range lines {
+		total += max(1, len(tview.WordWrap(line, width)))
+	}
+	return max(1, total)
 }
 
 // PrimitiveDetailsText renders all primitive detail fields as plain text.
@@ -711,6 +765,34 @@ func (d *RuleDetails) SelectApplicabilityID(id string) bool {
 		}
 	}
 	return false
+}
+
+// SetApplicabilityChangedFunc registers a callback invoked with the stable
+// primitive ID of the newly selected applicability row. It chains after the
+// table's own selection styling, so callers do not have to reimplement it.
+func (d *RuleDetails) SetApplicabilityChangedFunc(callback func(id string)) *RuleDetails {
+	table := d.Applicability
+	table.SetSelectionChangedFunc(func(row, _ int) {
+		if row < 1 || row >= table.GetRowCount() {
+			if callback != nil {
+				callback("")
+			}
+			return
+		}
+		applyApplicabilitySelectionStyle(table)
+		if callback != nil {
+			callback(d.SelectedApplicabilityID())
+		}
+	})
+	return d
+}
+
+// TextHeight returns the height the rule detail text needs at the given total
+// width, including its border.
+func (d *RuleDetails) TextHeight(width int) int {
+	// Read the live text: the view mutates it after construction.
+	text := d.Text.GetText(true)
+	return 2 + WrappedLineCount(text, width-2)
 }
 
 // NewRuleDetails renders rule details and an applicability table.

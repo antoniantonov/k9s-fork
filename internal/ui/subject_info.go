@@ -94,6 +94,12 @@ func (s *SubjectInfo) SummaryText() string {
 	return s.summaryText()
 }
 
+// ContentHeight returns the height the box needs to render the summary line
+// and every workload row without scrolling, including its border.
+func (s *SubjectInfo) ContentHeight() int {
+	return 2 + 1 + max(1, s.Table.GetRowCount())
+}
+
 // SetBorderFocusColor records the color used for the border while the box holds
 // focus. Focus is delegated to the inner table, so tview never flags the outer
 // flex as focused and the color has to be applied at draw time.

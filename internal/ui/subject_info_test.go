@@ -16,6 +16,21 @@ func TestSubjectInfoRendersSummary(t *testing.T) {
 	require.Equal(t, "Deployment netpol-demo-app/api · 3 pods · Ingress on", info.SummaryText())
 }
 
+func TestSubjectInfoContentHeight(t *testing.T) {
+	info := NewSubjectInfo()
+	require.Equal(t, 4, info.ContentHeight(), "border (2) + summary (1) + the empty-state row")
+
+	info.SetWorkloads([]SubjectWorkload{
+		{Kind: "Pod", Namespace: "demo", Name: "a", Status: "Running"},
+		{Kind: "Pod", Namespace: "demo", Name: "b", Status: "Running"},
+		{Kind: "Pod", Namespace: "demo", Name: "c", Status: "Running"},
+	})
+	require.Equal(t, 7, info.ContentHeight(), "border (2) + summary (1) + header row + 3 workload rows")
+
+	info.SetWorkloads(nil)
+	require.Equal(t, 4, info.ContentHeight(), "the empty state never collapses the box below one content row")
+}
+
 func TestSubjectInfoRendersWorkloadRowsInOrder(t *testing.T) {
 	info := NewSubjectInfo().SetSummary("summary").SetWorkloads([]SubjectWorkload{
 		{Kind: "Deployment", Namespace: "netpol-demo-app", Name: "api", Status: "3/3 ready"},
