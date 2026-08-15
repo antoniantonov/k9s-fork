@@ -269,7 +269,7 @@ func TestNetworkPolicyGraphGlobalKindsAndEmptySelection(t *testing.T) {
 	view.loadPanel(netpol.Ingress)
 	view.updateDetails(netpol.Ingress)
 	assert.NotContains(t, view.panels[netpol.Ingress].PanelTitle(), "kinds:")
-	assert.Contains(t, view.panels[netpol.Ingress].GetCell(0, 1).Text, "allow-api", "rules remain visible")
+	assert.Contains(t, view.panels[netpol.Ingress].GetCell(0, 0).Text, "allow-api", "rules remain visible")
 	ruleDetails, ok := view.detailItem.(*ui.RuleDetails)
 	require.True(t, ok)
 	assert.Equal(t, 1, ruleDetails.Applicability.GetRowCount(), "global kind filters constrain applicability")
@@ -1776,4 +1776,44 @@ func TestNetworkPolicyGraphEnterReportsCIDRPrimitive(t *testing.T) {
 	assert.Nil(t, view.enterCmd(enter), "the key must be consumed, not silently ignored")
 	message := <-view.app.Flash().Channel()
 	assert.Contains(t, message.Text, "not Kubernetes resources")
+}
+
+// The direction panels no longer badge a rule's state, so the detail pane
+// points at the line that explains it.
+func TestNetworkPolicyGraphHighlightsPartialStateLine(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := testSubjectResult()
+	// One of two subject pods matches: a partial rule.
+	result.Subject.Pods = append(result.Subject.Pods, netpol.PodRef{Namespace: "payments", Name: "api-2"})
+	result.Ingress.Rules[0].SubjectPodCount = 2
+	result.Ingress.Rules[0].SubjectMatchCount = 1
+	view.applyResult(result)
+
+	detail, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	raw := detail.Text.GetText(false)
+	assert.Contains(t, raw, "[yellow::b]State: Partial", "the state line is highlighted")
+	assert.NotContains(t, raw, "[yellow::b]Direction:", "only the state line is highlighted")
+
+	// A fully matched rule has nothing to explain.
+	view.applyResult(testSubjectResult())
+	detail, ok = view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	assert.NotContains(t, detail.Text.GetText(false), "[yellow::b]")
+}
+
+// Rule detail bodies carry YAML and selectors with square brackets, which the
+// dynamic-color TextView must not eat.
+func TestNetworkPolicyGraphDetailTextSurvivesBrackets(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := testSubjectResult()
+	result.Ingress.Rules[0].Peers = []string{"ipBlock=10.0.0.0/8 except [10.1.0.0/16]"}
+	result.Ingress.Rules[0].YAML = "ingress:\n  - ports: []\n"
+	view.applyResult(result)
+
+	detail, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	text := detail.Text.GetText(true)
+	assert.Contains(t, text, "except [10.1.0.0/16]")
+	assert.Contains(t, text, "ports: []")
 }

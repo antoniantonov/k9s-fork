@@ -19,9 +19,15 @@ const (
 	reachabilityAllowedColor    = tcell.ColorGreen
 	reachabilityDisallowedColor = tcell.ColorRed
 	reachabilityPartialColor    = tcell.ColorOrange
-	partialDataLabel            = "Partial Data"
-	emptyLabel                  = "[EMPTY]"
-	allowedLabel                = "Allowed"
+	// reachabilityPartialStateColor marks a result that is neither a clean
+	// allow nor a clean deny, so it stands apart from both.
+	reachabilityPartialStateColor = tcell.ColorYellow
+	partialDataLabel              = "Partial Data"
+	emptyLabel                    = "[EMPTY]"
+	allowedLabel                  = "Allowed"
+	// ruleStateLinePrefix is the rule detail line that explains the state shown
+	// in the direction panels.
+	ruleStateLinePrefix = "State:"
 )
 
 // ReachabilityProjection identifies the data shown by a DirectionPanel.
@@ -53,17 +59,23 @@ type reachabilityBlock struct {
 	search    string
 	state     netpol.AccessState
 	label     string
-	badge     string
 	synthetic bool
 	primary   string
 	secondary string
 	detail    string
 }
 
+// blockCell is one rendered cell of a block row.
+type blockCell struct {
+	text   string
+	expand bool
+}
+
 type reachabilityColors struct {
 	allowed     tcell.Color
 	disallowed  tcell.Color
 	partialData tcell.Color
+	partial     tcell.Color
 	neutral     tcell.Color
 }
 
@@ -135,7 +147,8 @@ func (p *DirectionPanel) SetReachabilityStyle(style config.Reachability) *Direct
 		allowed:     style.AllowedColor.Color(),
 		disallowed:  style.DisallowedColor.Color(),
 		partialData: style.PartialDataColor.Color(),
-		// config.Reachability has no neutral field; preserve the existing value.
+		// config.Reachability carries neither of these; preserve them.
+		partial: p.colors.partial,
 		neutral: p.colors.neutral,
 	}
 	p.rebuild()
@@ -327,13 +340,27 @@ func (p *DirectionPanel) ContentHeight() int {
 	return rows + 2
 }
 
+// blockColumns returns the cells of a block's two rendered rows. The Rules
+// projection drops the leading state column: now that only applicable rules are
+// listed it carried nothing but the occasional badge, and the row color says
+// the same thing without spending a column on it.
+func (p *DirectionPanel) blockColumns(block *reachabilityBlock) (top, bottom []blockCell) {
+	if p.projection == RulesProjection {
+		return []blockCell{{block.primary, true}, {block.secondary, true}},
+			[]blockCell{{block.detail, true}, {"", true}}
+	}
+	return []blockCell{{block.label, false}, {block.primary, true}, {block.secondary, true}},
+		[]blockCell{{"", false}, {block.detail, true}, {"", true}}
+}
+
 func (p *DirectionPanel) rebuild() {
 	old := p.ScrollState()
 	p.blocks = p.project()
 	p.blockRows = p.blockRows[:0]
 	p.Clear()
 
-	for index, block := range p.blocks {
+	for index := range p.blocks {
+		block := &p.blocks[index]
 		row := index * 3
 		p.blockRows = append(p.blockRows, row)
 		color := reachabilityColor(block.state, block.label, p.colors)
@@ -342,21 +369,19 @@ func (p *DirectionPanel) rebuild() {
 			// NetworkPolicy rules, so they render in a neutral color.
 			color = p.colors.neutral
 		}
-		p.setBlockCell(row, 0, block.badge, block.id, color, false)
-		p.setBlockCell(row, 1, block.primary, block.id, color, true)
-		p.setBlockCell(row, 2, block.secondary, block.id, color, true)
-		p.setBlockCell(row+1, 0, "", block.id, color, false)
-		p.setBlockCell(row+1, 1, block.detail, block.id, color, true)
-		p.setBlockCell(row+1, 2, "", block.id, color, true)
+		top, bottom := p.blockColumns(block)
+		for column := range top {
+			p.setBlockCell(row, column, top[column].text, block.id, color, top[column].expand)
+			p.setBlockCell(row+1, column, bottom[column].text, block.id, color, bottom[column].expand)
+		}
 
 		separator := strings.Repeat(p.separator(), 12)
-		cell := tview.NewTableCell(separator).
-			SetExpansion(1).
-			SetTextColor(tview.Styles.GraphicsColor).
-			SetSelectable(false)
-		p.SetCell(row+2, 0, cell)
-		p.SetCell(row+2, 1, tview.NewTableCell(separator).SetExpansion(1).SetTextColor(tview.Styles.GraphicsColor).SetSelectable(false))
-		p.SetCell(row+2, 2, tview.NewTableCell(separator).SetExpansion(1).SetTextColor(tview.Styles.GraphicsColor).SetSelectable(false))
+		for column := range top {
+			p.SetCell(row+2, column, tview.NewTableCell(separator).
+				SetExpansion(1).
+				SetTextColor(tview.Styles.GraphicsColor).
+				SetSelectable(false))
+		}
 	}
 
 	p.updateTitle()
@@ -413,16 +438,10 @@ func (p *DirectionPanel) project() []reachabilityBlock {
 				continue
 			}
 			permissions := formatPermissions(rule.Permissions)
-			badge := label
-			if label == allowedLabel {
-				// Redundant now that only applicable rules are listed.
-				badge = ""
-			}
 			block := reachabilityBlock{
 				id:        rule.StableID(),
 				state:     state,
 				label:     label,
-				badge:     badge,
 				synthetic: rule.Synthetic,
 				primary:   formatRuleName(rule),
 				secondary: permissions,
@@ -443,7 +462,6 @@ func (p *DirectionPanel) project() []reachabilityBlock {
 			id:        primitive.StableID(),
 			state:     state,
 			label:     label,
-			badge:     label,
 			synthetic: false,
 			primary:   formatPrimitiveName(&primitive.Ref),
 			secondary: formatPermissions(primitive.Permissions),
@@ -619,7 +637,18 @@ func reachabilityColor(state netpol.AccessState, label string, colors reachabili
 	if state == netpol.AccessPartialData || label == partialDataLabel {
 		return colors.partialData
 	}
+	// Neither allowed nor denied: the row is worth a second look, so it gets a
+	// color of its own rather than being lumped in with the denials.
+	if state == netpol.AccessPartial || state == netpol.AccessUnknown {
+		return colors.partial
+	}
 	return colors.disallowed
+}
+
+// isPartialState reports whether a state needs explaining rather than simply
+// being allowed or denied.
+func isPartialState(state netpol.AccessState) bool {
+	return state == netpol.AccessPartial || state == netpol.AccessUnknown
 }
 
 func defaultReachabilityColors() reachabilityColors {
@@ -627,6 +656,7 @@ func defaultReachabilityColors() reachabilityColors {
 		allowed:     reachabilityAllowedColor,
 		disallowed:  reachabilityDisallowedColor,
 		partialData: reachabilityPartialColor,
+		partial:     reachabilityPartialStateColor,
 		neutral:     tview.Styles.PrimaryTextColor,
 	}
 }
@@ -842,7 +872,8 @@ func newRuleDetailsFromText(
 	applicabilityTitle string,
 ) *RuleDetails {
 	text := tview.NewTextView().
-		SetText(body).
+		SetDynamicColors(true).
+		SetText(tview.Escape(body)).
 		SetScrollable(true).
 		SetWrap(true)
 	text.SetBorder(true).SetTitle(textTitle)
@@ -867,6 +898,49 @@ func NewEffectiveDetailsWithStyle(
 		disallowed:  style.DisallowedColor.Color(),
 		partialData: style.PartialDataColor.Color(),
 	}, " Effective Details ", " Effective Applicability ")
+}
+
+// HighlightRuleState prepares body for the rule detail pane, which renders with
+// dynamic colors. Everything is escaped so YAML and selectors containing square
+// brackets survive verbatim, and the "State:" line is painted when the rule is
+// neither cleanly allowed nor cleanly denied -- that line names the state the
+// direction panel colored, so it is where the user looks to find out why.
+func HighlightRuleState(body string, rule *netpol.RuleResult) string {
+	escaped := tview.Escape(body)
+	if rule == nil {
+		return escaped
+	}
+	if state, _ := ruleState(rule); !isPartialState(state) {
+		return escaped
+	}
+	return paintLine(escaped, ruleStateLinePrefix, reachabilityPartialStateColor)
+}
+
+// paintLine wraps the first line starting with prefix in a color tag. The tag
+// carries both colons on purpose: tview only recognizes the full
+// "[foreground:background:attributes]" form, and a bare "[yellow]" would be
+// printed verbatim.
+func paintLine(body, prefix string, color tcell.Color) string {
+	lines := strings.Split(body, "\n")
+	for index, line := range lines {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		lines[index] = fmt.Sprintf("[%s::b]%s[-::-]", colorName(color), line)
+		break
+	}
+	return strings.Join(lines, "\n")
+}
+
+// colorName renders a color as a tview tag value. Named colors round-trip as
+// their name; anything else falls back to its hex form.
+func colorName(color tcell.Color) string {
+	for name, candidate := range tcell.ColorNames {
+		if candidate == color {
+			return name
+		}
+	}
+	return fmt.Sprintf("#%06x", color.Hex())
 }
 
 // RuleDetailsText renders the non-tabular rule detail fields.

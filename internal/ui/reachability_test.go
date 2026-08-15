@@ -4,6 +4,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/derailed/k9s/internal/config"
@@ -21,10 +22,26 @@ func TestDirectionPanelRendersMultiRowBlocksAndTrailingSeparators(t *testing.T) 
 
 	require.Equal(t, 9, panel.GetRowCount())
 	assert.Equal(t, testRules()[0].StableID(), panel.GetCell(0, 0).GetReference())
-	assert.Equal(t, testRules()[0].StableID(), panel.GetCell(1, 1).GetReference())
+	assert.Equal(t, testRules()[0].StableID(), panel.GetCell(1, 0).GetReference())
 	assert.True(t, panel.GetCell(2, 0).NotSelectable)
-	assert.True(t, panel.GetCell(8, 2).NotSelectable, "the final item must have a separator")
+	assert.True(t, panel.GetCell(8, 1).NotSelectable, "the final item must have a separator")
 	assert.Contains(t, panel.GetCell(2, 0).Text, "─")
+}
+
+// Rules drop the leading state column: the row color carries the state, so the
+// column would be dead space on every applicable rule.
+func TestDirectionPanelRulesHaveNoStateColumn(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetRules(testRules())
+
+	assert.Equal(t, formatRuleName(&testRules()[0]), panel.GetCell(0, 0).Text)
+	assert.Equal(t, formatPermissions(testRules()[0].Permissions), panel.GetCell(0, 1).Text)
+	assert.Equal(t, 2, panel.GetColumnCount(), "rules render two columns")
+
+	// Primitives keep theirs: it is never blank there.
+	panel.SetProjection(PrimitivesProjection).SetPrimitives(testPrimitives())
+	assert.Equal(t, allowedLabel, panel.GetCell(0, 0).Text)
+	assert.Equal(t, 3, panel.GetColumnCount(), "primitives keep the state column")
 }
 
 func TestDirectionPanelASCIISeparators(t *testing.T) {
@@ -58,10 +75,13 @@ func TestDirectionPanelAccessLabelsAndColors(t *testing.T) {
 	assert.Equal(t, reachabilityAllowedColor, panel.GetCell(0, 0).Color)
 	assert.True(t, panel.GetCell(0, 0).Transparent)
 	assert.Equal(t, "[PARTIAL 1/2]", panel.GetCell(3, 0).Text)
-	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(3, 0).Color)
+	assert.Equal(t, reachabilityPartialStateColor, panel.GetCell(3, 0).Color,
+		"a partial result is neither an allow nor a deny")
 	assert.True(t, panel.GetCell(3, 0).Transparent)
 	assert.Equal(t, "Unknown", panel.GetCell(6, 0).Text)
+	assert.Equal(t, reachabilityPartialStateColor, panel.GetCell(6, 0).Color)
 	assert.Equal(t, "[EMPTY]", panel.GetCell(9, 0).Text)
+	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(9, 0).Color)
 	assert.Equal(t, "Partial Data", panel.GetCell(12, 0).Text)
 	assert.Equal(t, reachabilityPartialColor, panel.GetCell(12, 0).Color)
 	assert.True(t, panel.GetCell(12, 0).Transparent)
@@ -74,8 +94,10 @@ func TestDirectionPanelAccessLabelsAndColors(t *testing.T) {
 	}
 	panel.SetReachabilityStyle(style)
 	assert.Equal(t, style.AllowedColor.Color(), panel.GetCell(0, 0).Color)
-	assert.Equal(t, style.DisallowedColor.Color(), panel.GetCell(3, 0).Color)
+	assert.Equal(t, style.DisallowedColor.Color(), panel.GetCell(9, 0).Color)
 	assert.Equal(t, style.PartialDataColor.Color(), panel.GetCell(12, 0).Color)
+	assert.Equal(t, reachabilityPartialStateColor, panel.GetCell(3, 0).Color,
+		"the partial color has no skin key and survives a style change")
 }
 
 func TestDirectionPanelNavigationSkipsSeparators(t *testing.T) {
@@ -324,7 +346,7 @@ func TestDirectionPanelSelectionCallbackAndStyleKeepsResultAsTextColor(t *testin
 
 	panel.captureInput(tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
 	assert.Equal(t, testPrimitives()[1].StableID(), selected)
-	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(3, 0).Color)
+	assert.Equal(t, reachabilityPartialStateColor, panel.GetCell(3, 0).Color)
 	assert.True(t, panel.GetCell(3, 0).Transparent)
 }
 
@@ -407,7 +429,7 @@ func TestPrimitiveAndRuleDetails(t *testing.T) {
 	assert.Equal(t, 2, details.Applicability.GetRowCount())
 	assert.Equal(t, "Primitive", details.Applicability.GetCell(0, 0).Text)
 	assert.Equal(t, "Partial", details.Applicability.GetCell(1, 3).Text)
-	assert.Equal(t, reachabilityDisallowedColor, details.Applicability.GetCell(1, 0).Color)
+	assert.Equal(t, reachabilityPartialStateColor, details.Applicability.GetCell(1, 0).Color)
 	assert.True(t, details.Applicability.GetCell(1, 0).Transparent)
 }
 
@@ -453,12 +475,13 @@ func TestPrimitiveDetailsUsesNormalizedState(t *testing.T) {
 	assert.Contains(t, PrimitiveDetailsText(primitive), "State: [EMPTY]")
 }
 
-func TestPartialAndEmptyLabelsAreSearchableAndRemainDisallowedColored(t *testing.T) {
+func TestPartialAndEmptyLabelsAreSearchableAndPartialColored(t *testing.T) {
 	panel := NewDirectionPanel(netpol.Ingress)
 	panel.SetRules(testRules()).SetFilter("[PARTIAL 1/2]")
 	require.Equal(t, 3, panel.GetRowCount())
-	assert.Equal(t, "[PARTIAL 1/2]", panel.GetCell(0, 0).Text)
-	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(0, 0).Color)
+	require.Len(t, panel.blocks, 1)
+	assert.Equal(t, "[PARTIAL 1/2]", panel.blocks[0].label, "the label still drives search and color")
+	assert.Equal(t, reachabilityPartialStateColor, panel.GetCell(0, 0).Color)
 	assert.True(t, panel.GetCell(0, 0).Transparent)
 
 	// A non-synthetic [EMPTY] rule is now hidden from the Rules projection
@@ -503,15 +526,15 @@ func TestDirectionPanelKeepsSyntheticEmptyRuleVisible(t *testing.T) {
 	require.Len(t, panel.blocks, 1, "a synthetic rule must stay visible even when it has no matching subjects")
 	assert.True(t, panel.blocks[0].synthetic)
 	assert.Equal(t, "[EMPTY]", panel.blocks[0].label)
-	assert.Equal(t, "[EMPTY]", panel.GetCell(0, 0).Text, "synthetic rules still render their badge")
+	assert.Equal(t, "default-deny #-1", panel.GetCell(0, 0).Text, "rules lead with their name, not a badge")
 }
 
-func TestDirectionPanelAllowedRuleBadgeIsBlankButStaysAllowedColoredAndSearchable(t *testing.T) {
+func TestDirectionPanelAllowedRuleHasNoBadgeButStaysColoredAndSearchable(t *testing.T) {
 	panel := NewDirectionPanel(netpol.Ingress)
 	panel.SetRules(testRules()[:1])
 
 	require.Equal(t, "Allowed", panel.blocks[0].label, "the label is preserved for color and search")
-	assert.Empty(t, panel.GetCell(0, 0).Text, "the Allowed badge is redundant once only applicable rules are listed")
+	assert.Equal(t, formatRuleName(&testRules()[0]), panel.GetCell(0, 0).Text, "no badge column is rendered")
 	assert.Equal(t, reachabilityAllowedColor, panel.GetCell(0, 0).Color)
 	assert.True(t, panel.GetCell(0, 0).Transparent)
 
@@ -519,14 +542,18 @@ func TestDirectionPanelAllowedRuleBadgeIsBlankButStaysAllowedColoredAndSearchabl
 	assert.Len(t, panel.blocks, 1, "the rule must remain searchable by its label even without a rendered badge")
 }
 
-func TestDirectionPanelPartialAndPartialDataBadgesStillRender(t *testing.T) {
+// Rules no longer spend a column on their state: the row color carries it.
+func TestDirectionPanelRuleStatesAreColorCodedNotBadged(t *testing.T) {
 	rules := testRules()
 	rules[0].Warnings = []string{"incomplete"}
 	panel := NewDirectionPanel(netpol.Ingress)
 	panel.SetRules(rules)
 
-	assert.Equal(t, "Partial Data", panel.GetCell(0, 0).Text)
-	assert.Equal(t, "[PARTIAL 1/2]", panel.GetCell(3, 0).Text)
+	assert.Equal(t, formatRuleName(&rules[0]), panel.GetCell(0, 0).Text)
+	assert.Equal(t, reachabilityPartialColor, panel.GetCell(0, 0).Color, "partial data keeps its own color")
+	assert.Equal(t, formatRuleName(&rules[1]), panel.GetCell(3, 0).Text)
+	assert.Equal(t, reachabilityPartialStateColor, panel.GetCell(3, 0).Color, "a partial rule is yellow")
+	assert.Equal(t, reachabilityAllowedColor, panel.GetCell(6, 0).Color, "a fully matched rule stays green")
 }
 
 func TestDirectionPanelSyntheticRuleUsesNeutralColorAndFollowsSetStyles(t *testing.T) {
@@ -712,4 +739,83 @@ func testPrimitives() []netpol.PrimitiveResult {
 			TotalPairs: 1,
 		},
 	}
+}
+
+// The rule detail pane renders with dynamic colors, so square brackets in YAML
+// and selectors have to survive verbatim.
+func TestHighlightRuleStateEscapesBodyAndPaintsOnlyPartialStates(t *testing.T) {
+	body := "Rule index: 0\nState: Partial ([PARTIAL 1/2])\nPeers:\n  - ipBlock=10.0.0.0/8\n  ports: []"
+
+	allowed := &netpol.RuleResult{SubjectPodCount: 2, SubjectMatchCount: 2}
+	assert.Equal(t, tview.Escape(body), HighlightRuleState(body, allowed),
+		"an allowed rule has nothing to look into")
+
+	partial := &netpol.RuleResult{SubjectPodCount: 2, SubjectMatchCount: 1}
+	painted := HighlightRuleState(body, partial)
+	assert.Contains(t, painted, "[yellow::b]State: Partial (")
+	assert.Contains(t, painted, "[-::-]")
+	assert.NotContains(t, painted, "[yellow::b]Rule index", "only the State line is painted")
+	assert.NotContains(t, painted, "[yellow::b]Peers")
+
+	// Denied and partial-data rules are left alone: the panel color says it.
+	denied := &netpol.RuleResult{SubjectPodCount: 2, SubjectMatchCount: 0}
+	assert.NotContains(t, HighlightRuleState(body, denied), "[yellow::b]")
+	warned := &netpol.RuleResult{SubjectPodCount: 2, SubjectMatchCount: 2, Warnings: []string{"x"}}
+	assert.NotContains(t, HighlightRuleState(body, warned), "[yellow::b]")
+
+	assert.Equal(t, tview.Escape(body), HighlightRuleState(body, nil))
+}
+
+// A painted body must still read back as the original text.
+func TestRuleDetailsTextRoundTripsThroughDynamicColors(t *testing.T) {
+	body := "State: Partial ([PARTIAL 1/2])\n  ports: []\n  peer: [10.0.0.0/8]"
+	details := NewRuleDetails(testRules()[1], nil)
+	details.Text.SetText(HighlightRuleState(body, &netpol.RuleResult{SubjectPodCount: 2, SubjectMatchCount: 2}))
+
+	assert.Equal(t, body, details.Text.GetText(true), "escaped brackets survive verbatim")
+}
+
+func TestColorNameRoundTrip(t *testing.T) {
+	assert.Equal(t, "yellow", colorName(tcell.ColorYellow))
+	assert.Equal(t, "red", colorName(tcell.ColorRed))
+	assert.Equal(t, "#123456", colorName(tcell.NewHexColor(0x123456)))
+}
+
+// A color tag is only honored by tview in its full "[fg:bg:attr]" form, so this
+// asserts what actually reaches the screen rather than what is in the string.
+func TestHighlightedStateLineRendersInColor(t *testing.T) {
+	rule := &netpol.RuleResult{SubjectPodCount: 2, SubjectMatchCount: 1}
+	details := NewRuleDetails(*rule, nil)
+	details.Text.SetText(HighlightRuleState("Direction: Ingress\nState: Partial ([PARTIAL 1/2])\n  ports: []", rule))
+
+	screen := tcell.NewSimulationScreen("UTF-8")
+	require.NoError(t, screen.Init())
+	defer screen.Fini()
+	screen.SetSize(60, 8)
+	details.Text.SetRect(0, 0, 60, 8)
+	details.Text.Draw(screen)
+
+	readRow := func(row int) (string, map[tcell.Color]int) {
+		text, colors := "", map[tcell.Color]int{}
+		for column := range 60 {
+			r, _, style, _ := screen.GetContent(column, row)
+			text += string(r)
+			if r != ' ' && r != '│' {
+				fg, _, _ := style.Decompose()
+				colors[fg]++
+			}
+		}
+		return strings.TrimRight(text, " "), colors
+	}
+
+	direction, directionColors := readRow(1)
+	state, stateColors := readRow(2)
+	ports, _ := readRow(3)
+
+	assert.Contains(t, state, "State: Partial ([PARTIAL 1/2])", "the tag itself must not be printed")
+	assert.NotContains(t, state, "yellow")
+	assert.Positive(t, stateColors[reachabilityPartialStateColor], "the state line renders yellow")
+	assert.Zero(t, directionColors[reachabilityPartialStateColor], "neighbouring lines are untouched")
+	assert.Contains(t, direction, "Direction: Ingress")
+	assert.Contains(t, ports, "ports: []", "square brackets survive the dynamic-color pass")
 }

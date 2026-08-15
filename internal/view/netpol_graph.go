@@ -1226,7 +1226,7 @@ func (v *NetworkPolicyGraph) renderDetails(direction netpol.Direction) {
 		text.WriteString("\n")
 		text.WriteString(ui.RuleDetailsText(rule))
 		v.appendResultWarnings(&text)
-		ruleDetail.Text.SetText(strings.TrimSpace(text.String()))
+		ruleDetail.Text.SetText(ui.HighlightRuleState(strings.TrimSpace(text.String()), &rule))
 		detail = ruleDetail
 	} else {
 		primitive, ok := v.selectedPrimitive(direction, id)
