@@ -20,7 +20,7 @@ Automated cases are in `scripts/k9s-tui-smoke.exp`; setup/build phases are in `s
 | `Enter` | Applicability focused → opens highlighted primitive; `Esc` returns | `enter-opens-applicability-primitive` | Moves off the first CIDR row before opening |
 | `Esc` | Clear selection before back navigation; back from opened resource | `escape-clears-selection-before-back`, open cases | Dialog cancel also covered |
 | `←` / `→` | Focus Ingress/Egress | `left-right-direction-focus` | Uses ANSI cursor sequences |
-| `Tab` / `Shift-Tab` | Subject → Ingress → Egress → Details → Applicability focus ring | `tab-and-shift-tab-focus-ring` | Visual focus is indirectly asserted by stable repaint |
+| `Tab` / `Shift-Tab` | Subject → Ingress → Ingress details → Ingress applicability → Egress → Egress details → Egress applicability focus ring | `tab-and-shift-tab-focus-ring` | Each direction owns the detail stops that follow it, so its applicability is reachable without passing through the other panel. Focus opens on Subject. Visual focus is indirectly asserted by stable repaint |
 | Freeze/hang | Rapid arrows, refreshes, mode/direction/autorefresh toggles while scrolling | `freeze-hang-stress` | Sends `SIGQUIT` on repaint timeout |
 
 ## Functional data matrix

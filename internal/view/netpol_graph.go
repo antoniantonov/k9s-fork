@@ -186,7 +186,6 @@ type applicabilityMemo struct {
 	direction  netpol.Direction
 	ruleID     netpol.RuleID
 	effective  bool
-	valid      bool
 	rows       []netpol.ApplicabilityRow
 }
 
@@ -235,7 +234,10 @@ type NetworkPolicyGraph struct {
 	// or the enabled primitive kinds change.
 	dataGen     uint64
 	projections map[netpol.Direction]*projectionCache
-	rows        applicabilityMemo
+	// rows memoizes one applicability projection per direction. The focus ring
+	// asks about both directions on every Tab, so a single slot would evict the
+	// focused pane's rows on every keystroke.
+	rows map[netpol.Direction]*applicabilityMemo
 
 	// pendingResult and pendingErr hold the newest queued notification of each
 	// kind. The model reports a result and a partial-data failure back to back
@@ -276,10 +278,11 @@ func newNetworkPolicyGraph(subject netpol.SubjectRef, evaluator netpol.Evaluator
 		panels:      make(map[netpol.Direction]*ui.DirectionPanel, 2),
 		state:       make(map[netpol.Direction]*reachabilityDirectionState, 2),
 		projections: make(map[netpol.Direction]*projectionCache, 2),
+		rows:        make(map[netpol.Direction]*applicabilityMemo, 2),
 		kinds:       netpol.AllPrimitiveKinds(),
 		mode:        ui.RulesProjection,
 		focus:       netpol.Ingress,
-		focusTarget: focusIngress,
+		focusTarget: focusSubject,
 	}
 	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
 		v.state[direction] = &reachabilityDirectionState{
@@ -301,8 +304,8 @@ func newNetworkPolicyGraph(subject netpol.SubjectRef, evaluator netpol.Evaluator
 		})
 		v.panels[direction] = panel
 	}
-	v.AddItem(v.subjectInfo, 0, 1, false)
-	v.AddItem(v.directions, 0, 3, true)
+	v.AddItem(v.subjectInfo, 0, 1, true)
+	v.AddItem(v.directions, 0, 3, false)
 	// The details pane is the flexible section: every section above it is
 	// resized to its content at draw time and this one absorbs the remainder.
 	v.AddItem(v.details, 0, 1, false)
@@ -311,6 +314,9 @@ func newNetworkPolicyGraph(subject netpol.SubjectRef, evaluator netpol.Evaluator
 	v.rebuildDirections()
 	v.updateSubject()
 	v.showMessage("Waiting for NetworkPolicy evaluation...")
+	// rebuildDirections anchors focus on a direction panel. The Tab ring starts
+	// at the subject, so the view opens there instead.
+	v.applyFocusTarget(focusSubject)
 	return v
 }
 
@@ -720,43 +726,152 @@ func (v *NetworkPolicyGraph) focusDirection(direction netpol.Direction) {
 }
 
 func (v *NetworkPolicyGraph) cycleFocus(reverse bool) {
-	targets := v.focusTargets()
-	if len(targets) < 2 {
+	stops := v.focusStops()
+	if len(stops) == 0 {
 		return
-	}
-	current := 0
-	for index, target := range targets {
-		if target == v.focusTarget {
-			current = index
-			break
-		}
 	}
 	step := 1
 	if reverse {
 		step = -1
 	}
-	v.applyFocusTarget(targets[(current+step+len(targets))%len(targets)])
+	current := v.currentStopIndex(stops)
+	if current < 0 {
+		// Focus sits on a stop that no longer exists. Enter the ring from
+		// whichever end the key is heading towards rather than jumping across
+		// it, which is what anchoring on the subject would do in reverse.
+		if reverse {
+			v.applyFocusStop(stops[len(stops)-1])
+		} else {
+			v.applyFocusStop(stops[0])
+		}
+		return
+	}
+	v.applyFocusStop(stops[(current+step+len(stops))%len(stops)])
 }
 
-func (v *NetworkPolicyGraph) focusTargets() []reachabilityFocus {
-	targets := []reachabilityFocus{focusSubject}
-	if v.state[netpol.Ingress].visible {
-		targets = append(targets, focusIngress)
-	}
-	if v.state[netpol.Egress].visible {
-		targets = append(targets, focusEgress)
-	}
-	// The detail pane is focusable whenever it renders real content, which now
-	// includes the effective pane shown when nothing is selected.
-	if detail, ok := v.detailItem.(*ui.RuleDetails); ok {
-		targets = append(targets, focusDetails)
-		if detail.Applicability.GetRowCount() > 1 {
-			targets = append(targets, focusApplicability)
+// focusStop is one stop on the Tab ring. The detail stops repeat once per
+// direction, so a stop has to name the direction it belongs to.
+type focusStop struct {
+	target    reachabilityFocus
+	direction netpol.Direction
+}
+
+// focusStops lists the ring in order: subject, then each visible direction
+// followed immediately by its own details and applicability. Keeping a
+// direction's detail stops next to its panel means Tab reaches the ingress
+// applicability without first walking through egress.
+func (v *NetworkPolicyGraph) focusStops() []focusStop {
+	stops := []focusStop{{target: focusSubject}}
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		if !v.state[direction].visible {
+			continue
 		}
-	} else if v.detailItem != nil && v.panels[v.focus].SelectedID() != "" {
-		targets = append(targets, focusDetails)
+		stops = append(stops, focusStop{target: directionFocus(direction), direction: direction})
+		details, applicability := v.detailStops(direction)
+		if details {
+			stops = append(stops, focusStop{target: focusDetails, direction: direction})
+		}
+		if applicability {
+			stops = append(stops, focusStop{target: focusApplicability, direction: direction})
+		}
 	}
-	return targets
+	return stops
+}
+
+// detailStops reports which detail stops a direction offers. It answers from
+// the evaluated data rather than the rendered widget on purpose: the pane only
+// ever holds the focused direction, but the ring has to place the other
+// direction's stops too. It mirrors what renderDetails would build.
+func (v *NetworkPolicyGraph) detailStops(direction netpol.Direction) (details, applicability bool) {
+	if !v.haveResult || !v.state[direction].visible {
+		return false, false
+	}
+	id := v.panels[direction].SelectedID()
+	if id == "" {
+		return true, len(v.directionApplicability(direction)) > 0
+	}
+	if v.mode == ui.RulesProjection {
+		rule, ok := v.selectedRule(direction, id)
+		if !ok {
+			return false, false
+		}
+		return true, len(v.ruleApplicability(direction, rule.ID)) > 0
+	}
+	// Primitives render a plain text pane with no applicability table.
+	_, ok := v.selectedPrimitive(direction, id)
+	return ok, false
+}
+
+// currentStopIndex locates the ring position focus sits on, or -1 when focus is
+// on no stop at all. The detail stops appear once per direction, so the active
+// direction disambiguates them.
+func (v *NetworkPolicyGraph) currentStopIndex(stops []focusStop) int {
+	for index, stop := range stops {
+		if stop.target != v.focusTarget {
+			continue
+		}
+		if stop.target == focusSubject || stop.direction == v.focus {
+			return index
+		}
+	}
+	return -1
+}
+
+// applyFocusStop moves to a ring stop, switching the active direction first
+// when the stop belongs to the other one. The detail pane only ever renders the
+// active direction, so it has to be rebuilt before focus can land on it.
+func (v *NetworkPolicyGraph) applyFocusStop(stop focusStop) {
+	isDetail := stop.target == focusDetails || stop.target == focusApplicability
+	if isDetail && v.focus != stop.direction && v.state[stop.direction].visible {
+		v.focus = stop.direction
+		// Set the target before rebuilding: renderDetails re-anchors focus
+		// through refocusDetail once the new pane exists.
+		v.focusTarget = stop.target
+		v.updateDetails(stop.direction)
+		return
+	}
+	v.applyFocusTarget(stop.target)
+}
+
+// Focus routes focus to the widget the view believes holds it. tview.Flex would
+// otherwise always delegate to the item flagged at AddItem time, so every
+// re-focus of the graph -- most visibly when a pushed view is popped back off
+// the stack -- would land somewhere focusTarget does not name, leaving the key
+// bindings acting on a pane the user cannot see highlighted.
+func (v *NetworkPolicyGraph) Focus(delegate func(tview.Primitive)) {
+	if target := v.focusPrimitive(); target != nil {
+		delegate(target)
+		return
+	}
+	v.Flex.Focus(delegate)
+}
+
+// focusPrimitive resolves focusTarget to a widget, mirroring the order
+// applyFocusTarget falls back through. It never mutates: tview calls Focus
+// during its own focus cycle, so this has to be a pure lookup.
+func (v *NetworkPolicyGraph) focusPrimitive() tview.Primitive {
+	switch v.focusTarget {
+	case focusSubject:
+		return v.subjectInfo
+	case focusDetails, focusApplicability:
+		if detail, ok := v.detailItem.(*ui.RuleDetails); ok {
+			if v.focusTarget == focusApplicability {
+				return detail.Applicability
+			}
+			return detail.Text
+		}
+		if v.detailItem != nil {
+			return v.detailItem
+		}
+	}
+	// Both directions hidden: the panels are no longer in the widget tree.
+	if v.placeholder != nil {
+		return v.placeholder
+	}
+	if state, ok := v.state[v.focus]; ok && state.visible {
+		return v.panels[v.focus]
+	}
+	return v.subjectInfo
 }
 
 // applyFocusTarget moves focus to a target, falling back when the requested
@@ -819,7 +934,12 @@ func (v *NetworkPolicyGraph) applyFocusTarget(target reachabilityFocus) {
 
 // directionFocusTarget returns the focus target for the active direction panel.
 func (v *NetworkPolicyGraph) directionFocusTarget() reachabilityFocus {
-	if v.focus == netpol.Ingress {
+	return directionFocus(v.focus)
+}
+
+// directionFocus maps a direction onto its panel focus target.
+func directionFocus(direction netpol.Direction) reachabilityFocus {
+	if direction == netpol.Ingress {
 		return focusIngress
 	}
 	return focusEgress
@@ -1420,7 +1540,7 @@ func (v *NetworkPolicyGraph) selectedPrimitive(direction netpol.Direction, id st
 // kinds needs no call: they are part of the cache key.
 func (v *NetworkPolicyGraph) invalidateProjections() {
 	v.dataGen++
-	v.rows.valid = false
+	clear(v.rows)
 }
 
 // kindMask encodes the enabled primitive kinds so the caches key on them
@@ -1462,38 +1582,36 @@ func (v *NetworkPolicyGraph) projection(direction netpol.Direction) *projectionC
 // rule, reusing the last computation when the pane repaints unchanged.
 func (v *NetworkPolicyGraph) ruleApplicability(direction netpol.Direction, id netpol.RuleID) []netpol.ApplicabilityRow {
 	mask := v.kindMask()
-	if v.rows.valid && v.rows.generation == v.dataGen && v.rows.kindMask == mask &&
-		v.rows.direction == direction && !v.rows.effective && v.rows.ruleID == id {
-		return v.rows.rows
+	if memo := v.rows[direction]; memo != nil && memo.generation == v.dataGen && memo.kindMask == mask &&
+		!memo.effective && memo.ruleID == id {
+		return memo.rows
 	}
-	v.rows = applicabilityMemo{
+	v.rows[direction] = &applicabilityMemo{
 		generation: v.dataGen,
 		kindMask:   mask,
 		direction:  direction,
 		ruleID:     id,
-		valid:      true,
 		rows:       v.evaluator.RuleApplicability(v.result, direction, id, v.kinds),
 	}
-	return v.rows.rows
+	return v.rows[direction].rows
 }
 
 // directionApplicability returns the effective applicability rows for a whole
 // direction, reusing the last computation when the pane repaints unchanged.
 func (v *NetworkPolicyGraph) directionApplicability(direction netpol.Direction) []netpol.ApplicabilityRow {
 	mask := v.kindMask()
-	if v.rows.valid && v.rows.generation == v.dataGen && v.rows.kindMask == mask &&
-		v.rows.direction == direction && v.rows.effective {
-		return v.rows.rows
+	if memo := v.rows[direction]; memo != nil && memo.generation == v.dataGen && memo.kindMask == mask &&
+		memo.effective {
+		return memo.rows
 	}
-	v.rows = applicabilityMemo{
+	v.rows[direction] = &applicabilityMemo{
 		generation: v.dataGen,
 		kindMask:   mask,
 		direction:  direction,
 		effective:  true,
-		valid:      true,
 		rows:       v.evaluator.DirectionApplicability(v.result, direction, v.kinds),
 	}
-	return v.rows.rows
+	return v.rows[direction].rows
 }
 
 func (v *NetworkPolicyGraph) openKindsDialog() {
@@ -1914,6 +2032,14 @@ func (v *NetworkPolicyGraph) focusDirectionCmd(direction netpol.Direction) func(
 // remains directly available from a direction panel on "o".
 func (v *NetworkPolicyGraph) enterCmd(evt *tcell.EventKey) *tcell.EventKey {
 	switch v.focusTarget {
+	case focusSubject:
+		// The view opens here, so Enter has to lead somewhere rather than
+		// being the one key that does nothing on the default focus.
+		if !v.state[v.focus].visible {
+			return evt
+		}
+		v.focusDirection(v.focus)
+		return nil
 	case focusIngress, focusEgress:
 		return v.focusDetailPane(evt)
 	case focusApplicability:
@@ -1959,12 +2085,12 @@ func (v *NetworkPolicyGraph) openPrimitiveCmd(evt *tcell.EventKey) *tcell.EventK
 // selection because the effective pane also renders an applicability table, and
 // it never swallows the key without moving focus or explaining why.
 func (v *NetworkPolicyGraph) focusDetailPane(evt *tcell.EventKey) *tcell.EventKey {
-	targets := v.focusTargets()
-	if slices.Contains(targets, focusApplicability) {
+	details, applicability := v.detailStops(v.focus)
+	if applicability {
 		v.applyFocusTarget(focusApplicability)
 		return nil
 	}
-	if slices.Contains(targets, focusDetails) {
+	if details {
 		v.applyFocusTarget(focusDetails)
 		return nil
 	}

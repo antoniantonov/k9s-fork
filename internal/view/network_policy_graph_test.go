@@ -352,6 +352,14 @@ func TestNetworkPolicyGraphKeyboardModesFocusAndNavigation(t *testing.T) {
 	assert.Equal(t, focusDetails, view.focusTarget)
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyBacktab, 0, tcell.ModShift)))
 	assert.Equal(t, focusEgress, view.focusTarget)
+	// Walking back out of egress lands on the ingress detail stops, not on the
+	// ingress panel: each direction owns the stops that follow it.
+	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyBacktab, 0, tcell.ModShift)))
+	assert.Equal(t, focusApplicability, view.focusTarget)
+	assert.Equal(t, netpol.Ingress, view.focus)
+	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyBacktab, 0, tcell.ModShift)))
+	assert.Equal(t, focusDetails, view.focusTarget)
+	assert.Equal(t, netpol.Ingress, view.focus)
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyBacktab, 0, tcell.ModShift)))
 	assert.Equal(t, focusIngress, view.focusTarget)
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyBacktab, 0, tcell.ModShift)))
@@ -392,6 +400,8 @@ func TestNetworkPolicyGraphSwitchModeIsGlobal(t *testing.T) {
 func TestNetworkPolicyGraphOpenRuleKeys(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
+	// The view opens on the subject panel; Open Rule belongs to a direction.
+	view.focusDirection(netpol.Ingress)
 	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
 
 	open, ok := view.actions.Get(ui.KeyO)
@@ -472,7 +482,9 @@ func TestNetworkPolicyGraphEffectiveDetailsAreFocusable(t *testing.T) {
 	view.panels[netpol.Ingress].ClearSelection()
 	view.updateDetails(netpol.Ingress)
 
-	assert.Contains(t, view.focusTargets(), focusDetails)
+	details, applicability := view.detailStops(netpol.Ingress)
+	assert.True(t, details)
+	assert.True(t, applicability)
 }
 
 // The per-state breakdown must account for every row, including Unknown,
@@ -630,17 +642,151 @@ func TestNetworkPolicyGraphClearedSelectionFocusCycleIncludesApplicability(t *te
 	view.panels[netpol.Ingress].ClearSelection()
 	view.updateDetails(netpol.Ingress)
 
-	targets := view.focusTargets()
-	assert.Contains(t, targets, focusDetails)
-	assert.Contains(t, targets, focusApplicability)
+	details, applicability := view.detailStops(netpol.Ingress)
+	assert.True(t, details)
+	assert.True(t, applicability)
 
-	view.focusTarget = focusIngress
-	view.cycleFocus(false)
-	assert.Equal(t, focusEgress, view.focusTarget)
+	// The ingress detail stops sit directly behind the ingress panel, so the
+	// effective applicability is reachable without passing through egress.
+	view.focusDirection(netpol.Ingress)
 	view.cycleFocus(false)
 	assert.Equal(t, focusDetails, view.focusTarget)
+	assert.Equal(t, netpol.Ingress, view.focus)
 	view.cycleFocus(false)
 	assert.Equal(t, focusApplicability, view.focusTarget)
+	assert.Equal(t, netpol.Ingress, view.focus)
+	view.cycleFocus(false)
+	assert.Equal(t, focusEgress, view.focusTarget)
+}
+
+// The Tab ring pairs each direction with its own detail stops, so the ingress
+// applicability is reachable without walking through the egress panel.
+func TestNetworkPolicyGraphFocusRingOrder(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+
+	want := []focusStop{
+		{target: focusSubject},
+		{target: focusIngress, direction: netpol.Ingress},
+		{target: focusDetails, direction: netpol.Ingress},
+		{target: focusApplicability, direction: netpol.Ingress},
+		{target: focusEgress, direction: netpol.Egress},
+		{target: focusDetails, direction: netpol.Egress},
+		{target: focusApplicability, direction: netpol.Egress},
+	}
+	assert.Equal(t, want, view.focusStops())
+
+	// Forward from the subject walks the whole ring and wraps back to it.
+	view.applyFocusTarget(focusSubject)
+	for _, stop := range append(want[1:], want[0]) {
+		view.cycleFocus(false)
+		assert.Equal(t, stop.target, view.focusTarget, "forward ring target")
+		if stop.target != focusSubject {
+			assert.Equal(t, stop.direction, view.focus, "forward ring direction")
+			assert.Equal(t, stop.direction, view.detailShown.direction, "forward ring pane")
+		}
+	}
+
+	// And the same stops in reverse. Starting from ingress makes the first step
+	// cross into the egress detail stops, which has to rebuild the pane.
+	view.focusDirection(netpol.Ingress)
+	view.applyFocusTarget(focusSubject)
+	require.Equal(t, netpol.Ingress, view.focus)
+	reverse := []focusStop{want[6], want[5], want[4], want[3], want[2], want[1], want[0]}
+	for _, stop := range reverse {
+		view.cycleFocus(true)
+		assert.Equal(t, stop.target, view.focusTarget, "reverse ring target")
+		if stop.target != focusSubject {
+			assert.Equal(t, stop.direction, view.focus, "reverse ring direction")
+			assert.Equal(t, stop.direction, view.detailShown.direction, "reverse ring pane")
+		}
+	}
+}
+
+// Crossing into the other direction's detail stops must rebuild the pane, or
+// focus would land on a table still showing the direction we came from.
+func TestNetworkPolicyGraphFocusRingRebuildsPaneAcrossDirections(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+
+	// Shift-Tab off the egress panel lands on the ingress applicability.
+	view.focusDirection(netpol.Egress)
+	require.Equal(t, netpol.Egress, view.detailShown.direction)
+	view.cycleFocus(true)
+
+	assert.Equal(t, focusApplicability, view.focusTarget)
+	assert.Equal(t, netpol.Ingress, view.focus)
+	assert.Equal(t, netpol.Ingress, view.detailShown.direction,
+		"the pane must render the direction the stop belongs to")
+	detail, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	assert.Contains(t, detail.Applicability.GetTitle(), "(Ingress)")
+}
+
+// A hidden direction drops its panel and its detail stops together.
+func TestNetworkPolicyGraphFocusRingSkipsHiddenDirection(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.toggleDirection(netpol.Ingress)
+	require.False(t, view.state[netpol.Ingress].visible)
+
+	for _, stop := range view.focusStops() {
+		assert.NotEqual(t, focusIngress, stop.target)
+		if stop.target != focusSubject {
+			assert.Equal(t, netpol.Egress, stop.direction, "no ingress stop may survive")
+		}
+	}
+
+	view.applyFocusTarget(focusSubject)
+	view.cycleFocus(false)
+	assert.Equal(t, focusEgress, view.focusTarget)
+}
+
+// Primitives mode renders a plain detail pane, so the direction contributes a
+// details stop but no applicability stop.
+func TestNetworkPolicyGraphFocusRingOmitsApplicabilityInPrimitivesMode(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
+
+	details, applicability := view.detailStops(netpol.Ingress)
+	assert.True(t, details)
+	assert.False(t, applicability)
+
+	for _, stop := range view.focusStops() {
+		assert.NotEqual(t, focusApplicability, stop.target)
+	}
+}
+
+// The view opens on the subject panel, which is where the ring starts.
+func TestNetworkPolicyGraphOpensFocusedOnSubject(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	assert.Equal(t, focusSubject, view.focusTarget)
+
+	view.applyResult(testSubjectResult())
+	assert.Equal(t, focusSubject, view.focusTarget, "loading a result must not steal focus")
+
+	view.cycleFocus(false)
+	assert.Equal(t, focusIngress, view.focusTarget)
+}
+
+// With both directions hidden only the subject remains, and Tab must still be
+// able to reach it from the placeholder rather than dead-ending.
+func TestNetworkPolicyGraphFocusRingWithBothDirectionsHidden(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.toggleDirection(netpol.Ingress)
+	view.toggleDirection(netpol.Egress)
+	require.NotNil(t, view.placeholder)
+
+	assert.Equal(t, []focusStop{{target: focusSubject}}, view.focusStops())
+
+	view.cycleFocus(false)
+	assert.Equal(t, focusSubject, view.focusTarget)
+	view.cycleFocus(true)
+	assert.Equal(t, focusSubject, view.focusTarget)
 }
 
 func TestNetworkPolicyGraphEscapeWhenBothDirectionsHiddenFallsThrough(t *testing.T) {
@@ -676,6 +822,7 @@ func TestNetworkPolicyGraphClearedSelectionRecoversOnNavigation(t *testing.T) {
 func TestNetworkPolicyGraphOpenRuleTargets(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
+	view.focusDirection(netpol.Ingress)
 
 	namespace, name, ok := view.openRuleTarget()
 	require.True(t, ok)
@@ -1024,6 +1171,7 @@ func TestNetworkPolicyGraphErrorWithoutResult(t *testing.T) {
 func TestNetworkPolicyGraphEnterFocusesApplicability(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(multiPrimitiveSubjectResult())
+	view.focusDirection(netpol.Ingress)
 	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
 	require.Equal(t, focusIngress, view.focusTarget)
 
@@ -1098,6 +1246,7 @@ func TestNetworkPolicyGraphEnterFallsBackWhenApplicabilityIsEmpty(t *testing.T) 
 func TestNetworkPolicyGraphEnterOpensHighlightedPrimitive(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
+	view.focusDirection(netpol.Ingress)
 	require.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
 	require.Equal(t, focusApplicability, view.focusTarget)
 
@@ -1133,6 +1282,7 @@ func TestNetworkPolicyGraphEnterReportsCIDRApplicabilityRow(t *testing.T) {
 		}},
 	}
 	view.applyResult(result)
+	view.focusDirection(netpol.Ingress)
 
 	require.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
 	require.Equal(t, focusApplicability, view.focusTarget)
@@ -1267,6 +1417,7 @@ func TestNetworkPolicyGraphCollapsesRepeatedRefreshes(t *testing.T) {
 func TestNetworkPolicyGraphFocusFallsBackWhenTheTableDisappears(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
+	view.focusDirection(netpol.Ingress)
 	require.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
 	require.Equal(t, focusApplicability, view.focusTarget)
 
@@ -1361,6 +1512,117 @@ func TestNetworkPolicyGraphHiddenDirectionsKeepFocusAttached(t *testing.T) {
 	view.toggleDirection(netpol.Ingress)
 	require.Nil(t, view.placeholder)
 	assert.Equal(t, tview.Primitive(view.panels[netpol.Ingress]), view.app.GetFocus())
+}
+
+// Re-focusing the graph -- what PageStack.StackTop does after a pushed view is
+// popped -- must land on the pane focusTarget names. tview.Flex would otherwise
+// always delegate to the item flagged at AddItem time, so the user would come
+// back to a highlighted subject panel while "o" and "y" still acted on the
+// direction panel they left.
+func TestNetworkPolicyGraphRefocusHonorsFocusTarget(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.app = NewApp(config.NewConfig(nil))
+	view.applyResult(testSubjectResult())
+
+	uu := map[string]struct {
+		focus func()
+		want  func() tview.Primitive
+	}{
+		"subject": {
+			focus: func() { view.applyFocusTarget(focusSubject) },
+			// SubjectInfo is a Flex, so tview descends into its workload table.
+			want: func() tview.Primitive { return view.subjectInfo.Table },
+		},
+		"ingress": {
+			focus: func() { view.focusDirection(netpol.Ingress) },
+			want:  func() tview.Primitive { return view.panels[netpol.Ingress] },
+		},
+		"egress": {
+			focus: func() { view.focusDirection(netpol.Egress) },
+			want:  func() tview.Primitive { return view.panels[netpol.Egress] },
+		},
+		"details": {
+			focus: func() {
+				view.focusDirection(netpol.Ingress)
+				view.applyFocusTarget(focusDetails)
+			},
+			want: func() tview.Primitive { return view.detailItem.(*ui.RuleDetails).Text },
+		},
+		"applicability": {
+			focus: func() {
+				view.focusDirection(netpol.Ingress)
+				view.applyFocusTarget(focusApplicability)
+			},
+			want: func() tview.Primitive { return view.detailItem.(*ui.RuleDetails).Applicability },
+		},
+	}
+	for name, u := range uu {
+		t.Run(name, func(t *testing.T) {
+			u.focus()
+			want := u.want()
+			require.Equal(t, want, view.app.GetFocus(), "precondition: focus lands on the target")
+
+			// Focus something else, then re-focus the view the way the page
+			// stack does when the pushed view is popped.
+			view.app.SetFocus(tview.NewBox())
+			view.app.SetFocus(view)
+
+			assert.Equal(t, want, view.app.GetFocus())
+		})
+	}
+}
+
+// With both directions hidden the panels leave the widget tree, so a re-focus
+// has to land on the placeholder rather than a detached panel.
+func TestNetworkPolicyGraphRefocusWithBothDirectionsHidden(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.app = NewApp(config.NewConfig(nil))
+	view.applyResult(testSubjectResult())
+	view.toggleDirection(netpol.Ingress)
+	view.toggleDirection(netpol.Egress)
+	require.NotNil(t, view.placeholder)
+
+	view.app.SetFocus(tview.NewBox())
+	view.app.SetFocus(view)
+
+	assert.Equal(t, tview.Primitive(view.placeholder), view.app.GetFocus())
+}
+
+// Enter is the first key a user is likely to press on the default focus, so it
+// has to lead into the graph instead of doing nothing.
+func TestNetworkPolicyGraphEnterFromSubjectFocusesDirection(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	require.Equal(t, focusSubject, view.focusTarget)
+
+	assert.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
+	assert.Equal(t, focusIngress, view.focusTarget)
+	assert.Equal(t, netpol.Ingress, view.focus)
+}
+
+// Focus parked on a pane that left the ring must not make Shift-Tab leap across
+// the whole ring to its far end.
+func TestNetworkPolicyGraphCycleFocusFromAStopThatVanished(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	stops := view.focusStops()
+	require.Len(t, stops, 7)
+
+	// Primitives mode drops every applicability stop, stranding focusTarget.
+	view.focusDirection(netpol.Ingress)
+	view.applyFocusTarget(focusApplicability)
+	view.switchMode()
+	view.focusTarget = focusApplicability
+	require.Equal(t, -1, view.currentStopIndex(view.focusStops()))
+
+	view.cycleFocus(true)
+	assert.Equal(t, focusDetails, view.focusTarget, "reverse enters at the last stop")
+	assert.Equal(t, netpol.Egress, view.focus)
+
+	view.focusTarget = focusApplicability
+	view.focus = netpol.Ingress
+	view.cycleFocus(false)
+	assert.Equal(t, focusSubject, view.focusTarget, "forward enters at the first stop")
 }
 
 func TestSolveSectionHeights(t *testing.T) {
@@ -1741,6 +2003,7 @@ func TestNetworkPolicyGraphEnterOpensSelectedPrimitive(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
 	view.switchMode()
+	view.focusDirection(netpol.Ingress)
 	require.Equal(t, ui.PrimitivesProjection, view.mode)
 	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
 
@@ -1780,6 +2043,7 @@ func TestNetworkPolicyGraphEnterReportsCIDRPrimitive(t *testing.T) {
 	}
 	view.applyResult(result)
 	view.switchMode()
+	view.focusDirection(netpol.Ingress)
 	require.Equal(t, ui.PrimitivesProjection, view.mode)
 	require.NotEmpty(t, view.panels[netpol.Ingress].SelectedID())
 

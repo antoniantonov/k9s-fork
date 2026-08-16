@@ -552,7 +552,7 @@ Per-direction filters, selection, and scroll position remain independent.
 | `PageUp` / `PageDown` | Move selection by one page |
 | `Home` / `End` | Select the first/last item |
 | `Left` / `Right` | Focus ingress/egress (falls through to the details pane once it has focus) |
-| `Tab` / `Shift-Tab` | Cycle subject, directions, details, and applicability |
+| `Tab` / `Shift-Tab` | Cycle subject, then each direction with its own details and applicability |
 | `Enter` | Step into the details pane; press again to open the highlighted primitive |
 | `o` | Open the selected resource |
 | `y` | Open YAML for selected policy evidence |
