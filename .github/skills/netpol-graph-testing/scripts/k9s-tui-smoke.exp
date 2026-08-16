@@ -171,7 +171,7 @@ spawn {*}$docker_args
 stty rows 50 columns 200 < $spawn_out(slave,name)
 
 start_case "launch-npg-view"
-if {[assert_all_screen {Subject {Deployment netpol-demo-app/api} {3 pods} {Ingress on} {Egress on} {Kinds: CIDR,Pod,Namespace,Deployment,Job} {Auto-refresh off} {Ingress · Rules} {Egress · Rules} {Rule Details} Applicability {<ctrl-r>} {Refresh} {</>} Search {<npg>}} 45]} {
+if {[assert_all_screen {Subject {Deployment netpol-demo-app/api} {3 pods} {Ingress on} {Egress on} {Kinds: CIDR,Pod,Namespace,Deployment,Job} {Auto-refresh off} {Ingress · Rules} {Egress · Rules} {Rule Details} {Applicability \(Ingress\)} {<ctrl-r>} {Refresh} {</>} Search {<npg>}} 45]} {
 pass_case
 }
 
@@ -247,7 +247,7 @@ if {[assert_screen {Reachability Search|Filter:} 10]} {
 start_case "tab-and-shift-tab-focus-ring"
 for {set i 0} {$i < 6} {incr i} { send_key "\t" 150 }
 for {set i 0} {$i < 6} {incr i} { send_key "\033\[Z" 150 }
-assert_all_screen {Subject Ingress Egress {Rule Details} Applicability} 10
+assert_all_screen {Subject Ingress Egress {Rule Details} {Applicability \(Ingress\)}} 10
 pass_case
 
 start_case "left-right-direction-focus"
@@ -264,7 +264,7 @@ ensure_rules
 # From a direction panel in Rules mode, Enter focuses Applicability.
 send_key "\033\[D"
 send_key "\r"
-assert_all_screen {Applicability Primitive Peer Opposite State Ports} 15
+assert_all_screen {{Applicability \(Ingress\)} Primitive Peer Opposite State Ports} 15
 pass_case
 
 start_case "enter-navigation-effective-applicability"
@@ -273,9 +273,9 @@ ensure_rules
 # effective applicability table.
 send_key "\033"
 assert_screen {Effective Details|Selection: none} 15
-assert_screen {Effective Applicability} 15
+assert_screen {Effective Applicability \(Ingress\)} 15
 send_key "\r"
-assert_all_screen {{Effective Applicability} Primitive Peer Opposite State Ports} 15
+assert_all_screen {{Effective Applicability \(Ingress\)} Primitive Peer Opposite State Ports} 15
 pass_case
 
 start_case "enter-navigation-primitive-details"
@@ -294,9 +294,9 @@ ensure_rules
 # Go back to Rules, focus Applicability, move off the first CIDR row so Enter
 # opens a Kubernetes resource instead of the CIDR flash path, then Esc returns.
 assert_screen {Ingress · Rules} 15
-assert_screen {Applicability} 15
+assert_screen {Applicability \(Ingress\)} 15
 send_key "\r"
-assert_screen {Applicability} 15
+assert_screen {Applicability \(Ingress\)} 15
 assert_screen {CIDR 192\.168\.0\.0/16} 15
 send_key "\033\[B"
 send_key "\r"
@@ -377,7 +377,7 @@ if {[wait_stream {Auto-refresh is disabled|Auto-refresh off|Auto-refresh} 10]} {
 start_case "escape-clears-selection-before-back"
 ensure_rules
 send_key "\033"
-assert_screen {Effective Details.*Effective Applicability|Selection: none} 15
+assert_screen {Effective Details.*Effective Applicability \(Ingress\)|Selection: none} 15
 pass_case
 
 start_case "freeze-hang-stress"

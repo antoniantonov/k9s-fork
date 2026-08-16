@@ -1033,6 +1033,9 @@ func TestNetworkPolicyGraphEnterFocusesApplicability(t *testing.T) {
 
 	assert.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
 	assert.Equal(t, focusApplicability, view.focusTarget)
+	// Focus has left the direction panel, so the title is all that says which
+	// rule the table explains.
+	assert.Equal(t, " Applicability (Ingress) ", details.Applicability.GetTitle())
 }
 
 // With nothing selected the detail pane renders the direction's effective
@@ -1048,6 +1051,16 @@ func TestNetworkPolicyGraphEnterFocusesEffectiveApplicabilityWithoutSelection(t 
 	view.focusTarget = focusIngress
 	assert.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
 	assert.Equal(t, focusApplicability, view.focusTarget)
+
+	details, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	assert.Equal(t, " Effective Applicability (Ingress) ", details.Applicability.GetTitle())
+
+	view.panels[netpol.Egress].ClearSelection()
+	view.updateDetails(netpol.Egress)
+	details, ok = view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	assert.Equal(t, " Effective Applicability (Egress) ", details.Applicability.GetTitle())
 }
 
 // Primitives mode renders a plain text pane, so Enter falls back to it rather

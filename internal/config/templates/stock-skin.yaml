@@ -104,6 +104,8 @@ k9s:
       allowedColor: green
       disallowedColor: red
       partialDataColor: orange
+      partialColor: yellow
+      unknownColor: white
       focusColor: orange
     logs:
       fgColor: lightskyblue

@@ -31,7 +31,7 @@ Automated cases are in `scripts/k9s-tui-smoke.exp`; setup/build phases are in `s
 | Primitive kind | CIDR, Pod, Namespace, Deployment, Job | Demo topology + `primitive-kinds-apply-cancel-zero`; resource opening covered for selected primitive, exhaustive kind-by-kind opening manual-only |
 | Projection | Rules, Primitives | `rules-primitives-global-toggle`, Enter/open cases |
 | Direction | Ingress, Egress | Launch, direction toggle/focus, shared mode cases |
-| Access state | Allowed, Disallowed, Partial, Unknown, Partial-data, `[EMPTY]` | Demo topology covers Allowed/Disallowed/Partial/Unknown/`[EMPTY]`; Partial-data requires induced informer/API warning and is manual-only |
-| Details target | Rule Details text, Applicability table, Effective Details, Effective Applicability, Primitive Details text | Enter navigation and Esc cases |
+| Access state | Allowed, Disallowed, Partial, Unknown, Partial-data, rule-only `[EMPTY]` | Demo topology covers Allowed/Disallowed/Partial/Unknown, including zero-pod-pair primitives as `Unknown`; rule-level `[EMPTY]` remains for empty subject-policy matches; Partial-data requires induced informer/API warning and is manual-only |
+| Details target | Rule Details text, Applicability table with direction title, Effective Details, Effective Applicability with direction title, Primitive Details text | Enter navigation and Esc cases |
 | Dialogs | Subject picker, Primitive Kinds, Search | Dedicated dialog cases |
 | Resource opening | NetworkPolicy, Pod, Namespace, Deployment, Job, CIDR warning | `o`/Enter cases cover selected rows; exhaustive primitive-kind row selection manual-only |

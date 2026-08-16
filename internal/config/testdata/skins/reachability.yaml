@@ -4,4 +4,6 @@ k9s:
       allowedColor: "#006b3c"
       disallowedColor: "#a51c30"
       partialDataColor: "#9c5700"
+      partialColor: "#b58900"
+      unknownColor: "#f5f5f5"
       focusColor: "#c05621"

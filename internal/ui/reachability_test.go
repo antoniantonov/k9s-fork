@@ -79,9 +79,12 @@ func TestDirectionPanelAccessLabelsAndColors(t *testing.T) {
 		"a partial result is neither an allow nor a deny")
 	assert.True(t, panel.GetCell(3, 0).Transparent)
 	assert.Equal(t, "Unknown", panel.GetCell(6, 0).Text)
-	assert.Equal(t, reachabilityPartialStateColor, panel.GetCell(6, 0).Color)
-	assert.Equal(t, "[EMPTY]", panel.GetCell(9, 0).Text)
-	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(9, 0).Color)
+	assert.Equal(t, reachabilityUnknownStateColor, panel.GetCell(6, 0).Color,
+		"an unevaluable result is neither a partial allow nor a deny")
+	// A peer with no concrete pod pairs could not be evaluated at all, so it
+	// reads Unknown here exactly as it does in the applicability tables.
+	assert.Equal(t, "Unknown", panel.GetCell(9, 0).Text)
+	assert.Equal(t, reachabilityUnknownStateColor, panel.GetCell(9, 0).Color)
 	assert.Equal(t, "Partial Data", panel.GetCell(12, 0).Text)
 	assert.Equal(t, reachabilityPartialColor, panel.GetCell(12, 0).Color)
 	assert.True(t, panel.GetCell(12, 0).Transparent)
@@ -90,14 +93,44 @@ func TestDirectionPanelAccessLabelsAndColors(t *testing.T) {
 		AllowedColor:     config.Color("green"),
 		DisallowedColor:  config.Color("red"),
 		PartialDataColor: config.Color("orange"),
+		PartialColor:     config.Color("yellow"),
+		UnknownColor:     config.Color("white"),
 		FocusColor:       config.Color("orange"),
 	}
 	panel.SetReachabilityStyle(style)
 	assert.Equal(t, style.AllowedColor.Color(), panel.GetCell(0, 0).Color)
-	assert.Equal(t, style.DisallowedColor.Color(), panel.GetCell(9, 0).Color)
 	assert.Equal(t, style.PartialDataColor.Color(), panel.GetCell(12, 0).Color)
-	assert.Equal(t, reachabilityPartialStateColor, panel.GetCell(3, 0).Color,
-		"the partial color has no skin key and survives a style change")
+	assert.Equal(t, style.PartialColor.Color(), panel.GetCell(3, 0).Color)
+	assert.Equal(t, style.UnknownColor.Color(), panel.GetCell(9, 0).Color)
+}
+
+// A denied peer keeps the disallowed color: only the unevaluable zero-pair case
+// moved to Unknown.
+func TestDirectionPanelDisallowedPrimitiveStaysDisallowed(t *testing.T) {
+	panel := NewDirectionPanel(netpol.Ingress)
+	panel.SetProjection(PrimitivesProjection).SetPrimitives([]netpol.PrimitiveResult{{
+		Ref:        netpol.PrimitiveRef{Kind: netpol.PrimitiveCIDR, CIDR: "10.0.0.0/8"},
+		State:      netpol.AccessDisallowed,
+		TotalPairs: 3,
+	}})
+
+	assert.Equal(t, "Disallowed", panel.GetCell(0, 0).Text)
+	assert.Equal(t, reachabilityDisallowedColor, panel.GetCell(0, 0).Color)
+
+	panel.SetReachabilityStyle(config.Reachability{DisallowedColor: config.Color("maroon")})
+	assert.Equal(t, config.Color("maroon").Color(), panel.GetCell(0, 0).Color)
+}
+
+// The stock skin carries the partial and unknown colors, so the whole
+// skin-to-panel chain must land on yellow and white without any local default.
+func TestDirectionPanelStockSkinColorsPartialAndUnknown(t *testing.T) {
+	panel := NewDirectionPanelWithStyle(netpol.Ingress, config.NewStyles())
+	panel.SetProjection(PrimitivesProjection).SetPrimitives(testPrimitives())
+
+	assert.Equal(t, "[PARTIAL 1/2]", panel.GetCell(3, 0).Text)
+	assert.Equal(t, config.Color("yellow").Color(), panel.GetCell(3, 0).Color)
+	assert.Equal(t, "Unknown", panel.GetCell(6, 0).Text)
+	assert.Equal(t, config.Color("white").Color(), panel.GetCell(6, 0).Color)
 }
 
 func TestDirectionPanelNavigationSkipsSeparators(t *testing.T) {
@@ -353,7 +386,9 @@ func TestDirectionPanelSelectionCallbackAndStyleKeepsResultAsTextColor(t *testin
 func TestDirectionPanelSelectionStyleUsesTableCursorColors(t *testing.T) {
 	styles := config.NewStyles()
 	styles.K9s.Views.Table.CursorFgColor = config.Color("blue")
-	styles.K9s.Views.Table.CursorBgColor = config.Color("yellow")
+	// Deliberately not a reachability state color: the assertion below checks
+	// that a row keeps its own state color, which a collision would mask.
+	styles.K9s.Views.Table.CursorBgColor = config.Color("aqua")
 	panel := NewDirectionPanelWithStyle(netpol.Ingress, styles)
 	panel.SetProjection(PrimitivesProjection).SetPrimitives(testPrimitives())
 	panel.SelectID(testPrimitives()[1].StableID())
@@ -451,7 +486,7 @@ func TestNewEffectiveDetailsWithStyle(t *testing.T) {
 		},
 	}
 
-	details := NewEffectiveDetailsWithStyle("effective body", rows, config.Reachability{
+	details := NewEffectiveDetailsWithStyle("effective body", rows, netpol.Egress, config.Reachability{
 		AllowedColor:     config.Color("green"),
 		DisallowedColor:  config.Color("red"),
 		PartialDataColor: config.Color("orange"),
@@ -459,8 +494,79 @@ func TestNewEffectiveDetailsWithStyle(t *testing.T) {
 
 	assert.Equal(t, "effective body", details.Text.GetText(true))
 	assert.Equal(t, " Effective Details ", details.Text.GetTitle())
-	assert.Equal(t, " Effective Applicability ", details.Applicability.GetTitle())
+	// Enter moves focus off the direction panel, so the title has to say which
+	// direction the table explains.
+	assert.Equal(t, " Effective Applicability (Egress) ", details.Applicability.GetTitle())
 	assert.Equal(t, len(rows)+1, details.Applicability.GetRowCount())
+	assert.Equal(t, reachabilityPartialStateColor, details.Applicability.GetCell(2, 3).Color,
+		"a partial row falls back to yellow when the skin leaves the color unset")
+}
+
+// The applicability tables paint Partial yellow and Unknown white so neither is
+// mistaken for a clean allow or a clean deny.
+func TestApplicabilityTableColorsPartialAndUnknown(t *testing.T) {
+	primitives := testPrimitives()
+	rows := []netpol.ApplicabilityRow{
+		{Primitive: primitives[0], EffectiveState: netpol.AccessAllowed},
+		{Primitive: primitives[1], EffectiveState: netpol.AccessPartial},
+		{Primitive: primitives[2], EffectiveState: netpol.AccessUnknown},
+		{Primitive: primitives[3], EffectiveState: netpol.AccessDisallowed},
+	}
+
+	table := NewApplicabilityTableWithStyle(rows, config.Reachability{
+		AllowedColor:     config.Color("green"),
+		DisallowedColor:  config.Color("red"),
+		PartialDataColor: config.Color("orange"),
+		PartialColor:     config.Color("yellow"),
+		UnknownColor:     config.Color("white"),
+	})
+
+	assert.Equal(t, config.Color("green").Color(), table.GetCell(1, 3).Color)
+	assert.Equal(t, config.Color("yellow").Color(), table.GetCell(2, 3).Color)
+	assert.Equal(t, config.Color("white").Color(), table.GetCell(3, 3).Color)
+	assert.Equal(t, config.Color("red").Color(), table.GetCell(4, 3).Color)
+}
+
+// A peer with no concrete pod pairs was never evaluated, so the columns that
+// would otherwise read a definite "false" must not claim one.
+func TestApplicabilityTableReportsUnevaluatedColumnsAsNotApplicable(t *testing.T) {
+	primitives := testPrimitives()
+	rows := []netpol.ApplicabilityRow{
+		{
+			Primitive:      primitives[0],
+			PeerMatches:    true,
+			EffectiveState: netpol.AccessAllowed,
+			Permissions:    primitives[0].Permissions,
+		},
+		{
+			// primitives[3] is a CIDR peer with TotalPairs == 0.
+			Primitive:      primitives[3],
+			EffectiveState: netpol.AccessUnknown,
+		},
+	}
+
+	table := NewApplicabilityTable(rows)
+
+	require.Equal(t, len(rows)+1, table.GetRowCount())
+	assert.Equal(t, "true", table.GetCell(1, 1).Text, "an evaluated row still reports its peer match")
+	assert.Equal(t, "TCP/all", table.GetCell(1, 4).Text)
+
+	assert.Equal(t, "Unknown", table.GetCell(2, 3).Text)
+	for column, header := range map[int]string{1: "Peer", 2: "Opposite", 4: "Ports"} {
+		assert.Equal(t, "n/a", table.GetCell(2, column).Text,
+			"%s must not report a negative that was never evaluated", header)
+	}
+}
+
+// The rule applicability title names the rule's own direction.
+func TestRuleDetailsApplicabilityTitleCarriesDirection(t *testing.T) {
+	rule := testRules()[0]
+	rule.ID.Direction = netpol.Ingress
+	assert.Equal(t, " Applicability (Ingress) ", NewRuleDetails(rule, nil).Applicability.GetTitle())
+
+	rule.ID.Direction = netpol.Egress
+	assert.Equal(t, " Applicability (Egress) ",
+		NewRuleDetailsWithStyle(rule, nil, config.Reachability{}).Applicability.GetTitle())
 }
 
 func TestPrimitiveDetailsUsesNormalizedState(t *testing.T) {
@@ -472,7 +578,7 @@ func TestPrimitiveDetailsUsesNormalizedState(t *testing.T) {
 	primitive.Warnings = nil
 	primitive.AllowedPairs = 0
 	primitive.TotalPairs = 0
-	assert.Contains(t, PrimitiveDetailsText(primitive), "State: [EMPTY]")
+	assert.Contains(t, PrimitiveDetailsText(primitive), "State: Unknown")
 }
 
 func TestPartialAndEmptyLabelsAreSearchableAndPartialColored(t *testing.T) {
@@ -762,8 +868,29 @@ func TestHighlightRuleStateEscapesBodyAndPaintsOnlyPartialStates(t *testing.T) {
 	assert.NotContains(t, HighlightRuleState(body, denied), "[yellow::b]")
 	warned := &netpol.RuleResult{SubjectPodCount: 2, SubjectMatchCount: 2, Warnings: []string{"x"}}
 	assert.NotContains(t, HighlightRuleState(body, warned), "[yellow::b]")
-
 	assert.Equal(t, tview.Escape(body), HighlightRuleState(body, nil))
+}
+
+// The detail pane and the direction panel must agree on what a partial rule
+// looks like, so the State line follows the skin's partial color rather than
+// the built-in yellow.
+func TestHighlightRuleStateWithStyleUsesSkinPartialColor(t *testing.T) {
+	body := "Rule index: 0\nState: Partial ([PARTIAL 1/2])\nPeers:"
+	partial := &netpol.RuleResult{SubjectPodCount: 2, SubjectMatchCount: 1}
+
+	// A skin color resolves to a true color, which has no tcell name, so the
+	// tag carries its hex form. tview accepts either.
+	painted := HighlightRuleStateWithStyle(body, partial, config.Reachability{PartialColor: config.Color("fuchsia")})
+	assert.Contains(t, painted, "[#ff00ff::b]State: Partial (")
+	assert.NotContains(t, painted, "[yellow::b]")
+
+	// An unset skin key still falls back to the built-in partial color.
+	assert.Contains(t, HighlightRuleStateWithStyle(body, partial, config.Reachability{}), "[yellow::b]State: Partial (")
+
+	allowed := &netpol.RuleResult{SubjectPodCount: 2, SubjectMatchCount: 2}
+	assert.Equal(t, tview.Escape(body),
+		HighlightRuleStateWithStyle(body, allowed, config.Reachability{PartialColor: config.Color("fuchsia")}),
+		"an allowed rule is left alone whatever the skin says")
 }
 
 // A painted body must still read back as the original text.

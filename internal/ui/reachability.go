@@ -22,9 +22,16 @@ const (
 	// reachabilityPartialStateColor marks a result that is neither a clean
 	// allow nor a clean deny, so it stands apart from both.
 	reachabilityPartialStateColor = tcell.ColorYellow
+	// reachabilityUnknownStateColor marks a result that could not be evaluated
+	// at all, which is neither a denial nor a partial allow.
+	reachabilityUnknownStateColor = tcell.ColorWhite
 	partialDataLabel              = "Partial Data"
 	emptyLabel                    = "[EMPTY]"
 	allowedLabel                  = "Allowed"
+	unknownLabel                  = "Unknown"
+	// notApplicableLabel marks a column that has no answer for a row rather
+	// than a negative one.
+	notApplicableLabel = "n/a"
 	// ruleStateLinePrefix is the rule detail line that explains the state shown
 	// in the direction panels.
 	ruleStateLinePrefix = "State:"
@@ -76,6 +83,7 @@ type reachabilityColors struct {
 	disallowed  tcell.Color
 	partialData tcell.Color
 	partial     tcell.Color
+	unknown     tcell.Color
 	neutral     tcell.Color
 }
 
@@ -142,15 +150,14 @@ func (p *DirectionPanel) SetStyles(styles *config.Styles) *DirectionPanel {
 }
 
 // SetReachabilityStyle applies the configured reachability result colors.
+//
+//nolint:gocritic // Value parameter preserves the public API.
 func (p *DirectionPanel) SetReachabilityStyle(style config.Reachability) *DirectionPanel {
-	p.colors = reachabilityColors{
-		allowed:     style.AllowedColor.Color(),
-		disallowed:  style.DisallowedColor.Color(),
-		partialData: style.PartialDataColor.Color(),
-		// config.Reachability carries neither of these; preserve them.
-		partial: p.colors.partial,
-		neutral: p.colors.neutral,
-	}
+	colors := reachabilityColorsFromStyle(&style)
+	// config.Reachability does not carry the neutral color used by synthetic
+	// rows; it follows the body foreground, so preserve it.
+	colors.neutral = p.colors.neutral
+	p.colors = colors
 	p.rebuild()
 	return p
 }
@@ -621,8 +628,11 @@ func primitiveState(primitive *netpol.PrimitiveResult) (state netpol.AccessState
 	if primitive.State == netpol.AccessPartialData || len(primitive.Warnings) > 0 {
 		return netpol.AccessPartialData, partialDataLabel
 	}
+	// Without a single concrete pod pair nothing was evaluated, so the peer is
+	// unknown rather than denied. The rule and effective applicability tables
+	// report the same fact the same way.
 	if primitive.TotalPairs == 0 {
-		return netpol.AccessDisallowed, "[EMPTY]"
+		return netpol.AccessUnknown, unknownLabel
 	}
 	if primitive.State == netpol.AccessPartial {
 		return primitive.State, fmt.Sprintf("[PARTIAL %d/%d]", primitive.AllowedPairs, primitive.TotalPairs)
@@ -639,16 +649,21 @@ func reachabilityColor(state netpol.AccessState, label string, colors reachabili
 	}
 	// Neither allowed nor denied: the row is worth a second look, so it gets a
 	// color of its own rather than being lumped in with the denials.
-	if state == netpol.AccessPartial || state == netpol.AccessUnknown {
+	if state == netpol.AccessPartial {
 		return colors.partial
+	}
+	// Nothing could be evaluated, which is not a partial allow either.
+	if state == netpol.AccessUnknown {
+		return colors.unknown
 	}
 	return colors.disallowed
 }
 
-// isPartialState reports whether a state needs explaining rather than simply
-// being allowed or denied.
+// isPartialState reports whether a state is a mix of allow and deny, and so
+// needs the rule detail text to explain it. An unknown state is not a mix: it
+// means nothing could be evaluated, and its own color already says so.
 func isPartialState(state netpol.AccessState) bool {
-	return state == netpol.AccessPartial || state == netpol.AccessUnknown
+	return state == netpol.AccessPartial
 }
 
 func defaultReachabilityColors() reachabilityColors {
@@ -657,8 +672,35 @@ func defaultReachabilityColors() reachabilityColors {
 		disallowed:  reachabilityDisallowedColor,
 		partialData: reachabilityPartialColor,
 		partial:     reachabilityPartialStateColor,
+		unknown:     reachabilityUnknownStateColor,
 		neutral:     tview.Styles.PrimaryTextColor,
 	}
+}
+
+// reachabilityColorsFromStyle resolves the configured result colors, falling
+// back to the built-in defaults for any color a caller left unset: a partially
+// filled config must not paint a state in the terminal default color.
+func reachabilityColorsFromStyle(style *config.Reachability) reachabilityColors {
+	defaults := defaultReachabilityColors()
+	return reachabilityColors{
+		allowed:     orDefaultColor(style.AllowedColor, defaults.allowed),
+		disallowed:  orDefaultColor(style.DisallowedColor, defaults.disallowed),
+		partialData: orDefaultColor(style.PartialDataColor, defaults.partialData),
+		partial:     orDefaultColor(style.PartialColor, defaults.partial),
+		unknown:     orDefaultColor(style.UnknownColor, defaults.unknown),
+		neutral:     defaults.neutral,
+	}
+}
+
+// orDefaultColor falls back when a caller left a color unset. It tests the
+// config value rather than the resolved one on purpose: an explicit "default"
+// resolves to tcell.ColorDefault too, and overriding that would take away the
+// user's way of asking for the terminal foreground.
+func orDefaultColor(color config.Color, fallback tcell.Color) tcell.Color {
+	if color == "" {
+		return fallback
+	}
+	return color.Color()
 }
 
 func formatRuleName(rule *netpol.RuleResult) string {
@@ -840,11 +882,7 @@ func NewRuleDetailsWithStyle(
 	applicability []netpol.ApplicabilityRow,
 	style config.Reachability,
 ) *RuleDetails {
-	return newRuleDetailsWithTitle(&rule, applicability, reachabilityColors{
-		allowed:     style.AllowedColor.Color(),
-		disallowed:  style.DisallowedColor.Color(),
-		partialData: style.PartialDataColor.Color(),
-	}, " Rule Details ")
+	return newRuleDetailsWithTitle(&rule, applicability, reachabilityColorsFromStyle(&style), " Rule Details ")
 }
 
 func newRuleDetails(
@@ -861,7 +899,20 @@ func newRuleDetailsWithTitle(
 	colors reachabilityColors,
 	title string,
 ) *RuleDetails {
-	return newRuleDetailsFromText(RuleDetailsText(*rule), applicability, colors, title, " Applicability ")
+	return newRuleDetailsFromText(
+		RuleDetailsText(*rule),
+		applicability,
+		colors,
+		title,
+		applicabilityTitle("Applicability", rule.ID.Direction),
+	)
+}
+
+// applicabilityTitle names the direction the table explains. Enter moves focus
+// off the rule panel and onto the table, so the title is the only thing left
+// saying which side of the subject is on screen.
+func applicabilityTitle(prefix string, direction netpol.Direction) string {
+	return fmt.Sprintf(" %s (%s) ", prefix, direction)
 }
 
 func newRuleDetailsFromText(
@@ -891,21 +942,39 @@ func newRuleDetailsFromText(
 func NewEffectiveDetailsWithStyle(
 	text string,
 	rows []netpol.ApplicabilityRow,
+	direction netpol.Direction,
 	style config.Reachability,
 ) *RuleDetails {
-	return newRuleDetailsFromText(text, rows, reachabilityColors{
-		allowed:     style.AllowedColor.Color(),
-		disallowed:  style.DisallowedColor.Color(),
-		partialData: style.PartialDataColor.Color(),
-	}, " Effective Details ", " Effective Applicability ")
+	return newRuleDetailsFromText(
+		text,
+		rows,
+		reachabilityColorsFromStyle(&style),
+		" Effective Details ",
+		applicabilityTitle("Effective Applicability", direction),
+	)
 }
 
 // HighlightRuleState prepares body for the rule detail pane, which renders with
 // dynamic colors. Everything is escaped so YAML and selectors containing square
 // brackets survive verbatim, and the "State:" line is painted when the rule is
 // neither cleanly allowed nor cleanly denied -- that line names the state the
-// direction panel colored, so it is where the user looks to find out why.
+// direction panel colored, so it is where the user looks to find out why. The
+// built-in partial color is used; call HighlightRuleStateWithStyle to honor a
+// skin.
 func HighlightRuleState(body string, rule *netpol.RuleResult) string {
+	return highlightRuleState(body, rule, reachabilityPartialStateColor)
+}
+
+// HighlightRuleStateWithStyle paints the "State:" line in the skin's partial
+// color, so the detail pane and the direction panel agree on what a partial
+// rule looks like even under an inverted or custom skin.
+//
+//nolint:gocritic // Value parameter preserves the public API.
+func HighlightRuleStateWithStyle(body string, rule *netpol.RuleResult, style config.Reachability) string {
+	return highlightRuleState(body, rule, reachabilityColorsFromStyle(&style).partial)
+}
+
+func highlightRuleState(body string, rule *netpol.RuleResult, partial tcell.Color) string {
 	escaped := tview.Escape(body)
 	if rule == nil {
 		return escaped
@@ -913,7 +982,7 @@ func HighlightRuleState(body string, rule *netpol.RuleResult) string {
 	if state, _ := ruleState(rule); !isPartialState(state) {
 		return escaped
 	}
-	return paintLine(escaped, ruleStateLinePrefix, reachabilityPartialStateColor)
+	return paintLine(escaped, ruleStateLinePrefix, partial)
 }
 
 // paintLine wraps the first line starting with prefix in a color tag. The tag
@@ -974,12 +1043,10 @@ func NewApplicabilityTable(rows []netpol.ApplicabilityRow) *tview.Table {
 }
 
 // NewApplicabilityTableWithStyle creates an applicability table using configured colors.
+//
+//nolint:gocritic // Value parameter preserves the public API.
 func NewApplicabilityTableWithStyle(rows []netpol.ApplicabilityRow, style config.Reachability) *tview.Table {
-	return newApplicabilityTable(rows, reachabilityColors{
-		allowed:     style.AllowedColor.Color(),
-		disallowed:  style.DisallowedColor.Color(),
-		partialData: style.PartialDataColor.Color(),
-	})
+	return newApplicabilityTable(rows, reachabilityColorsFromStyle(&style))
 }
 
 func newApplicabilityTable(rows []netpol.ApplicabilityRow, colors reachabilityColors) *tview.Table {
@@ -1006,16 +1073,25 @@ func newApplicabilityTableWithTitle(
 	for index := range rows {
 		row := &rows[index]
 		color := reachabilityColor(row.EffectiveState, row.EffectiveState.String(), colors)
+		peer := fmt.Sprintf("%t", row.PeerMatches)
 		opposite := fmt.Sprintf("%t", row.OppositeSideAllows)
+		ports := formatPermissions(row.Permissions)
 		if row.Primitive.Ref.Kind == netpol.PrimitiveCIDR {
-			opposite = "n/a"
+			opposite = notApplicableLabel
+		}
+		// Without a concrete pod pair nothing was evaluated, so these columns
+		// have no answer to give. Printing "false" and "no ports" would assert
+		// negatives that were never tested, which is what made the old
+		// Disallowed label misleading in the first place.
+		if row.Primitive.TotalPairs == 0 {
+			peer, opposite, ports = notApplicableLabel, notApplicableLabel, notApplicableLabel
 		}
 		values := []string{
 			formatPrimitiveName(&row.Primitive.Ref),
-			fmt.Sprintf("%t", row.PeerMatches),
+			peer,
 			opposite,
 			row.EffectiveState.String(),
-			formatPermissions(row.Permissions),
+			ports,
 		}
 		id := row.Primitive.StableID()
 		for column, value := range values {

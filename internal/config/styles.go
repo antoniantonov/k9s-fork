@@ -137,7 +137,12 @@ type (
 		AllowedColor     Color `json:"allowedColor" yaml:"allowedColor"`
 		DisallowedColor  Color `json:"disallowedColor" yaml:"disallowedColor"`
 		PartialDataColor Color `json:"partialDataColor" yaml:"partialDataColor"`
-		FocusColor       Color `json:"focusColor" yaml:"focusColor"`
+		// PartialColor marks a result that is neither a clean allow nor a clean
+		// deny, so it must stand apart from both.
+		PartialColor Color `json:"partialColor" yaml:"partialColor"`
+		// UnknownColor marks a result that could not be evaluated at all.
+		UnknownColor Color `json:"unknownColor" yaml:"unknownColor"`
+		FocusColor   Color `json:"focusColor" yaml:"focusColor"`
 	}
 
 	// Status tracks resource status styles.
@@ -330,6 +335,8 @@ func newReachability() Reachability {
 		AllowedColor:     "green",
 		DisallowedColor:  "red",
 		PartialDataColor: "orange",
+		PartialColor:     "yellow",
+		UnknownColor:     "white",
 		FocusColor:       "orange",
 	}
 }
@@ -730,6 +737,8 @@ func (r *Reachability) Invert() {
 	r.AllowedColor = r.AllowedColor.InvertColor()
 	r.DisallowedColor = r.DisallowedColor.InvertColor()
 	r.PartialDataColor = r.PartialDataColor.InvertColor()
+	r.PartialColor = r.PartialColor.InvertColor()
+	r.UnknownColor = r.UnknownColor.InvertColor()
 	r.FocusColor = r.FocusColor.InvertColor()
 }
 

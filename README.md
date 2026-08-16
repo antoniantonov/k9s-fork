@@ -592,10 +592,10 @@ view; `Esc` returns.
 Allowed primitives are green and disallowed primitives are red, but status
 labels always accompany color. Namespace, Deployment, and Job results are
 conservative aggregates: green means every evaluated pod pair is allowed.
-Zero allowed pairs are red; mixed results are red and labeled
-`[PARTIAL allowed/total]`; workloads without current pods are red and labeled
-`[EMPTY]`. Thus a partially reachable aggregate is never presented as fully
-allowed.
+Zero allowed pairs are red; mixed results are yellow and labeled
+`[PARTIAL allowed/total]`; workloads without current pods are white and labeled
+`Unknown`, since nothing could be evaluated. Thus a partially reachable
+aggregate is never presented as fully allowed.
 
 The details panel shows the direction, subject and primitive, pod-pair coverage,
 ports, contributing policies/rule indexes, disallow explanations, and warnings.

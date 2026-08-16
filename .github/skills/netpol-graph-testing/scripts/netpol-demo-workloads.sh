@@ -12,7 +12,7 @@
 #   Subjects      Pod, Deployment, Job (active + completed), Namespace
 #   Primitives    CIDR, Pod, Namespace, Deployment, Job
 #   States        Allowed, Disallowed, Partial (mixed pod pairs), Unknown
-#                 (ambiguous named port), and [EMPTY] (zero-replica workload)
+#                 (ambiguous named port + zero-replica workload)
 #   Rules         podSelector-only, namespaceSelector-only, both (intersection),
 #                 ipBlock with except, empty from/to (allow-all), empty ports,
 #                 named ports, numeric ports, endPort ranges, default deny,
@@ -423,7 +423,7 @@ spec:
           resources:
             requests: {cpu: 5m, memory: 8Mi}
 ---
-# Zero replicas -> workload aggregate must render red with [EMPTY].
+# Zero replicas -> workload aggregate must render white with Unknown.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -957,7 +957,7 @@ echo
 echo "==> try these in k9s"
 cat <<EOF
     :npg deployment api ${NS_APP}        # green frontend/prometheus, partial ${NS_WEB},
-                                          # unknown ambiguous-ports, [EMPTY] scaled-to-zero
+                                          # unknown ambiguous-ports and scaled-to-zero
     :npg namespace ${NS_APP}             # namespace-wide aggregate
     :npg job report-generator ${NS_APP}  # active job subject
     :npg job db-migration ${NS_APP}      # completed job subject

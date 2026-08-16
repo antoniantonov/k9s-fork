@@ -307,6 +307,49 @@ func TestDirectionApplicabilityEffectiveStates(t *testing.T) {
 	}
 }
 
+func TestRuleApplicabilityZeroPodPairsIsUnknown(t *testing.T) {
+	snapshot := testSnapshot()
+	snapshot.Namespaces = append(snapshot.Namespaces, corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: "empty", Labels: map[string]string{"team": "empty"},
+	}})
+	snapshot.NetworkPolicies = []netv1.NetworkPolicy{ingressPolicy("allow-all", "server", []netv1.NetworkPolicyIngressRule{{}})}
+
+	result, err := NewEvaluator().EvaluateSubject(
+		SubjectRef{Kind: SubjectPod, Namespace: "server", Name: "server"}, snapshot, Options{},
+	)
+	require.NoError(t, err)
+
+	var ruleID RuleID
+	for _, rule := range result.Ingress.Rules {
+		if rule.ID.PolicyName == "allow-all" {
+			ruleID = rule.ID
+		}
+	}
+	require.NotEmpty(t, ruleID.PolicyName)
+
+	primitive := findPrimitive(t, result.Ingress, PrimitiveNamespace, "", "empty")
+	require.Zero(t, primitive.TotalPairs)
+
+	findRow := func(rows []ApplicabilityRow) ApplicabilityRow {
+		t.Helper()
+		for index := range rows {
+			row := &rows[index]
+			if row.Primitive.Ref.ID() == primitive.Ref.ID() {
+				return *row
+			}
+		}
+		require.FailNow(t, "applicability row not found", "%s", primitive.Ref.ID())
+		return ApplicabilityRow{}
+	}
+
+	ruleRow := findRow(NewEvaluator().RuleApplicability(result, Ingress, ruleID, sets.New(PrimitiveNamespace)))
+	require.Zero(t, ruleRow.Primitive.TotalPairs)
+	require.Equal(t, AccessUnknown, ruleRow.EffectiveState)
+
+	directionRow := findRow(NewEvaluator().DirectionApplicability(result, Ingress, sets.New(PrimitiveNamespace)))
+	require.Equal(t, AccessUnknown, directionRow.EffectiveState)
+}
+
 // A peer that matches no rule must report PeerMatches=false in the aggregate,
 // exactly as it does per-rule. Synthetic default-deny evidence is attached to
 // every denied pair, so counting it would make this column always true and

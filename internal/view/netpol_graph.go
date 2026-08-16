@@ -1226,7 +1226,7 @@ func (v *NetworkPolicyGraph) renderDetails(direction netpol.Direction) {
 		text.WriteString("\n")
 		text.WriteString(ui.RuleDetailsText(rule))
 		v.appendResultWarnings(&text)
-		ruleDetail.Text.SetText(ui.HighlightRuleState(strings.TrimSpace(text.String()), &rule))
+		ruleDetail.Text.SetText(ui.HighlightRuleStateWithStyle(strings.TrimSpace(text.String()), &rule, v.reachabilityStyle()))
 		detail = ruleDetail
 	} else {
 		primitive, ok := v.selectedPrimitive(direction, id)
@@ -1251,7 +1251,7 @@ func (v *NetworkPolicyGraph) renderDetails(direction netpol.Direction) {
 // been applied. It is what the details pane shows when nothing is selected.
 func (v *NetworkPolicyGraph) showEffectiveDetails(direction netpol.Direction, previous detailScrollState) {
 	rows := v.directionApplicability(direction)
-	detail := ui.NewEffectiveDetailsWithStyle(v.effectiveDetailsText(direction, rows), rows, v.reachabilityStyle())
+	detail := ui.NewEffectiveDetailsWithStyle(v.effectiveDetailsText(direction, rows), rows, direction, v.reachabilityStyle())
 	v.applyDetailFocusStyle(detail)
 	detail.SetApplicabilityChangedFunc(func(string) { v.syncActions() })
 	v.details.AddItem(detail, 0, 1, false)

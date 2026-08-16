@@ -142,6 +142,10 @@ func (e *engine) RuleApplicability(result SubjectResult, direction Direction, id
 		switch {
 		case primitive.State == AccessPartialData:
 			row.EffectiveState = AccessPartialData
+		case len(primitive.PairDecisions) == 0:
+			// Nothing was evaluated: no concrete pod pairs exist, so the rule's
+			// effect on this peer is unknown rather than denied.
+			row.EffectiveState = AccessUnknown
 		case allEffective:
 			row.EffectiveState = AccessAllowed
 		case anyEffective:
