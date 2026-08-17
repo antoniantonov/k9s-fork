@@ -432,8 +432,7 @@ func (v *NetworkPolicyGraph) ensureListeners() {
 }
 
 // Start loads the graph. Periodic reevaluation only runs while auto-refresh is
-// enabled; otherwise a single evaluation is performed and further updates are
-// driven by the refresh key.
+// enabled; otherwise a single evaluation is performed.
 func (v *NetworkPolicyGraph) Start() {
 	v.stopWatch()
 	v.ensureListeners()
@@ -550,7 +549,7 @@ func (v *NetworkPolicyGraph) toggleAutoRefresh() {
 		if v.autoRefresh {
 			v.app.Flash().Infof("Auto-refresh is enabled (every %s)", model.NetPolGraphRefreshRate)
 		} else {
-			v.app.Flash().Info("Auto-refresh is disabled. Press Ctrl-R to refresh")
+			v.app.Flash().Info("Auto-refresh is disabled")
 		}
 	}
 }
@@ -814,6 +813,9 @@ func (v *NetworkPolicyGraph) detailStops(direction netpol.Direction) (details, a
 	}
 	id := v.panels[direction].SelectedID()
 	if id == "" {
+		if v.mode == ui.PrimitivesProjection {
+			return true, false
+		}
 		return true, len(v.visibleApplicability(direction, v.directionApplicability(direction))) > 0
 	}
 	if v.mode == ui.RulesProjection {
@@ -1397,16 +1399,29 @@ func (v *NetworkPolicyGraph) renderDetails(direction netpol.Direction) {
 }
 
 // showEffectiveDetails renders the direction's reachability after every rule has
-// been applied. It is what the details pane shows when nothing is selected.
+// been applied. Rules mode includes the effective applicability table;
+// Primitives mode omits it because the direction panels already show those rows.
 func (v *NetworkPolicyGraph) showEffectiveDetails(direction netpol.Direction, previous detailScrollState) {
 	allRows := v.directionApplicability(direction)
-	rows := v.visibleApplicability(direction, allRows)
-	detail := ui.NewEffectiveDetailsWithStyle(v.effectiveDetailsText(direction, allRows), rows, direction, v.reachabilityStyle())
-	detail.Applicability.SetTitle(v.applicabilityTitle("Effective Applicability", direction))
-	v.applyDetailFocusStyle(detail)
-	detail.SetApplicabilityChangedFunc(func(string) { v.syncActions() })
-	v.details.AddItem(detail, 0, 1, false)
-	v.detailItem = detail
+	body := v.effectiveDetailsText(direction, allRows)
+	if v.mode == ui.PrimitivesProjection {
+		detail := tview.NewTextView().
+			SetText(tview.Escape(body)).
+			SetScrollable(true).
+			SetWrap(true)
+		detail.SetBorder(true).SetTitle(" Effective Details ")
+		v.applyTextFocusStyle(detail)
+		v.details.AddItem(detail, 0, 1, false)
+		v.detailItem = detail
+	} else {
+		rows := v.visibleApplicability(direction, allRows)
+		detail := ui.NewEffectiveDetailsWithStyle(body, rows, direction, v.reachabilityStyle())
+		detail.Applicability.SetTitle(v.applicabilityTitle("Effective Applicability", direction))
+		v.applyDetailFocusStyle(detail)
+		detail.SetApplicabilityChangedFunc(func(string) { v.syncActions() })
+		v.details.AddItem(detail, 0, 1, false)
+		v.detailItem = detail
+	}
 	v.detailShown = detailScrollState{direction: direction, effective: true}
 	v.restoreDetailState(previous)
 	v.refocusDetail()
@@ -1436,8 +1451,13 @@ func (v *NetworkPolicyGraph) effectiveDetailsText(direction netpol.Direction, ro
 	if len(rows) == 0 {
 		b.WriteString("\nNo primitives match the enabled kinds for this direction.\n")
 	}
-	b.WriteString("\nThis is the aggregate result of every evaluated rule. Select a rule or\n")
-	b.WriteString("primitive to inspect its individual contribution.\n")
+	b.WriteString("\nThis is the aggregate result of every evaluated rule. Select a ")
+	if v.mode == ui.PrimitivesProjection {
+		b.WriteString("primitive")
+	} else {
+		b.WriteString("rule")
+	}
+	b.WriteString(" to inspect its individual contribution.\n")
 	v.appendResultWarnings(&b)
 	return strings.TrimSpace(b.String())
 }
@@ -2455,7 +2475,6 @@ func (v *NetworkPolicyGraph) bindKeys() {
 		ui.KeyF:          ui.NewKeyAction("Primitive Kinds", func(*tcell.EventKey) *tcell.EventKey { v.openKindsDialog(); return nil }, true),
 		ui.KeyS:          ui.NewKeyAction("Subject", func(*tcell.EventKey) *tcell.EventKey { v.openSubjectDialog(); return nil }, true),
 		ui.KeyR:          ui.NewKeyAction("Toggle Auto-Refresh", func(*tcell.EventKey) *tcell.EventKey { v.toggleAutoRefresh(); return nil }, true),
-		tcell.KeyCtrlR:   ui.NewKeyAction("Refresh", func(*tcell.EventKey) *tcell.EventKey { v.Refresh(); return nil }, true),
 		tcell.KeyEnter:   ui.NewKeyAction("Focus Details/Open", v.enterCmd, false),
 		tcell.KeyEscape:  ui.NewKeyAction("Clear Selection/Back", v.escapeCmd, false),
 		tcell.KeyLeft:    ui.NewKeyAction("Focus Ingress", v.focusDirectionCmd(netpol.Ingress), false),
@@ -2487,7 +2506,7 @@ func (v *NetworkPolicyGraph) syncActions() {
 		v.actions.Delete(ui.KeyA)
 	}
 	if _, ok := v.subjectPromotionTarget(); ok {
-		v.actions.Add(tcell.KeyCtrlS, ui.NewKeyAction("Set Subject", v.applySubjectPromotionCmd, true))
+		v.actions.Add(tcell.KeyCtrlS, ui.NewKeyAction("Set As Subject", v.applySubjectPromotionCmd, true))
 	} else {
 		v.actions.Delete(tcell.KeyCtrlS)
 	}

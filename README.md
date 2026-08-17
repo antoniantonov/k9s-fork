@@ -569,14 +569,13 @@ Per-direction filters, selection, and scroll position remain independent.
 | `y` | Open YAML for selected policy evidence |
 | `/` | Filter visible items by text |
 | `r` | Enable or disable auto-refresh (disabled by default) |
-| `Ctrl-R` | Reevaluate reachability now |
+| `Ctrl-S` | Set the highlighted eligible workload or applicability primitive as the subject |
 | `Esc` | Clear focused selection; with none selected, close dialog/filter or go back |
 
 Reachability is evaluated once when the view opens. Auto-refresh is **off** by
-default: press `r` to reevaluate every 5 seconds, or `Ctrl-R` for a one-off
-refresh. The current state is shown in the subject summary line. Refreshing
-preserves the selected rule, primitive, applicability row, subject workload,
-and scroll position.
+default: press `r` to reevaluate every 5 seconds. The current state is shown in
+the subject summary line. Refreshing preserves the selected rule, primitive,
+applicability row, subject workload, and scroll position.
 
 Hiding a direction does not discard its filters, selection, or scroll
 position. The Rules/Primitives mode is global, so it remains shared even while

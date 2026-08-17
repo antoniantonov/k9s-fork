@@ -20,18 +20,18 @@ Automated cases are in `scripts/k9s-tui-smoke.exp`; setup/build phases are in `s
 | Launch commands | `:npg` opens with no direction rule selected, Effective Applicability for Ingress, and the exact `read-only graph` badge under the logo | `launch-npg-view` | `:netpolgraph`/`:npgraph` aliases covered by Go command tests/manual |
 | Context launch | Shift-R from Pod/Deployment/Job/Namespace | Manual-only | Requires navigating source resource tables |
 | `i` / `e` | Hide/show ingress and egress; both hidden placeholder | `direction-toggles-placeholder` | Verifies exact placeholder text |
-| `m` | Global Rules ↔ Primitives projection; both panels switch | `rules-primitives-global-toggle` | Also used by open-resource cases |
+| `m` | Global Rules ↔ Primitives projection; both panels switch and Effective Applicability stays hidden in Primitives mode | `rules-primitives-global-toggle` | Also used by open-resource cases |
 | `f` | Primitive Kinds dialog; CIDR, Pod, Namespace, Deployment, Job; Apply/Cancel | `primitive-kinds-apply-cancel-zero` | Applies zero kinds and verifies empty-kinds message |
 | `o` | Open Rule is offered only for real rules and hidden in Primitives mode | `open-rule-only-for-real-rules`, `open-rule-hidden-in-primitives` | Synthetic default-deny is asserted not to advertise the action |
 | `s` | Subject picker lists Pod, Deployment, Job, Namespace subjects | `subject-picker-kinds` | Selection of each subject kind is manual-only in TUI; topology supports all |
 | `/` | Search Apply, Clear, Cancel | `search-apply-clear-cancel` | Uses `frontend` filter |
-| `r` / `Ctrl-R` | Auto-refresh toggle and manual refresh | `refresh-controls` | Asserts repaint/status text |
+| `r` | Auto-refresh toggle; no manual refresh shortcut is advertised | `auto-refresh-toggle`, `launch-npg-view` | Asserts status text and absence of `Ctrl-R` |
 | `y` | YAML view of selected NetworkPolicy; hidden for synthetic rules and CIDR applicability | `yaml-view`, `yaml-hidden-without-a-manifest` | Navigates to real rules by their advertised action |
 | `Enter` | Rule selected → Applicability focus | `enter-navigation-rule-selected` | Headline behavior |
 | `Enter` | No rule selected → Effective Applicability focus | `enter-navigation-effective-applicability` | Exercises the default launch state directly |
 | `Enter` | Primitives selected → details text focus | `enter-navigation-primitive-details` | Plain text detail pane |
 | `Enter` | Applicability focused → opens highlighted primitive; `Esc` returns | `enter-opens-applicability-primitive` | Moves off the first CIDR row before opening |
-| `Ctrl-S` | Promote a supported Subject workload or applicability primitive to the graph subject | `ctrl-s-set-subject-from-subject-panel`, `ctrl-s-set-subject-from-applicability` | Promotes the selected API Pod from Subject, then independently filters Effective Applicability to `Deployment netpol-demo-web/frontend`; both cases assert focus returned to Subject through the renewed Ctrl-S hint |
+| `Ctrl-S` | **Set As Subject**: promote a supported Subject workload or applicability primitive to the graph subject | `ctrl-s-set-subject-from-subject-panel`, `ctrl-s-set-subject-from-applicability` | Promotes the selected API Pod from Subject, then independently filters Effective Applicability to `Deployment netpol-demo-web/frontend`; both cases assert focus returned to Subject through the renewed Ctrl-S hint |
 | `Esc` | Clear selection before back navigation; back from opened resource | `escape-clears-selection-before-back`, open cases | Dialog cancel also covered |
 | `←` / `→` | Focus Ingress/Egress | `left-right-direction-focus` | Uses ANSI cursor sequences |
 | `Tab` / `Shift-Tab` | Subject → Ingress → Ingress details → Ingress applicability → Egress → Egress details → Egress applicability focus ring | `tab-and-shift-tab-focus-ring` | Each direction owns the detail stops that follow it, so its applicability is reachable without passing through the other panel. Focus opens on Subject. Visual focus is indirectly asserted by stable repaint |
@@ -49,7 +49,7 @@ The Expect summary contains these 21 cases, each with an explicit verdict:
 `enter-navigation-primitive-details`,
 `enter-opens-applicability-primitive`, `open-rule-only-for-real-rules`,
 `open-rule-hidden-in-primitives`, `yaml-view`,
-`yaml-hidden-without-a-manifest`, `refresh-controls`,
+`yaml-hidden-without-a-manifest`, `auto-refresh-toggle`,
 `escape-clears-selection-before-back`,
 `ctrl-s-set-subject-from-subject-panel`,
 `ctrl-s-set-subject-from-applicability`, and

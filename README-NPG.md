@@ -61,8 +61,7 @@ NPG-specific `read-only graph` badge. The badge is removed when NPG stops; it
 is not a global K9s status.
 
 NPG evaluates reachability once when opened. Automatic refresh is disabled by
-default. It can be enabled at a five-second interval with `r`, or reevaluated
-once with `Ctrl-R`.
+default. It can be enabled at a five-second interval with `r`.
 
 NPG models the standard Kubernetes NetworkPolicy API, not guaranteed packet
 delivery. CNI behavior, NAT, `hostNetwork`, node-local traffic, service meshes,
@@ -542,7 +541,7 @@ that direction panel restores a selection.
 | Applicability or Effective Applicability | Open the highlighted Pod, Namespace, Deployment, or Job primitive. A CIDR reports that it is not a Kubernetes resource. |
 | Primitive Details | Open the selected Pod, Namespace, Deployment, or Job primitive. A CIDR reports that it is not a Kubernetes resource. |
 
-`Ctrl-S` promotes the highlighted resource to the current subject and
+`Ctrl-S` (**Set As Subject**) promotes the highlighted resource to the current subject and
 reevaluates:
 
 - In Rules-mode Applicability or Effective Applicability, Pod, Namespace,
@@ -580,11 +579,10 @@ the real rule is selected and its direction panel has focus.
 | `a` | Toggle both ingress and egress rule/effective applicability tables between all rows and exact Allowed rows only. Available only in Rules mode; hidden/unbound in Primitives mode. |
 | `/` | Search/filter the focused Subject, direction, Rule/Primitive context, or Applicability panel. Hidden while Effective Details text has focus. |
 | `r` | Enable or disable automatic reevaluation every five seconds. |
-| `Ctrl-R` | Reevaluate reachability immediately. |
 | `o` | Open the selected real NetworkPolicy rule. Available only in Rules mode while its direction panel has focus. |
 | `y` | Open YAML for the focused selected workload, real rule, resource primitive, or applicability row. Unavailable for CIDRs, synthetic rules, and empty selections. |
 | `Enter` | Move into Details/Applicability or open a highlighted primitive, depending on focus. |
-| `Ctrl-S` | Promote an eligible highlighted Pod, Deployment, Job, or Namespace applicability primitive—or Pod, Deployment, or Job Subject workload row—to the current subject and reevaluate. |
+| `Ctrl-S` | **Set As Subject**: promote an eligible highlighted Pod, Deployment, Job, or Namespace applicability primitive—or Pod, Deployment, or Job Subject workload row—to the current subject and reevaluate. |
 | `Esc` | Clear the active direction selection first; otherwise cancel or go back. |
 | `Left` / `Right` | Focus Ingress/Egress, except when a Details widget owns the arrows for scrolling. |
 | `Tab` / `Shift-Tab` | Move forward/backward through the panel focus ring. |

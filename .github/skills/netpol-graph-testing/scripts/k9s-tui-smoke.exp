@@ -189,8 +189,12 @@ spawn {*}$docker_args
 stty rows 50 columns 200 < $spawn_out(slave,name)
 
 start_case "launch-npg-view"
-if {[assert_all_screen {Subject {Deployment netpol-demo-app/api} {3 pods} {Ingress on} {Egress on} {Kinds: CIDR,Pod,Namespace,Deployment,Job} {Auto-refresh off} {Ingress · Rules} {Egress · Rules} {Selection: none} {Effective Details} {Effective Applicability \(Ingress\)} {read-only graph} {<ctrl-r>} {Refresh} {</>} Search {<npg>}} 45]} {
-pass_case
+if {[assert_all_screen {Subject {Deployment netpol-demo-app/api} {3 pods} {Ingress on} {Egress on} {Kinds: CIDR,Pod,Namespace,Deployment,Job} {Auto-refresh off} {Ingress · Rules} {Egress · Rules} {Selection: none} {Effective Details} {Effective Applicability \(Ingress\)} {read-only graph} {</>} Search {<npg>}} 45]} {
+  if {[screen_matches {<ctrl-r>} 2]} {
+    fail_case "manual Refresh shortcut remained visible"
+  } else {
+    pass_case
+  }
 }
 
 start_case "subject-picker-kinds"
@@ -216,10 +220,14 @@ if {[assert_screen {Both directions are hidden\. Press i for ingress or e for eg
 
 start_case "rules-primitives-global-toggle"
 send_key "m"
-if {[assert_all_screen {{Ingress · Primitives} {Egress · Primitives}} 15]} {
-  send_key "m"
-  assert_all_screen {{Ingress · Rules} {Egress · Rules}} 15
-  pass_case
+if {[assert_all_screen {{Ingress · Primitives} {Egress · Primitives} {Effective Details} {Selection: none}} 15]} {
+  if {[screen_matches {Effective Applicability} 2]} {
+    fail_case "Effective Applicability remained visible in Primitives mode"
+  } else {
+    send_key "m"
+    assert_all_screen {{Ingress · Rules} {Egress · Rules}} 15
+    pass_case
+  }
 }
 
 start_case "primitive-kinds-apply-cancel-zero"
@@ -395,12 +403,10 @@ if {[screen_matches {<y>} 5]} {
   }
 }
 
-start_case "refresh-controls"
+start_case "auto-refresh-toggle"
 ensure_rules
 send_key "r"
 wait_stream {Auto-refresh is enabled|Auto-refresh on|Auto-refresh} 10
-send_key "\022"
-assert_screen {Auto-refresh on|Auto-refresh} 10
 send_key "r"
 if {[wait_stream {Auto-refresh is disabled|Auto-refresh off|Auto-refresh} 10]} { finish_case }
 
@@ -414,10 +420,10 @@ pass_case
 
 start_case "ctrl-s-set-subject-from-subject-panel"
 ensure_rules
-if {[assert_all_screen {{<ctrl-s>} {Set Subject} {Pod[[:space:]]+netpol-demo-app[[:space:]]+api-}} 30]} {
+if {[assert_all_screen {{<ctrl-s>} {Set As Subject} {Pod[[:space:]]+netpol-demo-app[[:space:]]+api-}} 30]} {
   # Ctrl-S is delivered directly by the legacy tcell key map.
   send_key "\023" 500
-  if {[assert_all_screen {Subject {Pod netpol-demo-app/api-[[:alnum:]-]+ · 1 pod} {<ctrl-s>} {Set Subject}} 45]} {
+  if {[assert_all_screen {Subject {Pod netpol-demo-app/api-[[:alnum:]-]+ · 1 pod} {<ctrl-s>} {Set As Subject}} 45]} {
     pass_case
   }
 }
@@ -436,9 +442,9 @@ if {[assert_screen {Reachability Search|Filter:} 10]} {
   send_key "\t"
   send_key "\r"
   if {[assert_all_screen {{Effective Applicability \(Ingress\).*filter: Deployment netpol-demo-web/frontend} {Deployment netpol-demo-web/frontend}} 20]} {
-    if {[assert_all_screen {{<ctrl-s>} {Set Subject}} 15]} {
+    if {[assert_all_screen {{<ctrl-s>} {Set As Subject}} 15]} {
       send_key "\023" 500
-      if {[assert_all_screen {Subject {Deployment netpol-demo-web/frontend · 2 pods} {<ctrl-s>} {Set Subject}} 45]} {
+      if {[assert_all_screen {Subject {Deployment netpol-demo-web/frontend · 2 pods} {<ctrl-s>} {Set As Subject}} 45]} {
         pass_case
       }
     }
@@ -446,10 +452,10 @@ if {[assert_screen {Reachability Search|Filter:} 10]} {
 }
 
 start_case "freeze-hang-stress"
-# Mash the keys that touch the evaluator, the panels and the refresh loop. The
+# Mash the keys that touch the evaluator, the panels and the auto-refresh loop. The
 # UI thread used to block on informer lists here, which stalled every repaint.
 for {set i 0} {$i < 80} {incr i} {
-  send -- "\033\[A\033\[B\022m\033\[5~\033\[6~"
+  send -- "\033\[A\033\[Brm\033\[5~\033\[6~"
   after 40
 }
 # Drain everything already buffered so the probe below can only be satisfied by
@@ -457,7 +463,7 @@ for {set i 0} {$i < 80} {incr i} {
 drain 1
 # A live TUI repaints as soon as it is poked; a deadlocked one never answers.
 repaint
-send -- "\022"
+send -- "r"
 after 200
 send -- "\033\[A"
 set timeout 30

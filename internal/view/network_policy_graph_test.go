@@ -480,22 +480,40 @@ func TestNetworkPolicyGraphEscapeClearsSelectionBeforeBack(t *testing.T) {
 func TestNetworkPolicyGraphEffectiveDetailsWithoutSelection(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
+	view.panels[netpol.Ingress].ClearSelection()
+	view.updateDetails(netpol.Ingress)
 
-	for _, projection := range []ui.ReachabilityProjection{ui.RulesProjection, ui.PrimitivesProjection} {
-		t.Run(projection.String(), func(t *testing.T) {
-			if view.mode != projection {
-				view.switchMode()
-			}
-			view.panels[netpol.Ingress].ClearSelection()
-			view.updateDetails(netpol.Ingress)
+	details, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	text := details.Text.GetText(true)
+	assert.Contains(t, text, "Selection: none")
+	assert.Contains(t, text, "Primitives:")
+	assert.Greater(t, details.Applicability.GetRowCount(), 1)
+}
 
-			details, ok := view.detailItem.(*ui.RuleDetails)
-			require.True(t, ok)
-			text := details.Text.GetText(true)
-			assert.Contains(t, text, "Selection: none")
-			assert.Contains(t, text, "Primitives:")
-			assert.Greater(t, details.Applicability.GetRowCount(), 1)
-		})
+func TestNetworkPolicyGraphPrimitivesModeHidesEffectiveApplicabilityWithoutSelection(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(testSubjectResult())
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		require.Empty(t, view.panels[direction].SelectedID())
+		view.updateDetails(direction)
+
+		detail, ok := view.detailItem.(*tview.TextView)
+		require.True(t, ok, "%s effective details must not include an applicability table", direction)
+		assert.Equal(t, " Effective Details ", detail.GetTitle())
+		assert.Contains(t, detail.GetText(true), "Selection: none")
+		assert.Contains(t, detail.GetText(true), "Select a primitive")
+
+		details, applicability := view.detailStops(direction)
+		assert.True(t, details)
+		assert.False(t, applicability)
+	}
+
+	for _, stop := range view.focusStops() {
+		assert.NotEqual(t, focusApplicability, stop.target)
 	}
 }
 
@@ -1010,6 +1028,16 @@ func TestNetworkPolicyGraphToggleAutoRefreshStartsAndStopsTheWatch(t *testing.T)
 	assert.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'r', tcell.ModNone)))
 	assert.False(t, view.AutoRefresh())
 	assert.Contains(t, view.subjectInfo.SummaryText(), "Auto-refresh off")
+}
+
+func TestNetworkPolicyGraphHasNoManualRefreshShortcut(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	ctrlR := tcell.NewEventKey(tcell.KeyCtrlR, 0, tcell.ModCtrl)
+
+	_, ok := view.actions.Get(tcell.KeyCtrlR)
+	assert.False(t, ok)
+	assert.False(t, visibleHint(view, "Ctrl-R"))
+	assert.Equal(t, ctrlR, view.keyboard(ctrlR))
 }
 
 func TestNetworkPolicyGraphRefreshKeepsPanelSelection(t *testing.T) {
@@ -1591,6 +1619,9 @@ func TestNetworkPolicyGraphCtrlSApplicabilityAvailability(t *testing.T) {
 	require.True(t, detail.SelectApplicabilityID(podID))
 	view.syncActions()
 	assert.True(t, visibleHint(view, "Ctrl-S"), "subject-capable applicability row")
+	action, ok := view.actions.Get(tcell.KeyCtrlS)
+	require.True(t, ok)
+	assert.Equal(t, "Set As Subject", action.Description)
 
 	cidrID := result.Ingress.Primitives[netpol.PrimitiveCIDR][0].StableID()
 	require.True(t, detail.SelectApplicabilityID(cidrID))
@@ -2116,8 +2147,8 @@ func TestNetworkPolicyGraphPartialDataKeepsTheResult(t *testing.T) {
 	assert.Contains(t, view.subjectInfo.SummaryText(), "ERROR: network policy snapshot is incomplete")
 }
 
-// Mashing Ctrl-R must not queue an unbounded number of full-cluster snapshots.
-func TestNetworkPolicyGraphCollapsesRepeatedRefreshes(t *testing.T) {
+// Repeated refresh requests must not queue an unbounded number of full-cluster snapshots.
+func TestNetworkPolicyGraphCollapsesRepeatedRefreshRequests(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.app = NewApp(config.NewConfig(nil))
 	graph, ok := view.model.(*fakeNetPolGraphModel)
