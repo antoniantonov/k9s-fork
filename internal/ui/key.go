@@ -13,12 +13,16 @@ func initKeys() {
 	tcell.KeyNames[KeyHelp] = "?"
 	tcell.KeyNames[KeySlash] = "/"
 	tcell.KeyNames[KeySpace] = "space"
+	tcell.KeyNames[KeyShiftEnter] = "Shift-Enter"
 
 	initNumbKeys()
 	initStdKeys()
 	initShiftKeys()
 	initShiftNumKeys()
 }
+
+// KeyShiftEnter is a synthetic key used by views that distinguish Shift-Enter.
+const KeyShiftEnter tcell.Key = 0x7fff
 
 // Defines numeric keys for container actions.
 const (

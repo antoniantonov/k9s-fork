@@ -1138,6 +1138,132 @@ func multiPrimitiveSubjectResult() *netpol.SubjectResult {
 	return result
 }
 
+func subjectPromotionResult() *netpol.SubjectResult {
+	result := multiPrimitiveSubjectResult()
+	id := result.Ingress.Rules[0].ID
+	result.Ingress.Primitives[netpol.PrimitiveNamespace] = []netpol.PrimitiveResult{{
+		Ref: netpol.PrimitiveRef{
+			Kind: netpol.PrimitiveNamespace, Name: "shared", UID: types.UID("shared-uid"),
+		},
+		State:        netpol.AccessAllowed,
+		AllowedPairs: 1,
+		TotalPairs:   1,
+		Permissions:  []netpol.PortPermission{{All: true}},
+		Evidence:     []netpol.PolicyEvidence{{RuleID: id, Summary: "namespace evidence"}},
+		PairDecisions: []netpol.PairDecision{{
+			Source:      netpol.PodRef{Namespace: "shared", Name: "peer"},
+			Destination: netpol.PodRef{Namespace: "payments", Name: "api"},
+			Decision: netpol.Decision{
+				State:       netpol.AccessAllowed,
+				Permissions: []netpol.PortPermission{{All: true}},
+				Evidence: []netpol.PolicyEvidence{
+					{RuleID: id, Summary: "Ingress evidence"},
+					{RuleID: netpol.RuleID{Direction: netpol.Egress}, Summary: "opposite evidence"},
+				},
+			},
+		}},
+	}}
+	result.Ingress.Primitives[netpol.PrimitiveCIDR] = []netpol.PrimitiveResult{{
+		Ref:          netpol.PrimitiveRef{Kind: netpol.PrimitiveCIDR, CIDR: "10.0.0.0/8"},
+		State:        netpol.AccessAllowed,
+		AllowedPairs: 1,
+		TotalPairs:   1,
+		Permissions:  []netpol.PortPermission{{All: true}},
+		Evidence:     []netpol.PolicyEvidence{{RuleID: id, Summary: "cidr evidence"}},
+		PairDecisions: []netpol.PairDecision{{
+			Source:      netpol.PodRef{Name: "10.0.0.1"},
+			Destination: netpol.PodRef{Namespace: "payments", Name: "api"},
+			Decision: netpol.Decision{
+				State:       netpol.AccessAllowed,
+				Permissions: []netpol.PortPermission{{All: true}},
+				Evidence:    []netpol.PolicyEvidence{{RuleID: id, Summary: "Ingress evidence"}},
+			},
+		}},
+	}}
+	return result
+}
+
+func mixedApplicabilitySubjectResult() *netpol.SubjectResult {
+	result := testSubjectResult()
+	result.Ingress.Primitives = mixedApplicabilityPrimitives(netpol.Ingress, result.Ingress.Rules[0].ID)
+	result.Egress.Primitives = mixedApplicabilityPrimitives(netpol.Egress, result.Egress.Rules[0].ID)
+	return result
+}
+
+func mixedApplicabilityPrimitives(
+	direction netpol.Direction,
+	ruleID netpol.RuleID,
+) map[netpol.PrimitiveKind][]netpol.PrimitiveResult {
+	permission := netpol.PortPermission{All: true}
+	oppositeID := netpol.RuleID{Direction: oppositeDirection(direction), SyntheticKind: "unrestricted"}
+	pair := func(name string, allowed bool) netpol.PairDecision {
+		evidence := []netpol.PolicyEvidence{{RuleID: ruleID, Ports: []netpol.PortPermission{permission}}}
+		if allowed {
+			evidence = append(evidence, netpol.PolicyEvidence{RuleID: oppositeID})
+		}
+		state := netpol.AccessDisallowed
+		if allowed {
+			state = netpol.AccessAllowed
+		}
+		return netpol.PairDecision{
+			Source:      netpol.PodRef{Namespace: "payments", Name: name + "-source"},
+			Destination: netpol.PodRef{Namespace: "payments", Name: name + "-destination"},
+			Decision: netpol.Decision{
+				State:       state,
+				Permissions: []netpol.PortPermission{permission},
+				Evidence:    evidence,
+			},
+		}
+	}
+	primitive := func(name string, state netpol.AccessState, pairs ...netpol.PairDecision) netpol.PrimitiveResult {
+		allowed := 0
+		for index := range pairs {
+			if pairs[index].Decision.State == netpol.AccessAllowed {
+				allowed++
+			}
+		}
+		return netpol.PrimitiveResult{
+			Ref: netpol.PrimitiveRef{
+				Kind: netpol.PrimitivePod, Namespace: "payments", Name: name, UID: types.UID(name + "-uid"),
+			},
+			State:         state,
+			AllowedPairs:  allowed,
+			TotalPairs:    len(pairs),
+			Permissions:   []netpol.PortPermission{permission},
+			PairDecisions: pairs,
+		}
+	}
+	return map[netpol.PrimitiveKind][]netpol.PrimitiveResult{
+		netpol.PrimitivePod: {
+			primitive("allowed", netpol.AccessAllowed, pair("allowed", true)),
+			primitive("disallowed", netpol.AccessDisallowed, pair("disallowed", false)),
+			primitive("partial", netpol.AccessPartial, pair("partial-allowed", true), pair("partial-denied", false)),
+			primitive("unknown", netpol.AccessUnknown),
+			primitive("partial-data", netpol.AccessPartialData, pair("partial-data", true)),
+		},
+	}
+}
+
+func visibleHint(view *NetworkPolicyGraph, mnemonic string) bool {
+	for _, hint := range view.Hints() {
+		if hint.Mnemonic == mnemonic && hint.Visible {
+			return true
+		}
+	}
+	return false
+}
+
+func applicabilityStates(t *testing.T, view *NetworkPolicyGraph) []string {
+	t.Helper()
+	detail, ok := view.detailItem.(*ui.RuleDetails)
+	require.True(t, ok)
+	states := make([]string, 0, detail.Applicability.GetRowCount()-1)
+	for row := 1; row < detail.Applicability.GetRowCount(); row++ {
+		states = append(states, detail.Applicability.GetCell(row, 3).Text)
+	}
+	return states
+}
+
 func TestPrimitiveCommand(t *testing.T) {
 	tests := map[netpol.PrimitiveKind]string{
 		netpol.PrimitivePod:        "pods",
@@ -1293,6 +1419,330 @@ func TestNetworkPolicyGraphEnterReportsCIDRApplicabilityRow(t *testing.T) {
 	assert.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
 	message := <-view.app.Flash().Channel()
 	assert.Contains(t, message.Text, "CIDR primitives are not Kubernetes resources")
+}
+
+func TestNetworkPolicyGraphShiftEnterIsDistinctFromPlainEnter(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(subjectPromotionResult())
+	view.focusDirection(netpol.Ingress)
+
+	plainEnter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+	assert.Nil(t, view.keyboard(plainEnter))
+	assert.Equal(t, focusApplicability, view.focusTarget, "plain Enter retains detail navigation")
+	assert.Equal(t, netpol.SubjectRef{
+		Kind: netpol.SubjectPod, Namespace: "payments", Name: "api", UID: types.UID("subject-uid"),
+	}, view.subject)
+
+	detail := view.detailItem.(*ui.RuleDetails)
+	pod := view.result.Ingress.Primitives[netpol.PrimitivePod][0]
+	require.True(t, detail.SelectApplicabilityID(pod.StableID()))
+	view.syncActions()
+
+	// Plain Enter still follows the existing open-resource path. With no app
+	// installed it falls through and, critically, does not replace the subject.
+	assert.Equal(t, plainEnter, view.keyboard(plainEnter))
+	assert.Equal(t, "api", view.subject.Name)
+
+	shiftEnter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModShift)
+	assert.Nil(t, view.keyboard(shiftEnter))
+	assert.Equal(t, netpol.SubjectRef{
+		Kind: netpol.SubjectPod, Namespace: "payments", Name: "peer", UID: types.UID("peer-uid"),
+	}, view.subject)
+}
+
+func TestNetworkPolicyGraphShiftEnterAvailability(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := subjectPromotionResult()
+	view.applyResult(result)
+	shiftEnter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModShift)
+
+	assert.False(t, visibleHint(view, "Shift-Enter"), "subject focus")
+	assert.Equal(t, shiftEnter, view.keyboard(shiftEnter), "unbound Shift-Enter must fall through")
+
+	for _, target := range []reachabilityFocus{focusIngress, focusDetails} {
+		view.applyFocusTarget(target)
+		assert.False(t, visibleHint(view, "Shift-Enter"), "focus target %d", target)
+		assert.Equal(t, shiftEnter, view.keyboard(shiftEnter))
+	}
+
+	view.applyFocusTarget(focusApplicability)
+	detail := view.detailItem.(*ui.RuleDetails)
+	podID := result.Ingress.Primitives[netpol.PrimitivePod][0].StableID()
+	require.True(t, detail.SelectApplicabilityID(podID))
+	view.syncActions()
+	assert.True(t, visibleHint(view, "Shift-Enter"), "subject-capable applicability row")
+
+	cidrID := result.Ingress.Primitives[netpol.PrimitiveCIDR][0].StableID()
+	require.True(t, detail.SelectApplicabilityID(cidrID))
+	view.syncActions()
+	assert.False(t, visibleHint(view, "Shift-Enter"), "CIDR cannot become a subject")
+	assert.Equal(t, shiftEnter, view.keyboard(shiftEnter))
+
+	detail.Applicability.Select(0, 0)
+	view.syncActions()
+	assert.False(t, visibleHint(view, "Shift-Enter"), "no highlighted row")
+	assert.Equal(t, shiftEnter, view.keyboard(shiftEnter))
+
+	require.True(t, detail.SelectApplicabilityID(podID))
+	view.result.Ingress.Primitives[netpol.PrimitivePod] = nil
+	view.invalidateProjections()
+	view.syncActions()
+	assert.False(t, visibleHint(view, "Shift-Enter"), "stale row no longer resolves")
+	assert.Equal(t, shiftEnter, view.keyboard(shiftEnter))
+
+	view.applyResult(subjectPromotionResult())
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	assert.False(t, visibleHint(view, "Shift-Enter"), "Primitives mode")
+	assert.Equal(t, shiftEnter, view.keyboard(shiftEnter))
+}
+
+func TestNetworkPolicyGraphPromotesApplicabilityPrimitiveToSubject(t *testing.T) {
+	tests := []struct {
+		name string
+		kind netpol.PrimitiveKind
+		want netpol.SubjectRef
+	}{
+		{
+			name: "pod",
+			kind: netpol.PrimitivePod,
+			want: netpol.SubjectRef{
+				Kind: netpol.SubjectPod, Namespace: "payments", Name: "peer", UID: types.UID("peer-uid"),
+			},
+		},
+		{
+			name: "deployment",
+			kind: netpol.PrimitiveDeployment,
+			want: netpol.SubjectRef{
+				Kind: netpol.SubjectDeployment, Namespace: "payments", Name: "peer-dp",
+				UID: types.UID("peer-dp-uid"),
+			},
+		},
+		{
+			name: "job",
+			kind: netpol.PrimitiveJob,
+			want: netpol.SubjectRef{
+				Kind: netpol.SubjectJob, Namespace: "payments", Name: "peer-job",
+				UID: types.UID("peer-job-uid"),
+			},
+		},
+		{
+			name: "namespace",
+			kind: netpol.PrimitiveNamespace,
+			want: netpol.SubjectRef{
+				Kind: netpol.SubjectNamespace, Name: "shared", UID: types.UID("shared-uid"),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			view := newTestNetworkPolicyGraph()
+			result := subjectPromotionResult()
+			view.applyResult(result)
+			view.applyFocusTarget(focusApplicability)
+			detail := view.detailItem.(*ui.RuleDetails)
+			primitive := result.Ingress.Primitives[test.kind][0]
+			require.True(t, detail.SelectApplicabilityID(primitive.StableID()))
+			view.syncActions()
+			require.True(t, visibleHint(view, "Shift-Enter"))
+
+			shiftEnter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModShift)
+			require.Nil(t, view.keyboard(shiftEnter))
+
+			assert.Equal(t, test.want, view.subject)
+			assert.Equal(t, test.want, view.model.Subject(), "promotion must call model.SetSubject")
+			assert.False(t, view.haveResult, "the old subject result must be discarded")
+			assert.Empty(t, view.panels[netpol.Ingress].SelectedID())
+			assert.Empty(t, view.panels[netpol.Egress].SelectedID())
+			assert.Equal(t, focusIngress, view.focusTarget)
+			assert.Contains(t, view.detailItem.(*tview.TextView).GetText(true), "Waiting for NetworkPolicy evaluation")
+		})
+	}
+
+	t.Run("CIDR is not promotable", func(t *testing.T) {
+		view := newTestNetworkPolicyGraph()
+		result := subjectPromotionResult()
+		view.applyResult(result)
+		view.applyFocusTarget(focusApplicability)
+		detail := view.detailItem.(*ui.RuleDetails)
+		require.True(t, detail.SelectApplicabilityID(result.Ingress.Primitives[netpol.PrimitiveCIDR][0].StableID()))
+		view.syncActions()
+
+		before := view.subject
+		shiftEnter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModShift)
+		assert.False(t, visibleHint(view, "Shift-Enter"))
+		assert.Equal(t, shiftEnter, view.keyboard(shiftEnter))
+		assert.Equal(t, before, view.subject)
+		assert.Equal(t, before, view.model.Subject())
+		assert.True(t, view.haveResult)
+	})
+}
+
+func TestNetworkPolicyGraphAllowedOnlyActionAvailability(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	view.applyResult(mixedApplicabilitySubjectResult())
+	a := tcell.NewEventKey(tcell.KeyRune, 'a', tcell.ModNone)
+
+	assertAllowedAction := func(t *testing.T, want bool) {
+		t.Helper()
+		_, bound := view.actions.Get(ui.KeyA)
+		assert.Equal(t, want, bound)
+		assert.Equal(t, want, visibleHint(view, "a"))
+	}
+
+	assertAllowedAction(t, true)
+	for _, target := range []reachabilityFocus{
+		focusIngress,
+		focusDetails,
+		focusApplicability,
+		focusEgress,
+		focusDetails,
+		focusApplicability,
+	} {
+		view.applyFocusTarget(target)
+		assertAllowedAction(t, true)
+	}
+
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	for _, target := range []reachabilityFocus{focusSubject, focusIngress, focusDetails, focusEgress, focusDetails} {
+		view.applyFocusTarget(target)
+		assertAllowedAction(t, false)
+		assert.Equal(t, a, view.keyboard(a), "a must be unbound throughout Primitives mode")
+	}
+
+	view.switchMode()
+	require.Equal(t, ui.RulesProjection, view.mode)
+	assertAllowedAction(t, true)
+}
+
+func TestNetworkPolicyGraphAllowedOnlyFiltersSelectedAndEffectiveApplicability(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := mixedApplicabilitySubjectResult()
+	view.applyResult(result)
+	view.focusDirection(netpol.Ingress)
+	view.applyFocusTarget(focusApplicability)
+	detail := view.detailItem.(*ui.RuleDetails)
+	allowedID := result.Ingress.Primitives[netpol.PrimitivePod][0].StableID()
+	require.True(t, detail.SelectApplicabilityID(allowedID))
+	view.syncActions()
+
+	fullStates := []string{"Allowed", "Disallowed", "Partial", "Unknown", "Partial Data"}
+	assert.ElementsMatch(t, fullStates, applicabilityStates(t, view))
+
+	a := tcell.NewEventKey(tcell.KeyRune, 'a', tcell.ModNone)
+	require.Nil(t, view.keyboard(a))
+	detail = view.detailItem.(*ui.RuleDetails)
+	assert.Equal(t, " Applicability (Ingress) (Allowed only) ", detail.Applicability.GetTitle())
+	assert.Equal(t, []string{"Allowed"}, applicabilityStates(t, view),
+		"only exact AccessAllowed rows remain")
+	assert.Equal(t, allowedID, detail.SelectedApplicabilityID(),
+		"a still-visible applicability selection must retain its stable ID")
+
+	view.focusDirection(netpol.Egress)
+	detail = view.detailItem.(*ui.RuleDetails)
+	assert.Equal(t, " Applicability (Egress) (Allowed only) ", detail.Applicability.GetTitle())
+	assert.Equal(t, []string{"Allowed"}, applicabilityStates(t, view),
+		"the setting is global across ingress and egress")
+
+	view.panels[netpol.Egress].ClearSelection()
+	view.updateDetails(netpol.Egress)
+	detail = view.detailItem.(*ui.RuleDetails)
+	assert.True(t, view.detailShown.effective)
+	assert.Equal(t, " Effective Applicability (Egress) (Allowed only) ", detail.Applicability.GetTitle())
+	assert.Equal(t, []string{"Allowed"}, applicabilityStates(t, view),
+		"no-selection Effective Applicability uses the same filter")
+
+	view.switchMode()
+	require.Equal(t, ui.PrimitivesProjection, view.mode)
+	assert.False(t, visibleHint(view, "a"))
+	view.switchMode()
+	require.Equal(t, ui.RulesProjection, view.mode)
+	detail = view.detailItem.(*ui.RuleDetails)
+	assert.Equal(t, " Effective Applicability (Egress) (Allowed only) ", detail.Applicability.GetTitle(),
+		"the setting persists across Rules -> Primitives -> Rules")
+	assert.Equal(t, []string{"Allowed"}, applicabilityStates(t, view))
+
+	require.Nil(t, view.keyboard(a))
+	detail = view.detailItem.(*ui.RuleDetails)
+	assert.Equal(t, " Effective Applicability (Egress) ", detail.Applicability.GetTitle())
+	assert.ElementsMatch(t, fullStates, applicabilityStates(t, view), "toggling off restores every state")
+
+	view.focusDirection(netpol.Ingress)
+	detail = view.detailItem.(*ui.RuleDetails)
+	assert.Equal(t, " Applicability (Ingress) ", detail.Applicability.GetTitle())
+	assert.ElementsMatch(t, fullStates, applicabilityStates(t, view))
+}
+
+func TestNetworkPolicyGraphAllowedOnlyCanRecoverFromZeroRows(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := mixedApplicabilitySubjectResult()
+	result.Ingress.Primitives[netpol.PrimitivePod] = result.Ingress.Primitives[netpol.PrimitivePod][1:]
+	view.applyResult(result)
+	view.focusDirection(netpol.Ingress)
+
+	a := tcell.NewEventKey(tcell.KeyRune, 'a', tcell.ModNone)
+	require.Nil(t, view.keyboard(a))
+	detail := view.detailItem.(*ui.RuleDetails)
+	assert.Equal(t, " Applicability (Ingress) (Allowed only) ", detail.Applicability.GetTitle())
+	assert.Equal(t, 1, detail.Applicability.GetRowCount(), "zero allowed rows leave the header visible")
+	assert.Empty(t, detail.SelectedApplicabilityID())
+	assert.True(t, visibleHint(view, "a"), "the filter action remains available from the fallback detail focus")
+
+	require.Nil(t, view.keyboard(a))
+	detail = view.detailItem.(*ui.RuleDetails)
+	assert.Equal(t, " Applicability (Ingress) ", detail.Applicability.GetTitle())
+	assert.ElementsMatch(t, []string{"Disallowed", "Partial", "Unknown", "Partial Data"}, applicabilityStates(t, view))
+}
+
+func TestNetworkPolicyGraphDynamicApplicabilityActionHints(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := subjectPromotionResult()
+	view.applyResult(result)
+
+	assert.True(t, visibleHint(view, "a"))
+	assert.False(t, visibleHint(view, "Shift-Enter"))
+
+	view.focusDirection(netpol.Ingress)
+	assert.True(t, visibleHint(view, "a"))
+	assert.False(t, visibleHint(view, "Shift-Enter"))
+
+	view.applyFocusTarget(focusApplicability)
+	detail := view.detailItem.(*ui.RuleDetails)
+	podID := result.Ingress.Primitives[netpol.PrimitivePod][0].StableID()
+	cidrID := result.Ingress.Primitives[netpol.PrimitiveCIDR][0].StableID()
+	require.True(t, detail.SelectApplicabilityID(podID))
+	view.syncActions()
+	assert.True(t, visibleHint(view, "a"))
+	assert.True(t, visibleHint(view, "Shift-Enter"))
+
+	require.True(t, detail.SelectApplicabilityID(cidrID))
+	view.syncActions()
+	assert.True(t, visibleHint(view, "a"))
+	assert.False(t, visibleHint(view, "Shift-Enter"), "cursor moved to CIDR")
+
+	detail.Applicability.Select(0, 0)
+	view.syncActions()
+	assert.False(t, visibleHint(view, "Shift-Enter"), "selection moved off all data rows")
+
+	require.True(t, detail.SelectApplicabilityID(podID))
+	view.syncActions()
+	assert.True(t, visibleHint(view, "Shift-Enter"))
+	view.applyFocusTarget(focusDetails)
+	assert.False(t, visibleHint(view, "Shift-Enter"), "focus left applicability")
+
+	view.switchMode()
+	assert.False(t, visibleHint(view, "a"))
+	assert.False(t, visibleHint(view, "Shift-Enter"))
+	view.switchMode()
+	assert.True(t, visibleHint(view, "a"))
+
+	view.applyFocusTarget(focusApplicability)
+	detail = view.detailItem.(*ui.RuleDetails)
+	require.True(t, detail.SelectApplicabilityID(podID))
+	view.syncActions()
+	assert.True(t, visibleHint(view, "Shift-Enter"), "mode and cursor restoration recompute dynamic hints")
 }
 
 // Once focus sits inside the detail pane the arrows belong to the widget so its

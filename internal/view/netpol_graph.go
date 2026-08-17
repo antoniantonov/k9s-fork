@@ -208,6 +208,7 @@ type NetworkPolicyGraph struct {
 	state       map[netpol.Direction]*reachabilityDirectionState
 	kinds       sets.Set[netpol.PrimitiveKind]
 	mode        ui.ReachabilityProjection
+	allowedOnly bool
 	focus       netpol.Direction
 	focusTarget reachabilityFocus
 	result      netpol.SubjectResult
@@ -788,14 +789,14 @@ func (v *NetworkPolicyGraph) detailStops(direction netpol.Direction) (details, a
 	}
 	id := v.panels[direction].SelectedID()
 	if id == "" {
-		return true, len(v.directionApplicability(direction)) > 0
+		return true, len(v.visibleApplicability(v.directionApplicability(direction))) > 0
 	}
 	if v.mode == ui.RulesProjection {
 		rule, ok := v.selectedRule(direction, id)
 		if !ok {
 			return false, false
 		}
-		return true, len(v.ruleApplicability(direction, rule.ID)) > 0
+		return true, len(v.visibleApplicability(v.ruleApplicability(direction, rule.ID))) > 0
 	}
 	// Primitives render a plain text pane with no applicability table.
 	_, ok := v.selectedPrimitive(direction, id)
@@ -1335,8 +1336,9 @@ func (v *NetworkPolicyGraph) renderDetails(direction netpol.Direction) {
 			v.refocusDetail()
 			return
 		}
-		rows := v.ruleApplicability(direction, rule.ID)
+		rows := v.visibleApplicability(v.ruleApplicability(direction, rule.ID))
 		ruleDetail := ui.NewRuleDetailsWithStyle(rule, rows, v.reachabilityStyle())
+		ruleDetail.Applicability.SetTitle(v.applicabilityTitle("Applicability", direction))
 		v.applyDetailFocusStyle(ruleDetail)
 		// Moving through the applicability rows changes what YAML is
 		// reachable, so the key hints have to follow the cursor.
@@ -1370,8 +1372,9 @@ func (v *NetworkPolicyGraph) renderDetails(direction netpol.Direction) {
 // showEffectiveDetails renders the direction's reachability after every rule has
 // been applied. It is what the details pane shows when nothing is selected.
 func (v *NetworkPolicyGraph) showEffectiveDetails(direction netpol.Direction, previous detailScrollState) {
-	rows := v.directionApplicability(direction)
+	rows := v.visibleApplicability(v.directionApplicability(direction))
 	detail := ui.NewEffectiveDetailsWithStyle(v.effectiveDetailsText(direction, rows), rows, direction, v.reachabilityStyle())
+	detail.Applicability.SetTitle(v.applicabilityTitle("Effective Applicability", direction))
 	v.applyDetailFocusStyle(detail)
 	detail.SetApplicabilityChangedFunc(func(string) { v.syncActions() })
 	v.details.AddItem(detail, 0, 1, false)
@@ -1403,12 +1406,24 @@ func (v *NetworkPolicyGraph) effectiveDetailsText(direction netpol.Direction, ro
 		v.detailPrefix(direction), v.mode, direction, primitiveKindsSummary(v.kinds))
 	fmt.Fprintf(&b, "Primitives: %d · %s\n", len(rows), strings.Join(breakdown, " · "))
 	if len(rows) == 0 {
-		b.WriteString("\nNo primitives match the enabled kinds for this direction.\n")
+		if v.mode == ui.RulesProjection && v.allowedOnly {
+			b.WriteString("\nNo allowed primitives match the enabled kinds for this direction.\n")
+		} else {
+			b.WriteString("\nNo primitives match the enabled kinds for this direction.\n")
+		}
 	}
 	b.WriteString("\nThis is the aggregate result of every evaluated rule. Select a rule or\n")
 	b.WriteString("primitive to inspect its individual contribution.\n")
 	v.appendResultWarnings(&b)
 	return strings.TrimSpace(b.String())
+}
+
+func (v *NetworkPolicyGraph) applicabilityTitle(prefix string, direction netpol.Direction) string {
+	suffix := ""
+	if v.mode == ui.RulesProjection && v.allowedOnly {
+		suffix = " (Allowed only)"
+	}
+	return fmt.Sprintf(" %s (%s)%s ", prefix, direction, suffix)
 }
 
 // detailScrollState remembers what the detail pane renders and where its cursor
@@ -1612,6 +1627,19 @@ func (v *NetworkPolicyGraph) directionApplicability(direction netpol.Direction) 
 		rows:       v.evaluator.DirectionApplicability(v.result, direction, v.kinds),
 	}
 	return v.rows[direction].rows
+}
+
+func (v *NetworkPolicyGraph) visibleApplicability(rows []netpol.ApplicabilityRow) []netpol.ApplicabilityRow {
+	if v.mode != ui.RulesProjection || !v.allowedOnly {
+		return rows
+	}
+	visible := make([]netpol.ApplicabilityRow, 0, len(rows))
+	for index := range rows {
+		if rows[index].EffectiveState == netpol.AccessAllowed {
+			visible = append(visible, rows[index])
+		}
+	}
+	return visible
 }
 
 func (v *NetworkPolicyGraph) openKindsDialog() {
@@ -2132,6 +2160,38 @@ func (v *NetworkPolicyGraph) applicabilityTarget() (command, path string, err er
 	return command, path, nil
 }
 
+func (v *NetworkPolicyGraph) applicabilitySubjectTarget() (netpol.SubjectRef, bool) {
+	if v.mode != ui.RulesProjection || v.focusTarget != focusApplicability {
+		return netpol.SubjectRef{}, false
+	}
+	detail, ok := v.detailItem.(*ui.RuleDetails)
+	if !ok {
+		return netpol.SubjectRef{}, false
+	}
+	id := detail.SelectedApplicabilityID()
+	if id == "" {
+		return netpol.SubjectRef{}, false
+	}
+	primitive, ok := v.selectedPrimitive(v.focus, id)
+	if !ok {
+		return netpol.SubjectRef{}, false
+	}
+	ref := netpol.SubjectRef{Name: primitive.Ref.Name, UID: primitive.Ref.UID}
+	switch primitive.Ref.Kind {
+	case netpol.PrimitivePod:
+		ref.Kind, ref.Namespace = netpol.SubjectPod, primitive.Ref.Namespace
+	case netpol.PrimitiveDeployment:
+		ref.Kind, ref.Namespace = netpol.SubjectDeployment, primitive.Ref.Namespace
+	case netpol.PrimitiveJob:
+		ref.Kind, ref.Namespace = netpol.SubjectJob, primitive.Ref.Namespace
+	case netpol.PrimitiveNamespace:
+		ref.Kind = netpol.SubjectNamespace
+	default:
+		return netpol.SubjectRef{}, false
+	}
+	return ref, true
+}
+
 // openApplicabilityCmd opens the primitive backing the highlighted
 // applicability row.
 func (v *NetworkPolicyGraph) openApplicabilityCmd(evt *tcell.EventKey) *tcell.EventKey {
@@ -2149,6 +2209,23 @@ func (v *NetworkPolicyGraph) openApplicabilityCmd(evt *tcell.EventKey) *tcell.Ev
 	}
 	v.app.gotoResource(command, path, false, true)
 	return nil
+}
+
+func (v *NetworkPolicyGraph) applyApplicabilitySubjectCmd(evt *tcell.EventKey) *tcell.EventKey {
+	ref, ok := v.applicabilitySubjectTarget()
+	if !ok {
+		return evt
+	}
+	v.applySubject(ref)
+	return nil
+}
+
+func (v *NetworkPolicyGraph) toggleAllowedOnly() {
+	if v.mode != ui.RulesProjection {
+		return
+	}
+	v.allowedOnly = !v.allowedOnly
+	v.updateDetails(v.focus)
 }
 
 func primitiveCommand(ref *netpol.PrimitiveRef) (command, resourcePath string) {
@@ -2194,6 +2271,19 @@ func (v *NetworkPolicyGraph) bindKeys() {
 // to act on, so the menu never advertises an action that would just flash an
 // error. It must run after anything that changes focus, mode, or a selection.
 func (v *NetworkPolicyGraph) syncActions() {
+	if v.mode == ui.RulesProjection {
+		v.actions.Add(ui.KeyA, ui.NewKeyAction("Allowed Only", func(*tcell.EventKey) *tcell.EventKey {
+			v.toggleAllowedOnly()
+			return nil
+		}, true))
+	} else {
+		v.actions.Delete(ui.KeyA)
+	}
+	if _, ok := v.applicabilitySubjectTarget(); ok {
+		v.actions.Add(ui.KeyShiftEnter, ui.NewKeyAction("Set Subject", v.applyApplicabilitySubjectCmd, true))
+	} else {
+		v.actions.Delete(ui.KeyShiftEnter)
+	}
 	if _, _, ok := v.openRuleTarget(); ok {
 		v.actions.Add(ui.KeyO, ui.NewKeyAction(openRuleHint, v.openRuleCmd, true))
 	} else {
@@ -2213,7 +2303,11 @@ func (v *NetworkPolicyGraph) syncActions() {
 }
 
 func (v *NetworkPolicyGraph) keyboard(evt *tcell.EventKey) *tcell.EventKey {
-	if action, ok := v.actions.Get(ui.AsKey(evt)); ok {
+	key := ui.AsKey(evt)
+	if evt.Key() == tcell.KeyEnter && evt.Modifiers() == tcell.ModShift {
+		key = ui.KeyShiftEnter
+	}
+	if action, ok := v.actions.Get(key); ok {
 		return action.Action(evt)
 	}
 	return evt
