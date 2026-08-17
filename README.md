@@ -255,8 +255,19 @@ Binaries for Linux, Windows and Mac are available as tarballs in the [release pa
   IMAGE_NAME=my-k9s ./scripts/docker-build.sh
   ```
 
-  After a successful build the script prints a ready-to-paste `docker run`
-  command for the version it just built.
+  After a successful build the script prints a ready-to-paste command that
+  exports the active kind cluster's internal kubeconfig, joins its Docker
+  network, and opens the NetworkPolicy graph for
+  `deployment/api` in `netpol-demo-app`. It defaults to the `k9s-netpol`
+  cluster when the active context is not a kind context. Override
+  `KIND_CLUSTER`, `KIND_NETWORK`, `NPG_DEPLOYMENT`, or `NPG_NAMESPACE` when
+  building to customize the printed command.
+
+  Populate or refresh the local kind demo topology with:
+
+  ```shell
+  .github/skills/netpol-graph-testing/scripts/netpol-demo-workloads.sh
+  ```
 
 #### Testing the reachability view end to end
 

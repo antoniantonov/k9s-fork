@@ -56,6 +56,10 @@ current cluster snapshot and provides navigation to related resources and YAML.
 Opening a resource leaves NPG and pushes the resource view onto the normal K9s
 breadcrumb stack.
 
+While NPG is active, the status row beneath the K9s logo shows the
+NPG-specific `read-only graph` badge. The badge is removed when NPG stops; it
+is not a global K9s status.
+
 NPG evaluates reachability once when opened. Automatic refresh is disabled by
 default. It can be enabled at a five-second interval with `r`, or reevaluated
 once with `Ctrl-R`.
@@ -237,7 +241,11 @@ source egress and destination ingress permissions.
 
 NPG initially shows the Subject panel, both direction panels, and the Details
 area. Both directions initially use Rules mode, all primitive kinds are
-enabled, and focus starts on Subject.
+enabled, and focus starts on Subject. Neither direction has a selected rule or
+primitive in either projection. The active Details area therefore starts on
+Effective Details with `Effective Applicability (Ingress)`. Changing the
+subject, whether through the picker or `Ctrl-S`, clears both directions in both
+projections and returns focus to Subject for the new evaluation.
 
 ### Subject panel
 ![alt text](assets/npg/subject-panel.png)
@@ -272,6 +280,7 @@ Ingress and Egress use the same layout and behavior but represent opposite
 traffic directions. Press `m` to switch both panels between Rules and
 Primitives mode. The mode is always shared, while filters, selections, and
 scroll positions are preserved independently for each direction and mode.
+All four direction/projection selection states begin cleared.
 
 The panel title shows:
 
@@ -379,10 +388,10 @@ A selected primitive has no per-rule applicability table.
 
 #### Effective Details
 
-Pressing `Esc` to clear the active direction's selection changes the Details
-area to Effective Details. This is the final reachability of every enabled
-primitive after all rules have been combined, rather than one selected rule's
-contribution.
+Effective Details is the default on launch and after every subject change.
+Pressing `Esc` to clear a later direction selection returns to it. This is the
+final reachability of every enabled primitive after all rules have been
+combined, rather than one selected rule's contribution.
 
 Effective Details shows:
 
@@ -452,6 +461,10 @@ Partial, Unknown, and Partial Data rows are hidden. The Allowed-only setting
 persists across projection changes and applies again when returning to Rules.
 While active, applicability titles append a second parenthesized suffix
 `(Allowed only)`, for example `Applicability (Ingress) (Allowed only)`.
+Allowed-only affects only the visible applicability rows. Effective Details
+continues to report the complete Allowed, Partial, Disallowed, Unknown, and
+Partial Data counts, and those counts still sum to the unfiltered primitive
+total.
 
 ## 4. Navigation and Shortcuts
 
@@ -529,10 +542,17 @@ that direction panel restores a selection.
 | Applicability or Effective Applicability | Open the highlighted Pod, Namespace, Deployment, or Job primitive. A CIDR reports that it is not a Kubernetes resource. |
 | Primitive Details | Open the selected Pod, Namespace, Deployment, or Job primitive. A CIDR reports that it is not a Kubernetes resource. |
 
-`Shift-Enter` is available only when Rules-mode Applicability or Effective
-Applicability has focus. It promotes the highlighted Pod, Namespace,
-Deployment, or Job primitive to the current subject and reevaluates. CIDRs are
-ineligible.
+`Ctrl-S` promotes the highlighted resource to the current subject and
+reevaluates:
+
+- In Rules-mode Applicability or Effective Applicability, Pod, Namespace,
+  Deployment, and Job primitives are eligible; CIDRs are not.
+- In Subject, selected Pod, Deployment, and Job workload rows are eligible.
+  ReplicaSet, StatefulSet, and DaemonSet rows are not supported subject kinds.
+
+The new subject begins with both directions and both projections cleared, and
+focus returns to Subject. Plain `Enter` retains its open-resource behavior and
+never promotes the subject.
 
 In Rules mode, `Enter` does not directly open the NetworkPolicy. Use `o` while
 the real rule is selected and its direction panel has focus.
@@ -558,13 +578,13 @@ the real rule is selected and its direction panel has focus.
 | `s` | Open the subject picker. |
 | `f` | Open the global primitive-kind selector for CIDR, Pod, Namespace, Deployment, and Job. |
 | `a` | Toggle both ingress and egress rule/effective applicability tables between all rows and exact Allowed rows only. Available only in Rules mode; hidden/unbound in Primitives mode. |
-| `/` | Filter the active direction in the current mode. Filters are independent per direction and mode. |
+| `/` | Search/filter the focused Subject, direction, Rule/Primitive context, or Applicability panel. Hidden while Effective Details text has focus. |
 | `r` | Enable or disable automatic reevaluation every five seconds. |
 | `Ctrl-R` | Reevaluate reachability immediately. |
 | `o` | Open the selected real NetworkPolicy rule. Available only in Rules mode while its direction panel has focus. |
 | `y` | Open YAML for the focused selected workload, real rule, resource primitive, or applicability row. Unavailable for CIDRs, synthetic rules, and empty selections. |
 | `Enter` | Move into Details/Applicability or open a highlighted primitive, depending on focus. |
-| `Shift-Enter` | When Rules-mode Applicability or Effective Applicability has focus, promote the highlighted Pod, Namespace, Deployment, or Job primitive to the current subject and reevaluate. CIDRs are ineligible. |
+| `Ctrl-S` | Promote an eligible highlighted Pod, Deployment, Job, or Namespace applicability primitive—or Pod, Deployment, or Job Subject workload row—to the current subject and reevaluate. |
 | `Esc` | Clear the active direction selection first; otherwise cancel or go back. |
 | `Left` / `Right` | Focus Ingress/Egress, except when a Details widget owns the arrows for scrolling. |
 | `Tab` / `Shift-Tab` | Move forward/backward through the panel focus ring. |
@@ -600,5 +620,19 @@ The Primitive Kinds dialog opened with `f` supports standard form navigation:
 | `Esc` | Cancel without applying changes. |
 
 The Search dialog opened with `/` contains Apply, Clear, and Cancel actions.
-Applying or clearing affects only the active direction and current projection.
-`Esc` cancels the dialog and returns focus to the active direction.
+Its target follows focus:
+
+- Subject filters the subject workload rows.
+- Ingress or Egress filters that direction in the current projection.
+- Rule Details and Applicability filter the current direction's applicability
+  rows.
+- Primitive Details filters the current direction's Primitives panel.
+- Effective Applicability can be filtered, but Search is hidden while Effective
+  Details text has focus.
+
+Applicability search matches the values currently displayed in every column.
+This includes `n/a` for unevaluated Peer, Opposite, and Ports values, rather
+than the internal boolean or empty values behind those cells.
+
+Subject, direction, and applicability filters retain independent state. `Esc`
+cancels the dialog and returns focus to the panel that opened it.

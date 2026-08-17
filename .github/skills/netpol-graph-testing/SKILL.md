@@ -41,11 +41,17 @@ Only run the population path when `--check` fails, unless `--force-workloads` is
 
 # Full run
 .github/skills/netpol-graph-testing/scripts/run-tests.sh
+
+# Full validation with an uncached, uniquely tagged image
+.github/skills/netpol-graph-testing/scripts/run-tests.sh --clean-image
+
+# TUI-only validation against one exact local image
+.github/skills/netpol-graph-testing/scripts/run-tests.sh --only tui-tests --image sha256:<image-id>
 ```
 
-Phases: `preflight`, `ensure-cluster`, `ensure-workloads`, `build-image`, `go-tests`, `tui-tests`, `report`. Use `--only PHASE`, `--skip PHASE`, `--from PHASE`, `--rebuild`, and `--force-workloads` as needed.
+Phases: `preflight`, `ensure-cluster`, `ensure-workloads`, `go-tests`, `build-image`, `tui-tests`, `report`. Use `--only PHASE`, `--skip PHASE`, `--from PHASE`, `--rebuild`, `--clean-image`/`--no-image-cache`, `--image REF`, and `--force-workloads` as needed.
 
-Logs land under `.github/skills/netpol-graph-testing/runs/<timestamp>/`, with one log per phase plus the expect session log. Failures should be read from the named phase log; TUI stress timeouts send `SIGQUIT` to the container to capture goroutines.
+Logs land under `.github/skills/netpol-graph-testing/runs/<timestamp>/`, with one log per phase plus the expect session log. `image.ref`, `image.id`, and `image.source` record the resolved tag/reference, immutable image ID, and selection path used by TUI tests. A clean build never falls back to `.image-cache` or another local image. Failures should be read from the named phase log; TUI stress timeouts send `SIGQUIT` to the container to capture goroutines.
 
 ## Reading the results
 
@@ -57,7 +63,7 @@ parse this block rather than those lines:
 === smoke case summary ===
   PASS   launch-npg-view
   ...
-=== 17 case(s), 0 failure(s) ===
+=== 21 case(s), 0 failure(s) ===
 ```
 
 Every started case is guaranteed to record a verdict; a case that falls through
@@ -73,12 +79,12 @@ perl -pe 's/\e\[[0-9;?]*[a-zA-Z]//g; s/\e[()][AB012]//g; s/\r/\n/g' \
 
 ## Scope of the Go test phase
 
-`go-tests` runs `-race` over `./internal/netpol/...` and `./internal/view/...` in
-full, but only the reachability suites in `./internal/ui/` and
-`./internal/model/`. Those two packages carry pre-existing upstream races in
-`TestFlash`, `TestFlashBurst`, `TestShowPrompt` and `TestUpdateLogs`, which fail
-at the base commit and are unrelated to this view. Run the full packages
-manually if you need to audit them.
+`go-tests` first clears the build and test caches and runs the default
+`go test ./...` suite. It then runs `-race` over `./internal/netpol/...` and
+`./internal/view/...` in full, but only the reachability suites in
+`./internal/ui/` and `./internal/model/`. Those two packages carry pre-existing
+upstream races in `TestFlash`, `TestFlashBurst`, `TestShowPrompt` and
+`TestUpdateLogs`, which fail at the base commit and are unrelated to this view.
 
 ## Cleanup
 

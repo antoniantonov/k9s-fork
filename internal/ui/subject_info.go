@@ -6,11 +6,13 @@ package ui
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/derailed/k9s/internal/config"
 	"github.com/derailed/k9s/internal/netpol"
 	"github.com/derailed/tcell/v2"
 	"github.com/derailed/tview"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const subjectInfoEmptyMessage = "No workloads found for this subject."
@@ -20,6 +22,7 @@ type SubjectWorkload struct {
 	Kind      string // Pod, Deployment, ReplicaSet, Job, StatefulSet, DaemonSet
 	Namespace string
 	Name      string
+	UID       types.UID
 	Status    string // "3/3 ready", "Running", "Complete", ...
 }
 
@@ -43,6 +46,8 @@ type SubjectInfo struct {
 	summaryTxt  string
 	summarySet  bool
 	workloads   []SubjectWorkload
+	visible     []SubjectWorkload
+	filter      string
 	selectedID  string
 	styles      *config.Styles
 	borderColor tcell.Color
@@ -142,6 +147,20 @@ func (s *SubjectInfo) SetWorkloads(items []SubjectWorkload) *SubjectInfo {
 	return s
 }
 
+// SetFilter applies a case-insensitive text filter to the workload rows.
+func (s *SubjectInfo) SetFilter(filter string) *SubjectInfo {
+	if s.filter != filter {
+		s.filter = filter
+		s.rebuild()
+	}
+	return s
+}
+
+// Filter returns the current workload filter.
+func (s *SubjectInfo) Filter() string {
+	return s.filter
+}
+
 // SetStyles applies configured k9s table colors.
 func (s *SubjectInfo) SetStyles(styles *config.Styles) *SubjectInfo {
 	if styles == nil {
@@ -164,6 +183,8 @@ func (s *SubjectInfo) SetStyles(styles *config.Styles) *SubjectInfo {
 
 func (s *SubjectInfo) rebuild() {
 	s.summary.SetText(s.summaryText())
+	s.visible = s.filteredWorkloads()
+	s.SetTitle(s.panelTitle())
 	// Preserve the selection by workload identity: the informer cache can hand
 	// back rows in a different order, so a row index alone silently jumps the
 	// cursor onto an unrelated workload.
@@ -171,13 +192,13 @@ func (s *SubjectInfo) rebuild() {
 	row, column := s.Table.GetSelection()
 	offsetRow, offsetColumn := s.Table.GetOffset()
 	s.Table.Clear()
-	if len(s.workloads) == 0 {
+	if len(s.visible) == 0 {
 		s.Table.SetCell(0, 0, s.emptyCell())
 		s.Table.SetOffset(0, 0)
 		return
 	}
 	s.setHeader(0)
-	for index, item := range s.workloads {
+	for index, item := range s.visible {
 		s.setWorkload(1+index, item)
 	}
 	if index := s.indexOf(selectedID); index >= 0 {
@@ -212,19 +233,42 @@ func (s *SubjectInfo) SelectID(id string) bool {
 }
 
 func (s *SubjectInfo) workloadIDAtRow(row int) string {
-	if row < 1 || row > len(s.workloads) {
+	if row < 1 || row > len(s.visible) {
 		return ""
 	}
-	return s.workloads[row-1].ID()
+	return s.visible[row-1].ID()
 }
 
 func (s *SubjectInfo) indexOf(id string) int {
 	if id == "" {
 		return -1
 	}
-	return slices.IndexFunc(s.workloads, func(item SubjectWorkload) bool {
+	return slices.IndexFunc(s.visible, func(item SubjectWorkload) bool {
 		return item.ID() == id
 	})
+}
+
+func (s *SubjectInfo) filteredWorkloads() []SubjectWorkload {
+	filter := strings.ToLower(strings.TrimSpace(s.filter))
+	if filter == "" {
+		return slices.Clone(s.workloads)
+	}
+	items := make([]SubjectWorkload, 0, len(s.workloads))
+	for _, item := range s.workloads {
+		text := strings.Join([]string{item.Kind, item.Namespace, item.Name, item.Status}, " ")
+		if strings.Contains(strings.ToLower(text), filter) {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func (s *SubjectInfo) panelTitle() string {
+	title := " Subject "
+	if s.filter != "" {
+		title = strings.TrimSuffix(title, " ") + fmt.Sprintf(" · filter: %s ", s.filter)
+	}
+	return title
 }
 
 func (s *SubjectInfo) setHeader(row int) {
@@ -251,7 +295,11 @@ func (s *SubjectInfo) setWorkload(row int, item SubjectWorkload) {
 }
 
 func (s *SubjectInfo) emptyCell() *tview.TableCell {
-	return tview.NewTableCell(subjectInfoEmptyMessage).
+	message := subjectInfoEmptyMessage
+	if len(s.workloads) > 0 && strings.TrimSpace(s.filter) != "" {
+		message = "No subject workloads match the active filter."
+	}
+	return tview.NewTableCell(message).
 		SetTextColor(s.fgColor()).
 		SetBackgroundColor(s.bgColor()).
 		SetExpansion(1).

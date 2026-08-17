@@ -11,6 +11,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 IMAGE_NAME="${IMAGE_NAME:-k9s}"
+KIND_CLUSTER="${KIND_CLUSTER:-}"
+KIND_NETWORK="${KIND_NETWORK:-}"
+NPG_DEPLOYMENT="${NPG_DEPLOYMENT:-api}"
+NPG_NAMESPACE="${NPG_NAMESPACE:-netpol-demo-app}"
 PREVIOUS_VERSION="none"
 VERSION=""
 
@@ -41,11 +45,34 @@ resolve_next_version() {
   VERSION="${major}.${minor}.$((patch + 1))"
 }
 
+resolve_kind_target() {
+  local current_context=""
+
+  if [[ -z "$KIND_CLUSTER" ]] && command -v kubectl >/dev/null; then
+    current_context="$(kubectl config current-context 2>/dev/null || true)"
+    if [[ "$current_context" == kind-* ]]; then
+      KIND_CLUSTER="${current_context#kind-}"
+    fi
+  fi
+  KIND_CLUSTER="${KIND_CLUSTER:-k9s-netpol}"
+
+  if [[ -z "$KIND_NETWORK" ]]; then
+    KIND_NETWORK="$(docker inspect "${KIND_CLUSTER}-control-plane" \
+      --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' \
+      2>/dev/null | awk '{print $1}')"
+  fi
+  KIND_NETWORK="${KIND_NETWORK:-kind}"
+}
+
 main() {
+  local internal_kubeconfig
+
   require_command docker
   require_docker_daemon
 
   resolve_next_version
+  resolve_kind_target
+  internal_kubeconfig="/tmp/${KIND_CLUSTER}.internal.kubeconfig"
 
   echo "==> previous ${IMAGE_NAME} version: $PREVIOUS_VERSION"
   echo "==> building ${IMAGE_NAME}:${VERSION}"
@@ -54,14 +81,16 @@ main() {
   cat <<EOF
 ==> built image: ${IMAGE_NAME}:${VERSION}
 
-Sample run command:
+Run against kind cluster ${KIND_CLUSTER} and open the NetworkPolicy graph:
+kind get kubeconfig --name "${KIND_CLUSTER}" --internal > "${internal_kubeconfig}" && \\
 docker run --rm -it \\
-  -v "\$HOME/.kube/config:/root/.kube/config:ro" \\
-  ${IMAGE_NAME}:${VERSION}
-
-Note: local clusters (kind, minikube, Docker Desktop) usually also need
-      --network host on Linux. To use a different kubeconfig, change the -v
-      mount above or set KUBECONFIG inside the container.
+  --network "${KIND_NETWORK}" \\
+  -e TERM=xterm-256color \\
+  -e KUBECONFIG=/root/.kube/config \\
+  -v "${internal_kubeconfig}:/root/.kube/config:ro" \\
+  ${IMAGE_NAME}:${VERSION} \\
+  --context "kind-${KIND_CLUSTER}" \\
+  -c "npg deployment ${NPG_DEPLOYMENT} ${NPG_NAMESPACE}"
 EOF
 }
 

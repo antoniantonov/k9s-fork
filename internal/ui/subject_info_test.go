@@ -146,6 +146,41 @@ func TestSubjectInfoFallsBackToFirstRowWhenSelectionDisappears(t *testing.T) {
 	require.Equal(t, "Pod/demo/a", info.SelectedID())
 }
 
+func TestSubjectInfoFiltersVisibleWorkloads(t *testing.T) {
+	info := NewSubjectInfo().SetWorkloads([]SubjectWorkload{
+		{Kind: "Deployment", Namespace: "demo", Name: "api", Status: "2/2 ready"},
+		{Kind: "Pod", Namespace: "demo", Name: "api-123", Status: "Running"},
+		{Kind: "Job", Namespace: "ops", Name: "cleanup", Status: "Complete"},
+	})
+
+	info.SetFilter("complete")
+
+	require.Equal(t, "complete", info.Filter())
+	require.Equal(t, " Subject · filter: complete ", info.GetTitle())
+	require.Equal(t, 2, info.Table.GetRowCount())
+	requireSubjectInfoRow(t, info, 1, SubjectWorkload{
+		Kind: "Job", Namespace: "ops", Name: "cleanup", Status: "Complete",
+	})
+	require.Equal(t, "Job/ops/cleanup", info.SelectedID())
+
+	info.SetFilter("")
+
+	require.Equal(t, " Subject ", info.GetTitle())
+	require.Equal(t, 4, info.Table.GetRowCount())
+}
+
+func TestSubjectInfoFilterShowsEmptyState(t *testing.T) {
+	info := NewSubjectInfo().SetWorkloads([]SubjectWorkload{{
+		Kind: "Pod", Namespace: "demo", Name: "api", Status: "Running",
+	}})
+
+	info.SetFilter("missing")
+
+	require.Equal(t, 1, info.Table.GetRowCount())
+	require.Equal(t, "No subject workloads match the active filter.", info.Table.GetCell(0, 0).Text)
+	require.Empty(t, info.SelectedID())
+}
+
 func requireSubjectInfoRow(t *testing.T, info *SubjectInfo, row int, expected SubjectWorkload) {
 	t.Helper()
 

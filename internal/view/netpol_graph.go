@@ -164,6 +164,15 @@ const (
 	focusApplicability
 )
 
+type reachabilitySearchTarget uint8
+
+const (
+	searchNone reachabilitySearchTarget = iota
+	searchSubject
+	searchDirection
+	searchApplicability
+)
+
 // projectionCache memoizes the per-direction projections derived from the last
 // evaluated result. The evaluator clones its whole slice on every call and the
 // detail pane derives it several times per keystroke, which is enough work to
@@ -207,6 +216,7 @@ type NetworkPolicyGraph struct {
 	panels      map[netpol.Direction]*ui.DirectionPanel
 	state       map[netpol.Direction]*reachabilityDirectionState
 	kinds       sets.Set[netpol.PrimitiveKind]
+	appFilters  map[netpol.Direction]string
 	mode        ui.ReachabilityProjection
 	allowedOnly bool
 	focus       netpol.Direction
@@ -218,6 +228,7 @@ type NetworkPolicyGraph struct {
 	lastError   error
 	cancel      context.CancelFunc
 	listening   bool
+	logoBadge   ui.LogoBadgeToken
 	mx          sync.Mutex
 
 	// Workload rows are collected from the informers, which can block, so they
@@ -280,6 +291,7 @@ func newNetworkPolicyGraph(subject netpol.SubjectRef, evaluator netpol.Evaluator
 		state:       make(map[netpol.Direction]*reachabilityDirectionState, 2),
 		projections: make(map[netpol.Direction]*projectionCache, 2),
 		rows:        make(map[netpol.Direction]*applicabilityMemo, 2),
+		appFilters:  make(map[netpol.Direction]string, 2),
 		kinds:       netpol.AllPrimitiveKinds(),
 		mode:        ui.RulesProjection,
 		focus:       netpol.Ingress,
@@ -289,8 +301,8 @@ func newNetworkPolicyGraph(subject netpol.SubjectRef, evaluator netpol.Evaluator
 		v.state[direction] = &reachabilityDirectionState{
 			visible: true,
 			states: map[ui.ReachabilityProjection]reachabilityModeState{
-				ui.RulesProjection:      {},
-				ui.PrimitivesProjection: {},
+				ui.RulesProjection:      {scroll: ui.ReachabilityScrollState{Cleared: true}},
+				ui.PrimitivesProjection: {scroll: ui.ReachabilityScrollState{Cleared: true}},
 			},
 		}
 		panel := ui.NewDirectionPanel(direction)
@@ -425,6 +437,11 @@ func (v *NetworkPolicyGraph) ensureListeners() {
 func (v *NetworkPolicyGraph) Start() {
 	v.stopWatch()
 	v.ensureListeners()
+	if v.app != nil && v.logoBadge == 0 {
+		if logo := v.app.Logo(); logo != nil {
+			v.logoBadge = logo.SetViewBadge("read-only graph", tcell.ColorYellow, tcell.ColorRed)
+		}
+	}
 	if v.autoRefresh {
 		v.startWatch()
 		return
@@ -435,6 +452,14 @@ func (v *NetworkPolicyGraph) Start() {
 // Stop terminates graph updates and releases listeners.
 func (v *NetworkPolicyGraph) Stop() {
 	v.stopWatch()
+	if v.logoBadge != 0 {
+		if v.app != nil {
+			if logo := v.app.Logo(); logo != nil {
+				logo.ClearViewBadge(v.logoBadge)
+			}
+		}
+		v.logoBadge = 0
+	}
 	if v.listening {
 		v.model.RemoveListener(v)
 		if v.app != nil {
@@ -789,14 +814,14 @@ func (v *NetworkPolicyGraph) detailStops(direction netpol.Direction) (details, a
 	}
 	id := v.panels[direction].SelectedID()
 	if id == "" {
-		return true, len(v.visibleApplicability(v.directionApplicability(direction))) > 0
+		return true, len(v.visibleApplicability(direction, v.directionApplicability(direction))) > 0
 	}
 	if v.mode == ui.RulesProjection {
 		rule, ok := v.selectedRule(direction, id)
 		if !ok {
 			return false, false
 		}
-		return true, len(v.visibleApplicability(v.ruleApplicability(direction, rule.ID))) > 0
+		return true, len(v.visibleApplicability(direction, v.ruleApplicability(direction, rule.ID))) > 0
 	}
 	// Primitives render a plain text pane with no applicability table.
 	_, ok := v.selectedPrimitive(direction, id)
@@ -1093,6 +1118,7 @@ func subjectPodWorkloads(factory dao.Factory, pods []netpol.PodRef) ([]ui.Subjec
 			Kind:      "Pod",
 			Namespace: pod.Namespace,
 			Name:      pod.Name,
+			UID:       pod.UID,
 			Status:    statuses[objectKey(pod.Namespace, pod.Name)],
 		})
 	}
@@ -1135,6 +1161,7 @@ func namespaceSubjectWorkloads(factory dao.Factory, namespace string) ([]ui.Subj
 				Kind:      spec.kind,
 				Namespace: object.GetNamespace(),
 				Name:      object.GetName(),
+				UID:       object.GetUID(),
 				Status:    workloadStatus(spec.kind, object),
 			})
 		}
@@ -1336,7 +1363,7 @@ func (v *NetworkPolicyGraph) renderDetails(direction netpol.Direction) {
 			v.refocusDetail()
 			return
 		}
-		rows := v.visibleApplicability(v.ruleApplicability(direction, rule.ID))
+		rows := v.visibleApplicability(direction, v.ruleApplicability(direction, rule.ID))
 		ruleDetail := ui.NewRuleDetailsWithStyle(rule, rows, v.reachabilityStyle())
 		ruleDetail.Applicability.SetTitle(v.applicabilityTitle("Applicability", direction))
 		v.applyDetailFocusStyle(ruleDetail)
@@ -1372,8 +1399,9 @@ func (v *NetworkPolicyGraph) renderDetails(direction netpol.Direction) {
 // showEffectiveDetails renders the direction's reachability after every rule has
 // been applied. It is what the details pane shows when nothing is selected.
 func (v *NetworkPolicyGraph) showEffectiveDetails(direction netpol.Direction, previous detailScrollState) {
-	rows := v.visibleApplicability(v.directionApplicability(direction))
-	detail := ui.NewEffectiveDetailsWithStyle(v.effectiveDetailsText(direction, rows), rows, direction, v.reachabilityStyle())
+	allRows := v.directionApplicability(direction)
+	rows := v.visibleApplicability(direction, allRows)
+	detail := ui.NewEffectiveDetailsWithStyle(v.effectiveDetailsText(direction, allRows), rows, direction, v.reachabilityStyle())
 	detail.Applicability.SetTitle(v.applicabilityTitle("Effective Applicability", direction))
 	v.applyDetailFocusStyle(detail)
 	detail.SetApplicabilityChangedFunc(func(string) { v.syncActions() })
@@ -1406,11 +1434,7 @@ func (v *NetworkPolicyGraph) effectiveDetailsText(direction netpol.Direction, ro
 		v.detailPrefix(direction), v.mode, direction, primitiveKindsSummary(v.kinds))
 	fmt.Fprintf(&b, "Primitives: %d · %s\n", len(rows), strings.Join(breakdown, " · "))
 	if len(rows) == 0 {
-		if v.mode == ui.RulesProjection && v.allowedOnly {
-			b.WriteString("\nNo allowed primitives match the enabled kinds for this direction.\n")
-		} else {
-			b.WriteString("\nNo primitives match the enabled kinds for this direction.\n")
-		}
+		b.WriteString("\nNo primitives match the enabled kinds for this direction.\n")
 	}
 	b.WriteString("\nThis is the aggregate result of every evaluated rule. Select a rule or\n")
 	b.WriteString("primitive to inspect its individual contribution.\n")
@@ -1423,7 +1447,11 @@ func (v *NetworkPolicyGraph) applicabilityTitle(prefix string, direction netpol.
 	if v.mode == ui.RulesProjection && v.allowedOnly {
 		suffix = " (Allowed only)"
 	}
-	return fmt.Sprintf(" %s (%s)%s ", prefix, direction, suffix)
+	title := fmt.Sprintf(" %s (%s)%s ", prefix, direction, suffix)
+	if filter := v.appFilters[direction]; filter != "" {
+		title = strings.TrimSuffix(title, " ") + fmt.Sprintf(" · filter: %s ", filter)
+	}
+	return title
 }
 
 // detailScrollState remembers what the detail pane renders and where its cursor
@@ -1629,17 +1657,84 @@ func (v *NetworkPolicyGraph) directionApplicability(direction netpol.Direction) 
 	return v.rows[direction].rows
 }
 
-func (v *NetworkPolicyGraph) visibleApplicability(rows []netpol.ApplicabilityRow) []netpol.ApplicabilityRow {
-	if v.mode != ui.RulesProjection || !v.allowedOnly {
+func (v *NetworkPolicyGraph) visibleApplicability(
+	direction netpol.Direction,
+	rows []netpol.ApplicabilityRow,
+) []netpol.ApplicabilityRow {
+	filter := strings.TrimSpace(v.appFilters[direction])
+	if (v.mode != ui.RulesProjection || !v.allowedOnly) && filter == "" {
 		return rows
 	}
 	visible := make([]netpol.ApplicabilityRow, 0, len(rows))
 	for index := range rows {
-		if rows[index].EffectiveState == netpol.AccessAllowed {
-			visible = append(visible, rows[index])
+		row := &rows[index]
+		if v.mode == ui.RulesProjection && v.allowedOnly && row.EffectiveState != netpol.AccessAllowed {
+			continue
 		}
+		if !matchesApplicabilityFilter(row, filter) {
+			continue
+		}
+		visible = append(visible, *row)
 	}
 	return visible
+}
+
+func matchesApplicabilityFilter(row *netpol.ApplicabilityRow, filter string) bool {
+	if filter == "" {
+		return true
+	}
+	ref := &row.Primitive.Ref
+	peer := fmt.Sprintf("%t", row.PeerMatches)
+	opposite := fmt.Sprintf("%t", row.OppositeSideAllows)
+	ports := applicabilityPermissionsText(row.Permissions)
+	if ref.Kind == netpol.PrimitiveCIDR {
+		opposite = "n/a"
+	}
+	if row.Primitive.TotalPairs == 0 {
+		peer, opposite, ports = "n/a", "n/a", "n/a"
+	}
+	displayed := []string{
+		applicabilityPrimitiveText(ref),
+		peer,
+		opposite,
+		row.EffectiveState.String(),
+		ports,
+	}
+	return strings.Contains(
+		strings.ToLower(strings.Join(displayed, " ")),
+		strings.ToLower(strings.TrimSpace(filter)),
+	)
+}
+
+func applicabilityPrimitiveText(ref *netpol.PrimitiveRef) string {
+	valueOrDash := func(value string) string {
+		if value == "" {
+			return "—"
+		}
+		return value
+	}
+	if ref.Kind == netpol.PrimitiveCIDR {
+		if len(ref.CIDRExcept) == 0 {
+			return "CIDR " + valueOrDash(ref.CIDR)
+		}
+		return fmt.Sprintf("CIDR %s (except %s)", valueOrDash(ref.CIDR), strings.Join(ref.CIDRExcept, ", "))
+	}
+	name := ref.Name
+	if ref.Namespace != "" {
+		name = ref.Namespace + "/" + name
+	}
+	return ref.Kind.String() + " " + valueOrDash(name)
+}
+
+func applicabilityPermissionsText(permissions []netpol.PortPermission) string {
+	if len(permissions) == 0 {
+		return "no ports"
+	}
+	values := make([]string, 0, len(permissions))
+	for _, permission := range permissions {
+		values = append(values, permission.String())
+	}
+	return strings.Join(values, ", ")
 }
 
 func (v *NetworkPolicyGraph) openKindsDialog() {
@@ -1670,37 +1765,40 @@ func (v *NetworkPolicyGraph) openKindsDialog() {
 }
 
 func (v *NetworkPolicyGraph) openSearchDialog() {
-	if v.app == nil || !v.state[v.focus].visible {
+	target := v.searchTarget()
+	if v.app == nil || target == searchNone {
 		return
+	}
+	stop := focusStop{target: v.focusTarget, direction: v.focus}
+	finish := func() {
+		v.app.Content.RemovePage(netPolSearchPage)
+		v.restoreSearchFocus(stop)
 	}
 	styles := v.app.Styles.Dialog()
 	input := tview.NewInputField().
 		SetLabel("Filter: ").
-		SetText(v.state[v.focus].states[v.mode].filter)
+		SetText(v.searchFilter(target, v.focus))
 	form := tview.NewForm().
 		AddFormItem(input).
 		AddButton("Apply", func() {
-			v.applySearch(input.GetText())
-			v.app.Content.RemovePage(netPolSearchPage)
+			v.applySearchTarget(target, stop.direction, input.GetText())
+			finish()
 		}).
 		AddButton("Clear", func() {
-			v.applySearch("")
-			v.app.Content.RemovePage(netPolSearchPage)
+			v.applySearchTarget(target, stop.direction, "")
+			finish()
 		}).
 		AddButton("Cancel", func() {
-			v.app.Content.RemovePage(netPolSearchPage)
-			v.focusActiveDirection()
+			finish()
 		})
 	form.SetCancelFunc(func() {
-		v.app.Content.RemovePage(netPolSearchPage)
-		v.focusActiveDirection()
+		finish()
 	})
 	styleForm(form, &styles)
 	modal := tview.NewModalForm("<Reachability Search>", form)
 	modal.SetBackgroundColor(styles.BgColor.Color()).SetTextColor(styles.FgColor.Color())
 	modal.SetDoneFunc(func(int, string) {
-		v.app.Content.RemovePage(netPolSearchPage)
-		v.focusActiveDirection()
+		finish()
 	})
 	v.app.Content.AddPage(netPolSearchPage, modal, false, false)
 	v.app.Content.ShowPage(netPolSearchPage)
@@ -1752,17 +1850,14 @@ func (v *NetworkPolicyGraph) applySubject(ref netpol.SubjectRef) {
 	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
 		state := v.state[direction]
 		for projection, modeState := range state.states {
-			modeState.scroll = ui.ReachabilityScrollState{}
+			modeState.scroll = ui.ReachabilityScrollState{Cleared: true}
 			state.states[projection] = modeState
 		}
 		v.loadPanel(direction)
 	}
 	v.scheduleWorkloads()
 	v.updateSubject()
-	v.focusActiveDirection()
-	// After focusActiveDirection: its updateDetails would otherwise replace this
-	// with "No selected reachability result.", which reads as a prompt to select
-	// something rather than as a pending evaluation.
+	v.applyFocusTarget(focusSubject)
 	v.showMessage("Waiting for NetworkPolicy evaluation...")
 	// Without a watch loop nothing consumes the model refresh request, so the
 	// new subject would never be evaluated while auto-refresh is disabled.
@@ -1839,15 +1934,83 @@ func subjectRefFromObject(kind netpol.SubjectKind, object runtime.Object) (netpo
 	return ref, true
 }
 
+func (v *NetworkPolicyGraph) searchTarget() reachabilitySearchTarget {
+	switch v.focusTarget {
+	case focusSubject:
+		return searchSubject
+	case focusIngress, focusEgress:
+		if v.state[v.focus].visible {
+			return searchDirection
+		}
+	case focusApplicability:
+		if _, ok := v.detailItem.(*ui.RuleDetails); ok {
+			return searchApplicability
+		}
+	case focusDetails:
+		if v.detailShown.effective {
+			return searchNone
+		}
+		switch v.detailItem.(type) {
+		case *ui.RuleDetails:
+			return searchApplicability
+		case *tview.TextView:
+			if v.mode == ui.PrimitivesProjection && v.state[v.focus].visible &&
+				v.panels[v.focus].SelectedID() != "" {
+				return searchDirection
+			}
+		}
+	}
+	return searchNone
+}
+
+func (v *NetworkPolicyGraph) searchFilter(target reachabilitySearchTarget, direction netpol.Direction) string {
+	switch target {
+	case searchSubject:
+		return v.subjectInfo.Filter()
+	case searchDirection:
+		return v.state[direction].states[v.mode].filter
+	case searchApplicability:
+		return v.appFilters[direction]
+	default:
+		return ""
+	}
+}
+
 func (v *NetworkPolicyGraph) applySearch(filter string) {
-	state := v.state[v.focus]
-	modeState := state.states[v.mode]
-	modeState.filter = filter
-	state.states[v.mode] = modeState
-	v.panels[v.focus].SetFilter(filter)
-	v.savePanelState(v.focus)
-	v.updateDetails(v.focus)
-	v.focusActiveDirection()
+	v.applySearchTarget(v.searchTarget(), v.focus, filter)
+}
+
+func (v *NetworkPolicyGraph) applySearchTarget(
+	target reachabilitySearchTarget,
+	direction netpol.Direction,
+	filter string,
+) {
+	switch target {
+	case searchSubject:
+		v.subjectInfo.SetFilter(filter)
+	case searchDirection:
+		state := v.state[direction]
+		modeState := state.states[v.mode]
+		modeState.filter = filter
+		state.states[v.mode] = modeState
+		v.panels[direction].SetFilter(filter)
+		v.savePanelState(direction)
+		if direction == v.focus {
+			v.updateDetails(direction)
+		}
+	case searchApplicability:
+		v.appFilters[direction] = filter
+		if direction == v.focus {
+			v.updateDetails(direction)
+		}
+	}
+}
+
+func (v *NetworkPolicyGraph) restoreSearchFocus(stop focusStop) {
+	if stop.target != focusSubject && v.state[stop.direction].visible {
+		v.focus = stop.direction
+	}
+	v.applyFocusTarget(stop.target)
 }
 
 // openRuleTarget resolves the NetworkPolicy backing the focused direction
@@ -2192,6 +2355,43 @@ func (v *NetworkPolicyGraph) applicabilitySubjectTarget() (netpol.SubjectRef, bo
 	return ref, true
 }
 
+func (v *NetworkPolicyGraph) subjectWorkloadTarget() (netpol.SubjectRef, bool) {
+	if v.focusTarget != focusSubject {
+		return netpol.SubjectRef{}, false
+	}
+	id := v.subjectInfo.SelectedID()
+	index := slices.IndexFunc(v.workloads, func(item ui.SubjectWorkload) bool {
+		return item.ID() == id
+	})
+	if index < 0 {
+		return netpol.SubjectRef{}, false
+	}
+	workload := &v.workloads[index]
+	ref := netpol.SubjectRef{
+		Namespace: workload.Namespace,
+		Name:      workload.Name,
+		UID:       workload.UID,
+	}
+	switch workload.Kind {
+	case "Pod":
+		ref.Kind = netpol.SubjectPod
+	case "Deployment":
+		ref.Kind = netpol.SubjectDeployment
+	case "Job":
+		ref.Kind = netpol.SubjectJob
+	default:
+		return netpol.SubjectRef{}, false
+	}
+	return ref, true
+}
+
+func (v *NetworkPolicyGraph) subjectPromotionTarget() (netpol.SubjectRef, bool) {
+	if ref, ok := v.subjectWorkloadTarget(); ok {
+		return ref, true
+	}
+	return v.applicabilitySubjectTarget()
+}
+
 // openApplicabilityCmd opens the primitive backing the highlighted
 // applicability row.
 func (v *NetworkPolicyGraph) openApplicabilityCmd(evt *tcell.EventKey) *tcell.EventKey {
@@ -2211,8 +2411,8 @@ func (v *NetworkPolicyGraph) openApplicabilityCmd(evt *tcell.EventKey) *tcell.Ev
 	return nil
 }
 
-func (v *NetworkPolicyGraph) applyApplicabilitySubjectCmd(evt *tcell.EventKey) *tcell.EventKey {
-	ref, ok := v.applicabilitySubjectTarget()
+func (v *NetworkPolicyGraph) applySubjectPromotionCmd(evt *tcell.EventKey) *tcell.EventKey {
+	ref, ok := v.subjectPromotionTarget()
 	if !ok {
 		return evt
 	}
@@ -2254,7 +2454,6 @@ func (v *NetworkPolicyGraph) bindKeys() {
 		ui.KeyM:          ui.NewKeyAction("Toggle Mode", func(*tcell.EventKey) *tcell.EventKey { v.switchMode(); return nil }, true),
 		ui.KeyF:          ui.NewKeyAction("Primitive Kinds", func(*tcell.EventKey) *tcell.EventKey { v.openKindsDialog(); return nil }, true),
 		ui.KeyS:          ui.NewKeyAction("Subject", func(*tcell.EventKey) *tcell.EventKey { v.openSubjectDialog(); return nil }, true),
-		ui.KeySlash:      ui.NewKeyAction("Search", func(*tcell.EventKey) *tcell.EventKey { v.openSearchDialog(); return nil }, true),
 		ui.KeyR:          ui.NewKeyAction("Toggle Auto-Refresh", func(*tcell.EventKey) *tcell.EventKey { v.toggleAutoRefresh(); return nil }, true),
 		tcell.KeyCtrlR:   ui.NewKeyAction("Refresh", func(*tcell.EventKey) *tcell.EventKey { v.Refresh(); return nil }, true),
 		tcell.KeyEnter:   ui.NewKeyAction("Focus Details/Open", v.enterCmd, false),
@@ -2271,6 +2470,14 @@ func (v *NetworkPolicyGraph) bindKeys() {
 // to act on, so the menu never advertises an action that would just flash an
 // error. It must run after anything that changes focus, mode, or a selection.
 func (v *NetworkPolicyGraph) syncActions() {
+	if v.searchTarget() != searchNone {
+		v.actions.Add(ui.KeySlash, ui.NewKeyAction("Search", func(*tcell.EventKey) *tcell.EventKey {
+			v.openSearchDialog()
+			return nil
+		}, true))
+	} else {
+		v.actions.Delete(ui.KeySlash)
+	}
 	if v.mode == ui.RulesProjection {
 		v.actions.Add(ui.KeyA, ui.NewKeyAction("Allowed Only", func(*tcell.EventKey) *tcell.EventKey {
 			v.toggleAllowedOnly()
@@ -2279,10 +2486,10 @@ func (v *NetworkPolicyGraph) syncActions() {
 	} else {
 		v.actions.Delete(ui.KeyA)
 	}
-	if _, ok := v.applicabilitySubjectTarget(); ok {
-		v.actions.Add(ui.KeyShiftEnter, ui.NewKeyAction("Set Subject", v.applyApplicabilitySubjectCmd, true))
+	if _, ok := v.subjectPromotionTarget(); ok {
+		v.actions.Add(tcell.KeyCtrlS, ui.NewKeyAction("Set Subject", v.applySubjectPromotionCmd, true))
 	} else {
-		v.actions.Delete(ui.KeyShiftEnter)
+		v.actions.Delete(tcell.KeyCtrlS)
 	}
 	if _, _, ok := v.openRuleTarget(); ok {
 		v.actions.Add(ui.KeyO, ui.NewKeyAction(openRuleHint, v.openRuleCmd, true))
@@ -2303,11 +2510,7 @@ func (v *NetworkPolicyGraph) syncActions() {
 }
 
 func (v *NetworkPolicyGraph) keyboard(evt *tcell.EventKey) *tcell.EventKey {
-	key := ui.AsKey(evt)
-	if evt.Key() == tcell.KeyEnter && evt.Modifiers() == tcell.ModShift {
-		key = ui.KeyShiftEnter
-	}
-	if action, ok := v.actions.Get(key); ok {
+	if action, ok := v.actions.Get(ui.AsKey(evt)); ok {
 		return action.Action(evt)
 	}
 	return evt

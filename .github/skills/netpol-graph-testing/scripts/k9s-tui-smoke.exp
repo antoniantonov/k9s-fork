@@ -160,6 +160,15 @@ proc focus_ingress {} {
   send_key "\033\[D" 250
 }
 
+proc select_direction_row_with_hint {pattern description {max_moves 30}} {
+  for {set moves 0} {$moves < $max_moves} {incr moves} {
+    if {[screen_matches $pattern 1]} { return 1 }
+    send_key "\033\[B" 150
+  }
+  fail_case "could not find $description"
+  return 0
+}
+
 proc finish_case {} {
   assert_reachability_view 20
   pass_case
@@ -180,7 +189,7 @@ spawn {*}$docker_args
 stty rows 50 columns 200 < $spawn_out(slave,name)
 
 start_case "launch-npg-view"
-if {[assert_all_screen {Subject {Deployment netpol-demo-app/api} {3 pods} {Ingress on} {Egress on} {Kinds: CIDR,Pod,Namespace,Deployment,Job} {Auto-refresh off} {Ingress · Rules} {Egress · Rules} {Rule Details} {Applicability \(Ingress\)} {<ctrl-r>} {Refresh} {</>} Search {<npg>}} 45]} {
+if {[assert_all_screen {Subject {Deployment netpol-demo-app/api} {3 pods} {Ingress on} {Egress on} {Kinds: CIDR,Pod,Namespace,Deployment,Job} {Auto-refresh off} {Ingress · Rules} {Egress · Rules} {Selection: none} {Effective Details} {Effective Applicability \(Ingress\)} {read-only graph} {<ctrl-r>} {Refresh} {</>} Search {<npg>}} 45]} {
 pass_case
 }
 
@@ -261,7 +270,7 @@ start_case "tab-and-shift-tab-focus-ring"
 for {set i 0} {$i < 3} {incr i} { send_key "\t" 150 }
 assert_all_screen {{Applicability \(Ingress\)} Primitive Peer Opposite State Ports} 15
 for {set i 0} {$i < 3} {incr i} { send_key "\033\[Z" 150 }
-assert_all_screen {Subject Ingress Egress {Rule Details} {Applicability \(Ingress\)}} 10
+assert_all_screen {Subject Ingress Egress {Effective Details} {Effective Applicability \(Ingress\)}} 10
 pass_case
 
 start_case "left-right-direction-focus"
@@ -276,7 +285,8 @@ pass_case
 start_case "enter-navigation-rule-selected"
 ensure_rules
 # From a direction panel in Rules mode, Enter focuses Applicability.
-send_key "\033\[D"
+focus_ingress
+send_key "\033\[B"
 send_key "\r"
 assert_all_screen {{Applicability \(Ingress\)} Primitive Peer Opposite State Ports} 15
 pass_case
@@ -284,9 +294,8 @@ pass_case
 start_case "enter-navigation-effective-applicability"
 ensure_rules
 focus_ingress
-# Clear the selected rule so the pane renders the direction's effective
-# applicability, then Enter focuses that table.
-send_key "\033"
+# The graph opens without a selected rule, so Enter focuses the direction's
+# effective applicability table directly.
 assert_screen {Effective Details|Selection: none} 15
 assert_screen {Effective Applicability \(Ingress\)} 15
 send_key "\r"
@@ -295,10 +304,11 @@ pass_case
 
 start_case "enter-navigation-primitive-details"
 ensure_primitives
-# Return to a direction panel, switch to Primitives, and Enter focuses the text
-# detail pane (there is no applicability table in this projection).
-send_key "\033\[D"
+# Select a primitive, then Enter focuses its text detail pane (there is no
+# applicability table in this projection).
+focus_ingress
 assert_screen {Ingress · Primitives} 15
+send_key "\033\[B"
 assert_screen {Primitive Details} 15
 send_key "\r"
 assert_all_screen {{Primitive Details} {Direction: Ingress|Coverage:}} 15
@@ -315,7 +325,7 @@ assert_screen {Applicability \(Ingress\)} 15
 assert_screen {CIDR 192\.168\.0\.0/16} 15
 send_key "\033\[B"
 send_key "\r"
-if {[assert_screen {Pods|Namespaces|namespaces|Deployments|deployments|Jobs|jobs|Viewing v1/pods|Viewing v1/namespaces|Viewing apps/v1/deployments|Viewing batch/v1/jobs} 20]} {
+if {[assert_screen {Pods|pods\(|Namespaces|namespaces\(|Deployments|deployments\(|Jobs|jobs\(|Viewing v1/pods|Viewing v1/namespaces|Viewing apps/v1/deployments|Viewing batch/v1/jobs} 20]} {
   send_key "\033"
   finish_case
 }
@@ -325,11 +335,11 @@ ensure_rules
 focus_ingress
 # The first row is the synthetic default-deny, which is not a real rule and so
 # offers nothing to open.
+send_key "\033\[B"
 if {[screen_matches {<o>} 5]} {
   fail_case "Open Rule is advertised for the synthetic default-deny row"
-} else {
-  send_key "\033\[B"
-  assert_all_screen {{<o>} {Open Rule}} 20
+} elseif {[select_direction_row_with_hint {<o>} "a real rule with the Open Rule hint"]} {
+  assert_screen {Open Rule} 20
   send_key "o"
   assert_screen {NetworkPolicies|NetworkPolicy|policy} 20
   send_key "\033"
@@ -340,37 +350,38 @@ if {[screen_matches {<o>} 5]} {
 start_case "open-rule-hidden-in-primitives"
 ensure_rules
 focus_ingress
-send_key "\033\[B"
-assert_screen {<o>} 20
-send_key "m"
-assert_screen {Ingress · Primitives} 15
-if {[screen_matches {Open Rule} 5]} {
-  fail_case "Open Rule must not be offered in Primitives mode"
-} else {
+if {[select_direction_row_with_hint {<o>} "a real rule with the Open Rule hint"]} {
   send_key "m"
-  finish_case
+  assert_screen {Ingress · Primitives} 15
+  if {[screen_matches {Open Rule} 5]} {
+    fail_case "Open Rule must not be offered in Primitives mode"
+  } else {
+    send_key "m"
+    finish_case
+  }
 }
 
 start_case "yaml-view"
 ensure_rules
 focus_ingress
-# Move off the synthetic default-deny row: only a real rule has a manifest.
-send_key "\033\[B"
-send_key "y"
-if {[assert_screen {apiVersion|networking\.k8s\.io|YAML} 20]} {
-  send_key "\033"
-  finish_case
+# Only a real rule has a manifest, so navigate by the advertised action rather
+# than assuming a fixed rule row.
+if {[select_direction_row_with_hint {<y>} "a real rule with the YAML hint"]} {
+  send_key "y"
+  if {[assert_screen {apiVersion|networking\.k8s\.io|YAML} 20]} {
+    send_key "\033"
+    finish_case
+  }
 }
 
 start_case "yaml-hidden-without-a-manifest"
 ensure_rules
 focus_ingress
 # The synthetic default-deny row references no NetworkPolicy.
+send_key "\033\[B"
 if {[screen_matches {<y>} 5]} {
   fail_case "YAML is advertised for the synthetic default-deny row"
-} else {
-  send_key "\033\[B"
-  assert_screen {<y>} 20
+} elseif {[select_direction_row_with_hint {<y>} "a real rule with the YAML hint"]} {
   # Walk into the applicability table and land on the CIDR row, which is not a
   # Kubernetes resource and therefore has no manifest either.
   send_key "\r"
@@ -396,9 +407,43 @@ if {[wait_stream {Auto-refresh is disabled|Auto-refresh off|Auto-refresh} 10]} {
 start_case "escape-clears-selection-before-back"
 ensure_rules
 focus_ingress
+send_key "\033\[B"
 send_key "\033"
 assert_screen {Effective Details.*Effective Applicability \(Ingress\)|Selection: none} 15
 pass_case
+
+start_case "ctrl-s-set-subject-from-subject-panel"
+ensure_rules
+if {[assert_all_screen {{<ctrl-s>} {Set Subject} {Pod[[:space:]]+netpol-demo-app[[:space:]]+api-}} 30]} {
+  # Ctrl-S is delivered directly by the legacy tcell key map.
+  send_key "\023" 500
+  if {[assert_all_screen {Subject {Pod netpol-demo-app/api-[[:alnum:]-]+ · 1 pod} {<ctrl-s>} {Set Subject}} 45]} {
+    pass_case
+  }
+}
+
+start_case "ctrl-s-set-subject-from-applicability"
+ensure_rules
+focus_ingress
+assert_all_screen {{Selection: none} {Effective Applicability \(Ingress\)}} 15
+send_key "\r"
+assert_screen {Effective Applicability \(Ingress\)} 15
+# Filter to one known subject-capable primitive instead of relying on a fixed
+# applicability row count or ordering.
+send_key "/"
+if {[assert_screen {Reachability Search|Filter:} 10]} {
+  send_key "Deployment netpol-demo-web/frontend"
+  send_key "\t"
+  send_key "\r"
+  if {[assert_all_screen {{Effective Applicability \(Ingress\).*filter: Deployment netpol-demo-web/frontend} {Deployment netpol-demo-web/frontend}} 20]} {
+    if {[assert_all_screen {{<ctrl-s>} {Set Subject}} 15]} {
+      send_key "\023" 500
+      if {[assert_all_screen {Subject {Deployment netpol-demo-web/frontend · 2 pods} {<ctrl-s>} {Set Subject}} 45]} {
+        pass_case
+      }
+    }
+  }
+}
 
 start_case "freeze-hang-stress"
 # Mash the keys that touch the evaluator, the panels and the refresh loop. The

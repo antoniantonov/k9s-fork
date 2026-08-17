@@ -9,19 +9,25 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 DEMO_SCRIPT="$SCRIPT_DIR/netpol-demo-workloads.sh"
 EXPECT_SCRIPT="$SCRIPT_DIR/k9s-tui-smoke.exp"
-PHASES=(preflight ensure-cluster ensure-workloads build-image go-tests tui-tests report)
+PHASES=(preflight ensure-cluster ensure-workloads go-tests build-image tui-tests report)
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="$SKILL_DIR/runs/$RUN_ID"
 CLUSTER="k9s-netpol"
 PREFIX="netpol-demo"
 TIMEOUT="180s"
 IMAGE_NAME="k9s"
+REQUESTED_IMAGE=""
 ONLY=""
 FROM=""
 SKIPS=()
 FORCE_WORKLOADS=0
 REBUILD=0
-BUILT_IMAGE=""
+CLEAN_IMAGE=0
+BUILD_ATTEMPTED=0
+BUILT_IMAGE_TAG=""
+BUILT_IMAGE_ID=""
+TEST_IMAGE_TAG=""
+TEST_IMAGE_ID=""
 OVERALL_STATUS=0
 
 usage() {
@@ -29,11 +35,14 @@ usage() {
 Usage: $0 [options]
 
 Options:
-  --only PHASE          run one phase (preflight, ensure-cluster, ensure-workloads, build-image, go-tests, tui-tests, report)
+  --only PHASE          run one phase (preflight, ensure-cluster, ensure-workloads, go-tests, build-image, tui-tests, report)
   --skip PHASE          skip a phase; may be repeated
   --from PHASE          run from PHASE through report
   --force-workloads     repopulate workloads even when --check succeeds
   --rebuild             rebuild the k9s Docker image even when the tree cache matches
+  --clean-image         build a unique image with docker build --pull --no-cache
+  --no-image-cache      alias for --clean-image
+  --image REF           use this exact local image for TUI tests; build-image must be skipped
   --cluster NAME        kind cluster name (default: $CLUSTER)
   --prefix NAME         demo namespace prefix (default: $PREFIX)
   --timeout DURATION    readiness timeout passed to the demo script (default: $TIMEOUT)
@@ -83,10 +92,21 @@ require_phase() {
 
 log_path() { echo "$RUN_DIR/$1.log"; }
 status_path() { echo "$RUN_DIR/$1.status"; }
+image_path() { echo "$RUN_DIR/image.$1"; }
 
 record_status() {
   local phase="$1" status="$2"
   printf '%s\n' "$status" >"$(status_path "$phase")"
+}
+
+record_image() {
+  local source="$1" tag="$2" id="$3"
+  printf '%s\n' "$source" >"$(image_path source)"
+  printf '%s\n' "$tag" >"$(image_path ref)"
+  printf '%s\n' "$id" >"$(image_path id)"
+  echo "image source: $source"
+  echo "image ref: $tag"
+  echo "immutable image ID: $id"
 }
 
 run_phase() {
@@ -107,10 +127,8 @@ run_phase() {
     record_status "$phase" failed
     OVERALL_STATUS=1
     echo "    failed (see $log)" >&2
-    if [[ -n "$ONLY" ]]; then
-      return "$rc"
-    fi
   fi
+  return 0
 }
 
 phase_preflight() {
@@ -119,34 +137,57 @@ phase_preflight() {
     command -v "$cmd" >/dev/null || { echo "$cmd not found in PATH" >&2; return 1; }
     echo "$cmd: $(command -v "$cmd")"
   done
-  docker info >/dev/null
+  docker info >/dev/null || {
+    echo "cannot reach the Docker daemon" >&2
+    return 1
+  }
   echo "docker daemon: reachable"
 }
 
+check_workloads() {
+  "$DEMO_SCRIPT" --cluster "$CLUSTER" --prefix "$PREFIX" --timeout "$TIMEOUT" --check
+}
+
 phase_ensure_cluster() {
+  local topology_ready=0
+  echo "checking demo topology before any cluster bootstrap or workload population"
+  if check_workloads; then
+    topology_ready=1
+  else
+    echo "demo topology precheck did not pass"
+  fi
+
   if kind get clusters 2>/dev/null | grep -Fx "$CLUSTER" >/dev/null; then
     echo "kind cluster $CLUSTER exists; reusing"
     mkdir -p "$SKILL_DIR/.kube"
-    kind get kubeconfig --name "$CLUSTER" >"$SKILL_DIR/.kube/${CLUSTER}.kubeconfig"
-    kind get kubeconfig --name "$CLUSTER" --internal >"$SKILL_DIR/.kube/${CLUSTER}.internal.kubeconfig"
+    kind get kubeconfig --name "$CLUSTER" >"$SKILL_DIR/.kube/${CLUSTER}.kubeconfig" || return 1
+    kind get kubeconfig --name "$CLUSTER" --internal >"$SKILL_DIR/.kube/${CLUSTER}.internal.kubeconfig" || return 1
     chmod 600 "$SKILL_DIR/.kube/${CLUSTER}.kubeconfig" "$SKILL_DIR/.kube/${CLUSTER}.internal.kubeconfig"
-    kubectl --kubeconfig "$SKILL_DIR/.kube/${CLUSTER}.kubeconfig" wait --for=condition=Ready nodes --all --timeout="$TIMEOUT"
-    "$DEMO_SCRIPT" --cluster "$CLUSTER" --prefix "$PREFIX" --timeout "$TIMEOUT" --check >/dev/null || \
-      echo "cluster exists but workloads are not fully ready yet"
+    kubectl --kubeconfig "$SKILL_DIR/.kube/${CLUSTER}.kubeconfig" wait --for=condition=Ready nodes --all --timeout="$TIMEOUT" || return 1
+    if (( topology_ready == 0 )); then
+      check_workloads >/dev/null || echo "cluster exists but workloads are not fully ready yet"
+    fi
     return 0
   fi
-  echo "kind cluster $CLUSTER not found; bootstrapping via demo script"
+  echo "kind cluster $CLUSTER not found; precheck completed, bootstrapping via demo script"
   "$DEMO_SCRIPT" --cluster "$CLUSTER" --prefix "$PREFIX" --timeout "$TIMEOUT" --no-wait
 }
 
 phase_ensure_workloads() {
-  if (( FORCE_WORKLOADS == 0 )) && "$DEMO_SCRIPT" --cluster "$CLUSTER" --prefix "$PREFIX" --timeout "$TIMEOUT" --check; then
+  local topology_ready=0
+  if check_workloads; then
+    topology_ready=1
+  fi
+  if (( FORCE_WORKLOADS == 0 && topology_ready == 1 )); then
     echo "demo workloads already applied and ready; skipping population"
     return 0
   fi
+  if (( FORCE_WORKLOADS == 1 )); then
+    echo "workload precheck completed; forcing demo workload population"
+  fi
   echo "applying demo workloads"
-  "$DEMO_SCRIPT" --cluster "$CLUSTER" --prefix "$PREFIX" --timeout "$TIMEOUT"
-  "$DEMO_SCRIPT" --cluster "$CLUSTER" --prefix "$PREFIX" --timeout "$TIMEOUT" --check
+  "$DEMO_SCRIPT" --cluster "$CLUSTER" --prefix "$PREFIX" --timeout "$TIMEOUT" || return 1
+  check_workloads
 }
 
 # EMPTY_SHA256 is the digest of empty input: what shasum returns when the file
@@ -167,7 +208,28 @@ tree_hash() {
 }
 
 phase_build_image() {
-  local cache_file="$SKILL_DIR/.image-cache" hash cached_hash cached_image output
+  local cache_file="$SKILL_DIR/.image-cache"
+  local hash cached_hash cached_image cached_id current_id output clean_tag
+  BUILD_ATTEMPTED=1
+
+  if (( CLEAN_IMAGE == 1 )); then
+    clean_tag="${IMAGE_NAME}:netpol-clean-${RUN_ID}-$$"
+    echo "building unique clean image: $clean_tag"
+    (
+      cd "$REPO_ROOT"
+      docker build --pull --no-cache -t "$clean_tag" .
+    ) || return 1
+    current_id="$(docker image inspect --format '{{.Id}}' "$clean_tag")" || return 1
+    [[ "$current_id" == sha256:* ]] || {
+      echo "docker returned an invalid image ID for $clean_tag: $current_id" >&2
+      return 1
+    }
+    BUILT_IMAGE_TAG="$clean_tag"
+    BUILT_IMAGE_ID="$current_id"
+    record_image clean-build "$BUILT_IMAGE_TAG" "$BUILT_IMAGE_ID"
+    return 0
+  fi
+
   hash="$(tree_hash)"
   if [[ -z "$hash" || "$hash" == "$EMPTY_SHA256" ]]; then
     echo "could not fingerprint the source tree; refusing to trust the image cache" >&2
@@ -175,40 +237,97 @@ phase_build_image() {
   fi
   echo "source fingerprint: $hash"
   if [[ -f "$cache_file" ]]; then
-    read -r cached_hash cached_image <"$cache_file" || true
-    if (( REBUILD == 0 )) && [[ "$cached_hash" == "$hash" ]] && docker image inspect "$cached_image" >/dev/null 2>&1; then
-      BUILT_IMAGE="$cached_image"
-      echo "reusing cached image: $BUILT_IMAGE"
-      return 0
+    read -r cached_hash cached_image cached_id <"$cache_file" || true
+    if (( REBUILD == 0 )) && [[ "$cached_hash" == "$hash" ]]; then
+      current_id="$(docker image inspect --format '{{.Id}}' "$cached_image" 2>/dev/null || true)"
+      if [[ "$current_id" == sha256:* && ( -z "$cached_id" || "$cached_id" == "$current_id" ) ]]; then
+        BUILT_IMAGE_TAG="$cached_image"
+        BUILT_IMAGE_ID="$current_id"
+        echo "reusing cached image: $BUILT_IMAGE_TAG"
+        record_image tree-cache "$BUILT_IMAGE_TAG" "$BUILT_IMAGE_ID"
+        return 0
+      fi
     fi
   fi
-  output="$($REPO_ROOT/scripts/docker-build.sh)"
+  output="$("$REPO_ROOT/scripts/docker-build.sh")" || return 1
   printf '%s\n' "$output"
-  BUILT_IMAGE="$(printf '%s\n' "$output" | awk '/^==> built image:/ {print $4; exit}')"
-  [[ -n "$BUILT_IMAGE" ]] || { echo "failed to parse built image tag" >&2; return 1; }
-  printf '%s %s\n' "$hash" "$BUILT_IMAGE" >"$cache_file"
+  BUILT_IMAGE_TAG="$(printf '%s\n' "$output" | awk '/^==> built image:/ {print $4; exit}')"
+  [[ -n "$BUILT_IMAGE_TAG" ]] || { echo "failed to parse built image tag" >&2; return 1; }
+  BUILT_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$BUILT_IMAGE_TAG")" || return 1
+  [[ "$BUILT_IMAGE_ID" == sha256:* ]] || {
+    echo "docker returned an invalid image ID for $BUILT_IMAGE_TAG: $BUILT_IMAGE_ID" >&2
+    return 1
+  }
+  printf '%s %s %s\n' "$hash" "$BUILT_IMAGE_TAG" "$BUILT_IMAGE_ID" >"$cache_file"
+  record_image build "$BUILT_IMAGE_TAG" "$BUILT_IMAGE_ID"
 }
 
 phase_go_tests() {
   cd "$REPO_ROOT"
-  go test -race ./internal/netpol/... ./internal/view/...
+  go clean -cache -testcache || return 1
+  go test ./... || return 1
+  go test -race ./internal/netpol/... ./internal/view/... || return 1
   # internal/ui and internal/model carry pre-existing upstream races in the
   # flash, prompt and log tests, so only the reachability suites are selected
   # here. Run the full packages manually to audit those separately.
-  go test -race ./internal/ui/ -run 'Reachability|DirectionPanel|SubjectInfo|SubjectPicker|PrimitiveKind|RuleDetails|Applicability'
-  go test -race ./internal/model/ -run 'NetPolGraph|NetworkPolicyGraph'
+  go test -race ./internal/ui/ -run 'Reachability|DirectionPanel|SubjectInfo|SubjectPicker|PrimitiveKind|RuleDetails|Applicability' || return 1
+  go test -race ./internal/model/ -run 'NetPolGraph|NetworkPolicyGraph' || return 1
 }
 
-ensure_test_image() {
-  if [[ -n "$BUILT_IMAGE" ]]; then
-    echo "$BUILT_IMAGE"
+resolve_test_image() {
+  local ref id
+  if [[ -n "$REQUESTED_IMAGE" ]]; then
+    ref="$REQUESTED_IMAGE"
+    id="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)"
+    [[ "$id" == sha256:* ]] || {
+      echo "requested image is not available locally: $ref" >&2
+      return 1
+    }
+    TEST_IMAGE_TAG="$ref"
+    TEST_IMAGE_ID="$id"
+    record_image explicit "$TEST_IMAGE_TAG" "$TEST_IMAGE_ID"
     return 0
   fi
+
+  if [[ -n "$BUILT_IMAGE_ID" ]]; then
+    docker image inspect "$BUILT_IMAGE_ID" >/dev/null 2>&1 || {
+      echo "built image disappeared before TUI tests: $BUILT_IMAGE_ID" >&2
+      return 1
+    }
+    TEST_IMAGE_TAG="$BUILT_IMAGE_TAG"
+    TEST_IMAGE_ID="$BUILT_IMAGE_ID"
+    return 0
+  fi
+
+  if (( BUILD_ATTEMPTED == 1 )); then
+    echo "build-image did not produce an image; refusing .image-cache or local-image fallback" >&2
+    return 1
+  fi
+
   if [[ -f "$SKILL_DIR/.image-cache" ]]; then
-    awk '{print $2}' "$SKILL_DIR/.image-cache"
-    return 0
+    ref="$(awk '{print $2}' "$SKILL_DIR/.image-cache")"
+    id="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)"
+    if [[ "$id" == sha256:* ]]; then
+      TEST_IMAGE_TAG="$ref"
+      TEST_IMAGE_ID="$id"
+      record_image cache-fallback "$TEST_IMAGE_TAG" "$TEST_IMAGE_ID"
+      return 0
+    fi
   fi
-  docker images --format '{{.Repository}}:{{.Tag}}' "$IMAGE_NAME" | sort -V | tail -n1
+
+  ref="$(docker images --format '{{.Repository}}:{{.Tag}}' "$IMAGE_NAME" | sort -V | tail -n1)"
+  [[ -n "$ref" ]] || {
+    echo "no k9s image found; run build-image first or pass --image REF" >&2
+    return 1
+  }
+  id="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)"
+  [[ "$id" == sha256:* ]] || {
+    echo "could not resolve local image: $ref" >&2
+    return 1
+  }
+  TEST_IMAGE_TAG="$ref"
+  TEST_IMAGE_ID="$id"
+  record_image local-fallback "$TEST_IMAGE_TAG" "$TEST_IMAGE_ID"
 }
 
 # container_kubeconfig returns a kubeconfig the container can actually use.
@@ -237,15 +356,15 @@ kind_network() {
 
 phase_tui_tests() {
   local image kubeconfig network
-  image="$(ensure_test_image)"
-  [[ -n "$image" ]] || { echo "no k9s image found; run build-image first" >&2; return 1; }
-  kubeconfig="$(container_kubeconfig)"
+  resolve_test_image || return 1
+  image="$TEST_IMAGE_ID"
+  kubeconfig="$(container_kubeconfig)" || return 1
   network="$(kind_network)"
-  echo "using image $image on docker network $network"
+  echo "using exact image $image (ref: $TEST_IMAGE_TAG) on docker network $network"
   echo "probing cluster from the container"
   docker run --rm --network "$network" \
     -e KUBECONFIG=/root/.kube/config -v "$kubeconfig:/root/.kube/config:ro" \
-    --entrypoint kubectl "$image" get namespace "$PREFIX-app"
+    --entrypoint kubectl "$image" get namespace "$PREFIX-app" || return 1
   K9S_IMAGE="$image" \
     KUBECONFIG_MOUNT="$kubeconfig" \
     DOCKER_NETWORK="$network" \
@@ -255,9 +374,16 @@ phase_tui_tests() {
 }
 
 phase_report() {
-  local phase status failed=0
+  local phase status failed=0 image_source image_ref image_id
   echo
   echo "NetworkPolicy graph test run: $RUN_DIR"
+  if [[ -f "$(image_path id)" ]]; then
+    image_source="$(cat "$(image_path source)")"
+    image_ref="$(cat "$(image_path ref)")"
+    image_id="$(cat "$(image_path id)")"
+    echo "Image: $image_ref"
+    echo "Image ID: $image_id ($image_source)"
+  fi
   printf '%-18s %s\n' Phase Status
   printf '%-18s %s\n' ----- ------
   for phase in "${PHASES[@]}"; do
@@ -277,6 +403,8 @@ while [[ $# -gt 0 ]]; do
     --from) FROM="$2"; require_phase "$FROM"; shift 2 ;;
     --force-workloads) FORCE_WORKLOADS=1; shift ;;
     --rebuild) REBUILD=1; shift ;;
+    --clean-image|--no-image-cache) CLEAN_IMAGE=1; shift ;;
+    --image) REQUESTED_IMAGE="$2"; shift 2 ;;
     --cluster) CLUSTER="$2"; shift 2 ;;
     --prefix) PREFIX="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
@@ -285,11 +413,33 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -n "$REQUESTED_IMAGE" ]] && should_run build-image; then
+  echo "--image requires build-image to be skipped (for example: --only tui-tests --image REF)" >&2
+  exit 2
+fi
+if [[ -n "$REQUESTED_IMAGE" ]] && ! should_run tui-tests; then
+  echo "--image requires tui-tests to run" >&2
+  exit 2
+fi
+if (( CLEAN_IMAGE == 1 )) && ! should_run build-image; then
+  echo "--clean-image requires build-image to run" >&2
+  exit 2
+fi
+
 mkdir -p "$RUN_DIR"
 
 for phase in "${PHASES[@]}"; do
   run_phase "$phase"
 done
 
+set +e
 phase_report | tee "$(log_path report)"
-(( OVERALL_STATUS == 0 ))
+report_rc=${PIPESTATUS[0]}
+set -e
+if (( report_rc == 0 )); then
+  record_status report ok
+else
+  record_status report failed
+  OVERALL_STATUS=1
+fi
+exit "$OVERALL_STATUS"
