@@ -3,7 +3,6 @@
 This document describes only the Network Policy Graph (NPG) read-only panel in
 K9s.
 ![alt text](assets/npg/intro.png)
-
 ## 1. What Is Network Policy Graph?
 
 Network Policy Graph is a read-only reachability view for standard Kubernetes
@@ -248,7 +247,7 @@ projections and returns focus to Subject for the new evaluation.
 
 ### Subject panel
 ![alt text](assets/npg/subject-panel.png)
-  The Subject panel identifies the selected subject and lists associated
+The Subject panel identifies the selected subject and lists associated
 workloads.
 
 Its summary line contains:
@@ -291,7 +290,7 @@ The filter suffix is shown only when that direction and mode has an active text
 filter.
 
 #### Rules mode
-
+![alt text](assets/npg/ingress-egress-panels-rules.png)
 Rules are rendered as two-line blocks without a header.
 
 | Displayed field | Meaning | Possible values |
@@ -322,7 +321,7 @@ When a real rule is selected and the direction panel has focus:
 These actions are unavailable for synthetic rules.
 
 #### Primitives mode
-
+![alt text](assets/npg/ingress-egress-panels-primitives.png)
 Primitives are rendered as two-line blocks with three columns.
 
 | Column or field | Meaning | Possible values |
@@ -348,11 +347,11 @@ Press `Enter` to move from the direction panel to Primitive Details. Press
 address ranges rather than Kubernetes resources and cannot be opened.
 
 ### Details panel
-
+![alt text](assets/npg/effective-details-demo.png)
 The Details panel follows the active direction and current selection.
 
 #### Rule Details
-
+![alt text](assets/npg/rules-details-panel.png)
 When a rule is selected in Rules mode, Rule Details contains:
 
 - direction and subject identity;
@@ -370,7 +369,7 @@ When a rule is selected in Rules mode, Rule Details contains:
 An Applicability panel is displayed below the rule text.
 
 #### Primitive Details
-
+![alt text](assets/npg/primitive-details-panel.png)
 When a primitive is selected in Primitives mode, Primitive Details contains:
 
 - direction and subject identity;
@@ -386,7 +385,7 @@ When a primitive is selected in Primitives mode, Primitive Details contains:
 A selected primitive has no per-rule applicability table.
 
 #### Effective Details
-
+![alt text](assets/npg/effective-details-panel.png)
 Effective Details is the default on launch and after every subject change.
 Pressing `Esc` to clear a later direction selection returns to it. This is the
 final reachability of every enabled primitive after all rules have been
@@ -405,7 +404,7 @@ The state counts always add up to the displayed primitive total. Effective
 Applicability is shown below the text when applicable.
 
 ### Applicability panel
-
+![alt text](assets/npg/applicability-panel.png)
 Applicability explains how a selected rule contributes to each enabled
 primitive. When no direction row is selected, **Effective Applicability**
 instead shows the final result after all rules have been applied.
@@ -599,7 +598,7 @@ Both directions are hidden. Press i for ingress or e for egress.
 ### Dialog navigation
 
 The Subject picker opened with `s` supports:
-
+![alt text](assets/npg/pick-subject-dialog.png)
 | Key | Action |
 |---|---|
 | `Left` / `Right` | Switch between the subject-kind list and resource-instance list. |
@@ -607,19 +606,25 @@ The Subject picker opened with `s` supports:
 | `Up` / `Down` | Move in the active list. |
 | `Enter` | Accept the selected subject. |
 | `Esc` | Cancel without changing the subject. |
+<br>
+---
+<br>
 
 The Primitive Kinds dialog opened with `f` supports standard form navigation:
-
+![alt text](assets/npg/primitive-kind-dialog.png)
 | Key | Action |
 |---|---|
 | `Tab` / `Shift-Tab` | Move between kind checkboxes and Apply/Cancel buttons. |
 | `Space` | Toggle the focused primitive kind. |
 | `Enter` | Activate the focused control. |
 | `Esc` | Cancel without applying changes. |
+<br>
+---
+<br>
 
 The Search dialog opened with `/` contains Apply, Clear, and Cancel actions.
 Its target follows focus:
-
+![alt text](assets/npg/search-dialog.png)
 - Subject filters the subject workload rows.
 - Ingress or Egress filters that direction in the current projection.
 - Rule Details and Applicability filter the current direction's applicability
