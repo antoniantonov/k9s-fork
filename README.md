@@ -237,6 +237,60 @@ Binaries for Linux, Windows and Mac are available as tarballs in the [release pa
   docker run --rm -it -v ~/.kube/config:/root/.kube/config k9s-docker:0.1
   ```
 
+#### Building a local versioned image
+
+  The `scripts/docker-build-and-run.sh` helper rebuilds the k9s Docker image
+  locally from scratch and tags it with the next patch version. It scans
+  existing local `k9s:X.Y.Z` image tags, picks the highest version, increments
+  the patch component, and removes older k9s images and their containers after
+  a successful build.
+
+  ```shell
+  ./scripts/docker-build-and-run.sh --kubeconfig /path/to/kubeconfig
+  ```
+
+  The script prints the exact `docker run` command and starts it. Use
+  `--build-only` to build, clean up, and print the command without starting
+  k9s. Without `--kubeconfig`, an internal kubeconfig is generated for the
+  active kind context; other contexts default to `$HOME/.kube/config`.
+
+  Set `IMAGE_NAME` to build and clean up a different local image name:
+
+  ```shell
+  IMAGE_NAME=my-k9s ./scripts/docker-build-and-run.sh --build-only \
+    --kubeconfig /path/to/kubeconfig
+  ```
+
+  The run command joins the kind Docker network when the kubeconfig's current
+  context is a local kind cluster and opens the NetworkPolicy graph for
+  `deployment/api` in `netpol-demo-app`. Override `KIND_NETWORK`,
+  `NPG_DEPLOYMENT`, or `NPG_NAMESPACE` to customize it.
+
+  Populate or refresh the local kind demo topology with:
+
+  ```shell
+  .github/skills/netpol-graph-testing/scripts/netpol-demo-workloads.sh
+  ```
+
+#### Testing the reachability view end to end
+
+  `.github/skills/netpol-graph-testing/` bundles everything needed to exercise
+  the NetworkPolicy reachability view against a local kind cluster: a demo
+  topology covering every result state and primitive kind, a phase-based
+  orchestrator, and an `expect` harness that drives the real TUI in Docker.
+
+  ```shell
+  # Populate the cluster only when it is not already set up.
+  ./.github/skills/netpol-graph-testing/scripts/netpol-demo-workloads.sh --check
+
+  # Preflight, cluster, workloads, image build, Go tests and TUI smoke tests.
+  ./.github/skills/netpol-graph-testing/scripts/run-tests.sh
+  ```
+
+  Individual phases can be selected with `--only`, `--skip` and `--from`. Logs
+  land under `runs/<timestamp>/`. See the skill's `SKILL.md` for details and
+  `references/test-matrix.md` for the coverage matrix.
+
 #### Building a multi-platform image
 
   The `make imgx` target builds for `linux/amd64` and `linux/arm64` via Docker
@@ -433,6 +487,7 @@ K9s uses aliases to navigate most K8s resources.
 | Port forward                                                                    | `shift-f`                      | Pods/Services/Containers                                               |
 | Warp to namespace                                                               | `w`                            | When namespace column is available                                     |
 | Jump to owner                                                                   | `shift-j`                      | When resource has an owner                                             |
+| Open NetworkPolicy reachability                                                 | `shift-r`                      | Pods/Deployments/Jobs/Namespaces                                        |
 | Use/switch namespace                                                            | `u`                            | Namespace view                                                         |
 | UsedBy (show resources using this)                                              | `u`                            | ServiceAccounts/PVCs/Secrets/ConfigMaps                                |
 | Benchmark (run/stop)                                                            | `b`                            | Services/Port-forwards                                                 |
@@ -446,6 +501,184 @@ K9s uses aliases to navigate most K8s resources.
 | Restart resource                                                                | `r`                            | Deployments/DaemonSets/StatefulSets                                    |
 | Rollback resource                                                               | `ctrl-l`                       | ReplicaSets                                                            |
 | View ReplicaSets                                                                | `z`                            | Deployment view                                                        |
+
+---
+
+## NetworkPolicy Reachability
+
+The NetworkPolicy reachability view explains effective **Kubernetes
+NetworkPolicy** connectivity. Open it with:
+
+```text
+:netpolgraph <kind> <name> [namespace]
+:npgraph <kind> <name> [namespace]
+:npg <kind> <name> [namespace]
+```
+
+Supported subjects are `Pod`, `Deployment`, `Job`, and `Namespace` (kind names
+are case-insensitive). The aliases `po`, `pods`, `dp`, `deploy`,
+`deployments`, `jobs`, `ns`, and `namespaces` are also accepted. Pod,
+Deployment, and Job subjects accept an optional namespace; Namespace subjects
+use `:npg namespace <name>` without a namespace argument. For example:
+
+```text
+:npg pod api-7d8c9f default
+:npg deployment api default
+:npg job database-migration default
+:npg namespace payments
+```
+
+In Pod, Deployment, Job, and Namespace views, select a row and press `Shift-R`
+to open the same view for that resource. `:np` remains the normal
+NetworkPolicy resource alias.
+
+Ingress and egress are evaluated independently and are both visible initially.
+For ingress, the displayed primitive is the source; for egress, it is the
+destination. Effective reachability checks both the source's egress policy and
+the destination's ingress policy.
+
+The **Subject** panel at the top shows a status summary line and a selectable
+table of the subject's workloads. Pod, Deployment, and Job subjects list their
+pods; Namespace subjects list the namespace's deployments, replicasets,
+statefulsets, daemonsets, jobs, and pods. Rows are sorted by namespace and name
+and capped at 300.
+
+Each direction has two display modes, but the projection mode is shared
+between ingress and egress: pressing `m` switches both directions at once.
+Per-direction filters, selection, and scroll position remain independent.
+
+- **Rules** lists the NetworkPolicy rules selecting the subject, including
+  synthetic unrestricted/default-deny explanations where applicable.
+- **Primitives** evaluates reachable CIDRs, Pods, Namespaces, Deployments, and
+  Jobs. Press `f` to enable or disable these five primitive kinds; the
+  selection applies to both directions.
+
+### Reachability key map
+
+| Key | Action |
+|---|---|
+| `i` | Show or hide ingress |
+| `e` | Show or hide egress |
+| `m` | Toggle Rules/Primitives for both directions |
+| `s` | Change the reachability subject |
+| `f` | Configure CIDR/Pod/Namespace/Deployment/Job filters |
+| `Up` / `Down` | Select the previous/next rule or primitive |
+| `PageUp` / `PageDown` | Move selection by one page |
+| `Home` / `End` | Select the first/last item |
+| `Left` / `Right` | Focus ingress/egress (falls through to the details pane once it has focus) |
+| `Tab` / `Shift-Tab` | Cycle subject, then each direction with its own details and applicability |
+| `Enter` | Step into the details pane; press again to open the highlighted primitive |
+| `o` | Open the selected resource |
+| `y` | Open YAML for selected policy evidence |
+| `/` | Filter visible items by text |
+| `r` | Enable or disable auto-refresh (disabled by default) |
+| `Ctrl-S` | Set the highlighted eligible workload or applicability primitive as the subject |
+| `Esc` | Clear focused selection; with none selected, close dialog/filter or go back |
+
+Reachability is evaluated once when the view opens. Auto-refresh is **off** by
+default: press `r` to reevaluate every 5 seconds. The current state is shown in
+the subject summary line. Refreshing preserves the selected rule, primitive,
+applicability row, subject workload, and scroll position.
+
+Hiding a direction does not discard its filters, selection, or scroll
+position. The Rules/Primitives mode is global, so it remains shared even while
+one direction is hidden. If both directions are hidden, the subject and details
+remain visible.
+
+Press `o` to open the Kubernetes resource behind the selected row. Rules mode
+opens the NetworkPolicy; Primitives mode opens the selected Pod, Namespace,
+Deployment, or Job. CIDR primitives are not Kubernetes resources and cannot be
+opened. The reachability view appears in the breadcrumb trail as `<npg>`, so
+opening a resource pushes it onto the stack and `Esc` walks back through
+breadcrumbs such as `<npg> <pods> <containers>`.
+
+`Enter` navigates instead of opening. With ingress or egress focused it moves
+focus into the details pane so the applicability rows can be scrolled — onto
+the applicability table when one is rendered, and onto the details text
+otherwise. It works with **no** rule selected too, because the details pane then
+shows the direction's effective applicability. Pressing `Enter` again, with the
+applicability table focused, opens the highlighted row's primitive in its own
+view; `Esc` returns.
+
+### Results and details
+
+Allowed primitives are green and disallowed primitives are red, but status
+labels always accompany color. Namespace, Deployment, and Job results are
+conservative aggregates: green means every evaluated pod pair is allowed.
+Zero allowed pairs are red; mixed results are yellow and labeled
+`[PARTIAL allowed/total]`; workloads without current pods are white and labeled
+`Unknown`, since nothing could be evaluated. Thus a partially reachable
+aggregate is never presented as fully allowed.
+
+The details panel shows the direction, subject and primitive, pod-pair coverage,
+ports, contributing policies/rule indexes, disallow explanations, and warnings.
+Rule details include selectors, peers, ports, and an applicability table for
+the enabled primitive kinds. A peer selector match alone is not sufficient:
+the table's effective result also checks policy on the opposite endpoint.
+NetworkPolicy has additive allow rules, not explicit deny rules, so a
+disallowed result means an endpoint is isolated and no matching allow rule was
+found.
+
+Pressing `Esc` clears the selection in the focused direction. With nothing
+selected, the details panel shows that direction's effective reachability: the
+state of every primitive after all rules have been applied, rather than one
+rule's contribution. The header reports the direction, current mode, enabled
+primitive kinds, and a per-state count that always sums to the number of
+primitives shown; the table
+below lists each primitive with its effective state and ports. This is the
+aggregate of every evaluated rule. Selecting a rule or primitive returns to the
+per-item view. Effective details work in Rules and Primitives mode and cover
+the focused direction only.
+
+Named ports are resolved against destination pod container ports when they can
+be determined safely. Ambiguous named ports and unsupported semantics are
+reported as unknown rather than optimistically allowed. Numeric ports,
+protocols, ranges, `ipBlock.cidr`, and `except` are included in details.
+
+Results are capped to protect K9s on large clusters (the default cap is 5,000
+results). A truncated result is explicitly marked and must not be interpreted
+as a complete graph. Failed or forbidden list/watch requests similarly produce
+a **partial data** warning identifying incomplete resource data; partial-data
+results are distinct from a mixed `[PARTIAL x/y]` aggregate.
+
+Reachability colors follow the active skin and can be customized:
+
+```yaml
+k9s:
+  views:
+    reachability:
+      allowedColor: green
+      disallowedColor: red
+      partialDataColor: orange
+      focusColor: orange
+```
+
+### RBAC
+
+A complete graph requires cluster-wide `get`, `list`, and `watch` access to:
+
+- core `pods` and `namespaces`;
+- `networking.k8s.io/networkpolicies`;
+- `apps/deployments` and `apps/replicasets`;
+- `batch/jobs`.
+
+Access to the selected subject is also required. Namespace-scoped or otherwise
+incomplete RBAC can still produce useful results, but they are labeled partial
+data and must not be treated as complete.
+
+### Limitations
+
+This view models the standard `networking.k8s.io/v1` NetworkPolicy API; it does
+not prove packet delivery. Enforcement and some edge cases depend on the
+cluster's CNI plugin. In particular, existing connections during policy
+changes, `hostNetwork` and node-local traffic, IP blocks before/after NAT, and
+networks outside standard NetworkPolicy enforcement can differ by
+implementation.
+
+Service meshes, application authorization, DNS, routes, load balancers, node
+or cloud firewalls, flow logs, and vendor policy APIs such as
+CiliumNetworkPolicy, Calico GlobalNetworkPolicy, and AdminNetworkPolicy are not
+evaluated.
 
 ---
 

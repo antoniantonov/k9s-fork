@@ -9,6 +9,7 @@ import (
 
 	"github.com/derailed/k9s/internal/view/cmd"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRbacCmd(t *testing.T) {
@@ -357,6 +358,149 @@ func TestXRayCmd(t *testing.T) {
 				assert.Equal(t, u.res, res)
 				assert.Equal(t, u.ns, ns)
 			}
+		})
+	}
+}
+
+func TestNetworkPolicyGraphCmd(t *testing.T) {
+	uu := map[string]struct {
+		command string
+		ok      bool
+		args    cmd.NetworkPolicyGraphArgs
+	}{
+		"bare": {
+			command: "npg",
+			ok:      true,
+		},
+		"pod": {
+			command: "netpolgraph pod api payments",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind:      "pod",
+				Name:      "api",
+				Namespace: "payments",
+			},
+		},
+		"pod-without-namespace": {
+			command: "npg po api",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind: "pod",
+				Name: "api",
+			},
+		},
+		"deployment-aliases": {
+			command: "npgraph deploy API Payments",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind:      "deployment",
+				Name:      "api",
+				Namespace: "payments",
+			},
+		},
+		"job": {
+			command: "npg jobs cleanup ops",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind:      "job",
+				Name:      "cleanup",
+				Namespace: "ops",
+			},
+		},
+		"namespace": {
+			command: "npg namespace payments",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind: "namespace",
+				Name: "payments",
+			},
+		},
+		"pod-kind-only": {
+			command: "npg pod",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind: "pod",
+			},
+		},
+		"deployment-kind-only": {
+			command: "npg deploy",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind: "deployment",
+			},
+		},
+		"job-kind-only": {
+			command: "npg jobs",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind: "job",
+			},
+		},
+		"namespace-kind-only": {
+			command: "npg ns",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind: "namespace",
+			},
+		},
+		"case-insensitive": {
+			command: "NPG DEPLOYMENT API DEFAULT",
+			ok:      true,
+			args: cmd.NetworkPolicyGraphArgs{
+				Kind:      "deployment",
+				Name:      "api",
+				Namespace: "default",
+			},
+		},
+		"unknown-kind": {
+			command: "npg service api payments",
+		},
+		"excess": {
+			command: "npg pod api payments extra",
+		},
+		"namespace-excess": {
+			command: "npg namespace payments extra",
+		},
+		"not-command": {
+			command: "pod api payments",
+		},
+	}
+
+	for name, u := range uu {
+		t.Run(name, func(t *testing.T) {
+			p := cmd.NewInterpreter(u.command)
+			got, ok := p.NetworkPolicyGraphArgs()
+			assert.Equal(t, u.ok, ok)
+			assert.Equal(t, u.args, got)
+			assert.Equal(t, u.command != "pod api payments", p.IsNetworkPolicyGraphCmd())
+		})
+	}
+}
+
+func TestNetworkPolicyGraphKindAliases(t *testing.T) {
+	uu := map[string]string{
+		"po":          "pod",
+		"pod":         "pod",
+		"pods":        "pod",
+		"dp":          "deployment",
+		"deploy":      "deployment",
+		"deployment":  "deployment",
+		"deployments": "deployment",
+		"job":         "job",
+		"jobs":        "job",
+		"ns":          "namespace",
+		"namespace":   "namespace",
+		"namespaces":  "namespace",
+	}
+
+	for alias, kind := range uu {
+		t.Run(alias, func(t *testing.T) {
+			line := "npg " + alias
+			p := cmd.NewInterpreter(line)
+			got, ok := p.NetworkPolicyGraphArgs()
+			require.True(t, ok)
+			assert.Equal(t, kind, got.Kind)
+			assert.Empty(t, got.Name)
 		})
 	}
 }

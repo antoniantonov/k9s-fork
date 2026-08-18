@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: netpol-partial
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clients
+  namespace: netpol-partial
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      containers:
+        - name: client
+          image: registry.k8s.io/pause:3.10
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client-allowed
+  namespace: netpol-partial
+  labels:
+    app: client
+    access: allowed
+spec:
+  containers:
+    - name: client
+      image: registry.k8s.io/pause:3.10
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client-blocked
+  namespace: netpol-partial
+  labels:
+    app: client
+    access: blocked
+spec:
+  containers:
+    - name: client
+      image: registry.k8s.io/pause:3.10
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api
+  namespace: netpol-partial
+  labels:
+    app: api
+spec:
+  containers:
+    - name: api
+      image: registry.k8s.io/pause:3.10
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-some-clients
+  namespace: netpol-partial
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              access: allowed

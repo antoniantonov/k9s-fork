@@ -15,4 +15,10 @@ func Test_newStyle(t *testing.T) {
 	assert.Equal(t, Color("black"), s.Body.BgColor)
 	assert.Equal(t, Color("cadetblue"), s.Body.FgColor)
 	assert.Equal(t, Color("lightskyblue"), s.Frame.Status.NewColor)
+	assert.Equal(t, Color("green"), s.Views.Reachability.AllowedColor)
+	assert.Equal(t, Color("red"), s.Views.Reachability.DisallowedColor)
+	assert.Equal(t, Color("orange"), s.Views.Reachability.PartialDataColor)
+	assert.Equal(t, Color("yellow"), s.Views.Reachability.PartialColor)
+	assert.Equal(t, Color("white"), s.Views.Reachability.UnknownColor)
+	assert.Equal(t, Color("orange"), s.Views.Reachability.FocusColor)
 }

@@ -81,6 +81,13 @@ k9s:
       keyColor: steelblue
       colonColor: white
       valueColor: papayawhip
+    reachability:
+      allowedColor: green
+      disallowedColor: red
+      partialDataColor: orange
+      partialColor: yellow
+      unknownColor: white
+      focusColor: orange
     logs:
       fgColor: white
       bgColor: black

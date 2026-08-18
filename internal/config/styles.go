@@ -123,12 +123,26 @@ type (
 
 	// Views tracks individual view styles.
 	Views struct {
-		Table  Table  `json:"table" yaml:"table"`
-		Xray   Xray   `json:"xray" yaml:"xray"`
-		Charts Charts `json:"charts" yaml:"charts"`
-		Yaml   Yaml   `json:"yaml" yaml:"yaml"`
-		Picker Picker `json:"picker" yaml:"picker"`
-		Log    Log    `json:"logs" yaml:"logs"`
+		Table        Table        `json:"table" yaml:"table"`
+		Xray         Xray         `json:"xray" yaml:"xray"`
+		Charts       Charts       `json:"charts" yaml:"charts"`
+		Yaml         Yaml         `json:"yaml" yaml:"yaml"`
+		Picker       Picker       `json:"picker" yaml:"picker"`
+		Log          Log          `json:"logs" yaml:"logs"`
+		Reachability Reachability `json:"reachability" yaml:"reachability"`
+	}
+
+	// Reachability tracks NetworkPolicy reachability result styles.
+	Reachability struct {
+		AllowedColor     Color `json:"allowedColor" yaml:"allowedColor"`
+		DisallowedColor  Color `json:"disallowedColor" yaml:"disallowedColor"`
+		PartialDataColor Color `json:"partialDataColor" yaml:"partialDataColor"`
+		// PartialColor marks a result that is neither a clean allow nor a clean
+		// deny, so it must stand apart from both.
+		PartialColor Color `json:"partialColor" yaml:"partialColor"`
+		// UnknownColor marks a result that could not be evaluated at all.
+		UnknownColor Color `json:"unknownColor" yaml:"unknownColor"`
+		FocusColor   Color `json:"focusColor" yaml:"focusColor"`
 	}
 
 	// Status tracks resource status styles.
@@ -306,12 +320,24 @@ func newCharts() Charts {
 
 func newViews() Views {
 	return Views{
-		Table:  newTable(),
-		Xray:   newXray(),
-		Charts: newCharts(),
-		Yaml:   newYaml(),
-		Picker: newPicker(),
-		Log:    newLog(),
+		Table:        newTable(),
+		Xray:         newXray(),
+		Charts:       newCharts(),
+		Yaml:         newYaml(),
+		Picker:       newPicker(),
+		Log:          newLog(),
+		Reachability: newReachability(),
+	}
+}
+
+func newReachability() Reachability {
+	return Reachability{
+		AllowedColor:     "green",
+		DisallowedColor:  "red",
+		PartialDataColor: "orange",
+		PartialColor:     "yellow",
+		UnknownColor:     "white",
+		FocusColor:       "orange",
 	}
 }
 
@@ -574,6 +600,11 @@ func (s *Styles) Views() Views {
 	return s.K9s.Views
 }
 
+// Reachability returns NetworkPolicy reachability styles.
+func (s *Styles) Reachability() Reachability {
+	return s.K9s.Views.Reachability
+}
+
 // Invert inverts all colors in the Style.
 func (s *Style) Invert() {
 	s.Body.Invert()
@@ -698,6 +729,17 @@ func (v *Views) Invert() {
 	v.Yaml.Invert()
 	v.Picker.Invert()
 	v.Log.Invert()
+	v.Reachability.Invert()
+}
+
+// Invert inverts all colors in Reachability.
+func (r *Reachability) Invert() {
+	r.AllowedColor = r.AllowedColor.InvertColor()
+	r.DisallowedColor = r.DisallowedColor.InvertColor()
+	r.PartialDataColor = r.PartialDataColor.InvertColor()
+	r.PartialColor = r.PartialColor.InvertColor()
+	r.UnknownColor = r.UnknownColor.InvertColor()
+	r.FocusColor = r.FocusColor.InvertColor()
 }
 
 // Invert inverts all colors in Table.

@@ -9,14 +9,17 @@ import (
 	"log/slog"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 
 	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/dao"
 	"github.com/derailed/k9s/internal/model"
+	"github.com/derailed/k9s/internal/netpol"
 	"github.com/derailed/k9s/internal/slogs"
 	"github.com/derailed/k9s/internal/view/cmd"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
@@ -269,6 +272,10 @@ func (c *Command) defaultCmd(isRoot bool) error {
 
 func (c *Command) specialCmd(p *cmd.Interpreter, pushCmd bool) bool {
 	switch {
+	case p.IsNetworkPolicyGraphCmd():
+		if err := c.networkPolicyGraphCmd(p, pushCmd); err != nil {
+			c.app.Flash().Err(err)
+		}
 	case p.IsCowCmd():
 		if msg, ok := p.CowArg(); !ok {
 			c.app.Flash().Errf("Invalid command. Use `cow xxx`")
@@ -310,6 +317,131 @@ func (c *Command) specialCmd(p *cmd.Interpreter, pushCmd bool) bool {
 	}
 
 	return true
+}
+
+func (c *Command) networkPolicyGraphCmd(p *cmd.Interpreter, pushCmd bool) error {
+	args, ok := p.NetworkPolicyGraphArgs()
+	if !ok {
+		return errors.New("invalid command. use `npg <pod|deployment|job|namespace> <name> [namespace]`")
+	}
+	if c.app.factory == nil {
+		return errors.New("network policy reachability requires an active Kubernetes connection")
+	}
+	args, err := resolveNetworkPolicyGraphArgs(c.app.factory, args, c.app.Config.ActiveNamespace())
+	if err != nil {
+		return err
+	}
+	subject, err := networkPolicyGraphSubject(args, c.app.Config.ActiveNamespace())
+	if err != nil {
+		return err
+	}
+	return c.exec(p, client.NpGVR, NewNetworkPolicyGraph(subject), true, pushCmd)
+}
+
+func resolveNetworkPolicyGraphArgs(factory dao.Factory, args cmd.NetworkPolicyGraphArgs, activeNamespace string) (cmd.NetworkPolicyGraphArgs, error) {
+	if args.Kind == "" {
+		args.Kind = "namespace"
+	}
+
+	gvr, plural, err := networkPolicyGraphGVR(args.Kind)
+	if err != nil {
+		return cmd.NetworkPolicyGraphArgs{}, err
+	}
+
+	listNamespace := client.ClusterScope
+	if args.Kind != "namespace" {
+		if args.Namespace == "" {
+			args.Namespace = activeNamespace
+		}
+		if client.IsAllNamespace(args.Namespace) {
+			return cmd.NetworkPolicyGraphArgs{}, errors.New("a concrete namespace is required for pod, deployment, and job subjects")
+		}
+		listNamespace = args.Namespace
+	}
+
+	if args.Name != "" {
+		return args, nil
+	}
+
+	name, err := firstNetworkPolicyGraphName(factory, gvr, listNamespace)
+	if err != nil {
+		return cmd.NetworkPolicyGraphArgs{}, err
+	}
+	if name == "" {
+		if args.Kind == "namespace" {
+			return cmd.NetworkPolicyGraphArgs{}, errors.New("no namespaces found")
+		}
+		return cmd.NetworkPolicyGraphArgs{}, fmt.Errorf("no %s found in namespace %s", plural, args.Namespace)
+	}
+	args.Name = name
+
+	return args, nil
+}
+
+func networkPolicyGraphGVR(kind string) (*client.GVR, string, error) {
+	switch kind {
+	case "pod":
+		return client.PodGVR, "pods", nil
+	case "deployment":
+		return client.DpGVR, "deployments", nil
+	case "job":
+		return client.JobGVR, "jobs", nil
+	case "namespace":
+		return client.NsGVR, "namespaces", nil
+	default:
+		return nil, "", fmt.Errorf("unsupported NetworkPolicy graph subject kind %q", kind)
+	}
+}
+
+func firstNetworkPolicyGraphName(factory dao.Factory, gvr *client.GVR, namespace string) (string, error) {
+	oo, err := factory.List(gvr, namespace, true, labels.Everything())
+	if err != nil {
+		return "", err
+	}
+
+	names := make([]string, 0, len(oo))
+	for _, o := range oo {
+		accessor, err := meta.Accessor(o)
+		if err != nil {
+			continue
+		}
+		if name := accessor.GetName(); name != "" {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return "", nil
+	}
+	sort.Strings(names)
+
+	return names[0], nil
+}
+
+func networkPolicyGraphSubject(args cmd.NetworkPolicyGraphArgs, activeNamespace string) (netpol.SubjectRef, error) {
+	subject := netpol.SubjectRef{Name: args.Name, Namespace: args.Namespace}
+	switch args.Kind {
+	case "pod":
+		subject.Kind = netpol.SubjectPod
+	case "deployment":
+		subject.Kind = netpol.SubjectDeployment
+	case "job":
+		subject.Kind = netpol.SubjectJob
+	case "namespace":
+		subject.Kind = netpol.SubjectNamespace
+		subject.Namespace = ""
+	default:
+		return netpol.SubjectRef{}, fmt.Errorf("unsupported NetworkPolicy graph subject kind %q", args.Kind)
+	}
+	if subject.Name == "" {
+		return netpol.SubjectRef{}, errors.New("NetworkPolicy graph subject name is required")
+	}
+	if subject.Kind != netpol.SubjectNamespace && subject.Namespace == "" {
+		subject.Namespace = activeNamespace
+	}
+	if subject.Kind != netpol.SubjectNamespace && client.IsAllNamespace(subject.Namespace) {
+		return netpol.SubjectRef{}, errors.New("a concrete namespace is required for pod, deployment, and job subjects")
+	}
+	return subject, nil
 }
 
 func (c *Command) viewMetaFor(p *cmd.Interpreter) (*client.GVR, *MetaViewer, *cmd.Interpreter, error) {

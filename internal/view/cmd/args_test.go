@@ -167,6 +167,41 @@ func TestFlagsNew(t *testing.T) {
 			i:  NewInterpreter("apply -f"),
 			ll: args{},
 		},
+
+		"netpol-graph": {
+			i:  NewInterpreter("npg"),
+			aa: []string{"deployments", "api", "payments"},
+			ll: args{kindKey: "deployment", nameKey: "api", nsKey: "payments"},
+		},
+
+		"netpol-graph-bare": {
+			i:  NewInterpreter("npg"),
+			ll: args{},
+		},
+
+		"netpol-graph-kind-only": {
+			i:  NewInterpreter("npg"),
+			aa: []string{"pod"},
+			ll: args{kindKey: "pod"},
+		},
+
+		"netpol-graph-unknown-kind": {
+			i:  NewInterpreter("npg"),
+			aa: []string{"service", "api", "payments"},
+			ll: args{},
+		},
+
+		"netpol-graph-too-many": {
+			i:  NewInterpreter("npg"),
+			aa: []string{"pod", "api", "payments", "extra"},
+			ll: args{},
+		},
+
+		"netpol-graph-namespace-extra": {
+			i:  NewInterpreter("npg"),
+			aa: []string{"namespace", "payments", "extra"},
+			ll: args{},
+		},
 	}
 
 	for k := range uu {

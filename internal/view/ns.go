@@ -35,8 +35,13 @@ func NewNamespace(gvr *client.GVR) ResourceViewer {
 
 func (n *Namespace) bindKeys(aa *ui.KeyActions) {
 	aa.Bulk(ui.KeyMap{
-		ui.KeyU: ui.NewKeyAction("Use", n.useNsCmd, true),
+		ui.KeyU:      ui.NewKeyAction("Use", n.useNsCmd, true),
+		ui.KeyShiftR: ui.NewKeyAction("Network Reachability", n.networkPolicyGraphCmd, true),
 	})
+}
+
+func (n *Namespace) networkPolicyGraphCmd(evt *tcell.EventKey) *tcell.EventKey {
+	return gotoNetworkPolicyGraph(n.App(), "namespace", n.GetTable().GetSelectedItem(), evt)
 }
 
 func (n *Namespace) switchNs(app *App, _ ui.Tabular, _ *client.GVR, path string) {

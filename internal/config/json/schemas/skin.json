@@ -110,6 +110,18 @@
         "views": {
           "type": "object",
           "properties": {
+            "reachability": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "allowedColor": {"type": "string"},
+                "disallowedColor": {"type": "string"},
+                "partialDataColor": {"type": "string"},
+                "partialColor": {"type": "string"},
+                "unknownColor": {"type": "string"},
+                "focusColor": {"type": "string"}
+              }
+            },
             "charts": {
               "type": "object",
               "properties": {

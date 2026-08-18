@@ -10,20 +10,31 @@ import (
 )
 
 const (
-	cowCmd         = "cow"
-	canCmd         = "can"
-	nsFlag         = "-n"
-	filterFlag     = "/"
-	labelFlagEq    = "="
-	labelFlagEqs   = "=="
-	labelFlagNotEq = "!="
-	labelFlagIn    = " in "
-	labelFlagNotin = " notin "
-	labelFlagQuote = "'"
+	cowCmd             = "cow"
+	canCmd             = "can"
+	netpolGraphKindPod = "pod"
+	netpolGraphKindDP  = "deployment"
+	netpolGraphKindJob = "job"
+	netpolGraphKindNS  = "namespace"
+	nsFlag             = "-n"
+	filterFlag         = "/"
+	labelFlagEq        = "="
+	labelFlagEqs       = "=="
+	labelFlagNotEq     = "!="
+	labelFlagIn        = " in "
+	labelFlagNotin     = " notin "
+	labelFlagQuote     = "'"
 	label
 	fuzzyFlag   = "-f"
 	contextFlag = "@"
 )
+
+// NetworkPolicyGraphArgs tracks a network policy graph subject.
+type NetworkPolicyGraphArgs struct {
+	Kind      string
+	Name      string
+	Namespace string
+}
 
 var (
 	labelFlags = []string{
@@ -73,5 +84,10 @@ var (
 		"x",
 		"xr",
 		"xray",
+	)
+	netpolGraphCmd = sets.New(
+		"netpolgraph",
+		"npgraph",
+		"npg",
 	)
 )

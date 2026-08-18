@@ -16,12 +16,17 @@ const (
 	fuzzyKey   = "fuzzy"
 	labelKey   = "labels"
 	contextKey = "context"
+	kindKey    = "kind"
+	nameKey    = "name"
 )
 
 type args map[string]string
 
 func newArgs(p *Interpreter, aa []string) args {
 	arguments := make(args, len(aa))
+	if p != nil && p.IsNetworkPolicyGraphCmd() {
+		return newNetworkPolicyGraphArgs(aa)
+	}
 	if len(aa) == 0 {
 		return arguments
 	}
@@ -78,6 +83,56 @@ func newArgs(p *Interpreter, aa []string) args {
 	}
 
 	return arguments
+}
+
+func newNetworkPolicyGraphArgs(aa []string) args {
+	if len(aa) == 0 || len(aa) > 3 {
+		return args{}
+	}
+
+	kind, ok := normalizeNetworkPolicyGraphKind(aa[0])
+	if !ok {
+		return args{}
+	}
+
+	arguments := args{kindKey: kind}
+	if len(aa) == 1 {
+		return arguments
+	}
+
+	name := strings.ToLower(strings.TrimSpace(aa[1]))
+	if name == "" {
+		return args{}
+	}
+	if kind == netpolGraphKindNS && len(aa) != 2 {
+		return args{}
+	}
+	arguments[nameKey] = name
+
+	if len(aa) == 3 {
+		namespace := strings.ToLower(strings.TrimSpace(aa[2]))
+		if namespace == "" {
+			return args{}
+		}
+		arguments[nsKey] = namespace
+	}
+
+	return arguments
+}
+
+func normalizeNetworkPolicyGraphKind(kind string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "po", "pod", "pods":
+		return netpolGraphKindPod, true
+	case "dp", "deploy", "deployment", "deployments":
+		return netpolGraphKindDP, true
+	case "job", "jobs":
+		return netpolGraphKindJob, true
+	case "ns", "namespace", "namespaces":
+		return netpolGraphKindNS, true
+	default:
+		return "", false
+	}
 }
 
 func (a args) String() string {

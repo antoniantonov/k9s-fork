@@ -129,8 +129,39 @@ func (p *Pod) bindKeys(aa *ui.KeyActions) {
 	}
 
 	aa.Bulk(ui.KeyMap{
-		ui.KeyO: ui.NewKeyAction("Show Node", p.showNode, true),
+		ui.KeyO:      ui.NewKeyAction("Show Node", p.showNode, true),
+		ui.KeyShiftR: ui.NewKeyAction("Network Reachability", p.networkPolicyGraphCmd, true),
 	})
+}
+
+func (p *Pod) networkPolicyGraphCmd(evt *tcell.EventKey) *tcell.EventKey {
+	return gotoNetworkPolicyGraph(p.App(), "pod", p.GetTable().GetSelectedItem(), evt)
+}
+
+func gotoNetworkPolicyGraph(app *App, kind, fqn string, evt *tcell.EventKey) *tcell.EventKey {
+	if fqn == "" {
+		return evt
+	}
+	app.gotoResource(networkPolicyGraphCommand(kind, fqn), "", false, true)
+
+	return nil
+}
+
+func networkPolicyGraphCommand(kind, fqn string) string {
+	namespace, name := client.Namespaced(fqn)
+	if kind == "namespace" {
+		if name == "" {
+			name = namespace
+		}
+		return fmt.Sprintf("npg namespace %s", name)
+	}
+
+	command := fmt.Sprintf("npg %s %s", kind, name)
+	if namespace != "" {
+		command += " " + namespace
+	}
+
+	return command
 }
 
 func (p *Pod) logOptions(prev bool) (*dao.LogOptions, error) {

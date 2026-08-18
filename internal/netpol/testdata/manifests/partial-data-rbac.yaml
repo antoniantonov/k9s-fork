@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: netpol-visible
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: netpol-hidden
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: namespace-reader
+  namespace: netpol-visible
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: namespace-reader
+  namespace: netpol-visible
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: namespace-reader
+  namespace: netpol-visible
+subjects:
+  - kind: ServiceAccount
+    name: namespace-reader
+    namespace: netpol-visible
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: namespace-reader
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: visible-api
+  namespace: netpol-visible
+  labels:
+    app: api
+spec:
+  containers:
+    - name: api
+      image: registry.k8s.io/pause:3.10
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hidden-client
+  namespace: netpol-hidden
+  labels:
+    app: client
+spec:
+  containers:
+    - name: client
+      image: registry.k8s.io/pause:3.10

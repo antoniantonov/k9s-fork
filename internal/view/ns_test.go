@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/derailed/k9s/internal/client"
+	"github.com/derailed/k9s/internal/ui"
 	"github.com/derailed/k9s/internal/view"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,5 +18,7 @@ func TestNSCleanser(t *testing.T) {
 
 	require.NoError(t, ns.Init(makeCtx(t)))
 	assert.Equal(t, "Namespaces", ns.Name())
-	assert.Len(t, ns.Hints(), 8)
+	assert.Len(t, ns.Hints(), 9)
+	_, ok := ns.Actions().Get(ui.KeyShiftR)
+	assert.True(t, ok)
 }

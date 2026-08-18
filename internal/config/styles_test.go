@@ -19,6 +19,38 @@ func TestNewStyle(t *testing.T) {
 	assert.Equal(t, config.Color("black"), s.K9s.Body.BgColor)
 	assert.Equal(t, config.Color("cadetblue"), s.K9s.Body.FgColor)
 	assert.Equal(t, config.Color("lightskyblue"), s.K9s.Frame.Status.NewColor)
+	assert.Equal(t, config.Color("green"), s.Reachability().AllowedColor)
+	assert.Equal(t, config.Color("red"), s.Reachability().DisallowedColor)
+	assert.Equal(t, config.Color("orange"), s.Reachability().PartialDataColor)
+	assert.Equal(t, config.Color("yellow"), s.Reachability().PartialColor)
+	assert.Equal(t, config.Color("white"), s.Reachability().UnknownColor)
+	assert.Equal(t, config.Color("orange"), s.Reachability().FocusColor)
+}
+
+func TestReachabilityStyleInvert(t *testing.T) {
+	s := config.NewStyles()
+	before := s.Reachability()
+
+	s.K9s.Invert()
+
+	assert.Equal(t, before.AllowedColor.InvertColor(), s.Reachability().AllowedColor)
+	assert.Equal(t, before.DisallowedColor.InvertColor(), s.Reachability().DisallowedColor)
+	assert.Equal(t, before.PartialDataColor.InvertColor(), s.Reachability().PartialDataColor)
+	assert.Equal(t, before.PartialColor.InvertColor(), s.Reachability().PartialColor)
+	assert.Equal(t, before.UnknownColor.InvertColor(), s.Reachability().UnknownColor)
+	assert.Equal(t, before.FocusColor.InvertColor(), s.Reachability().FocusColor)
+}
+
+func TestReachabilitySkin(t *testing.T) {
+	s := config.NewStyles()
+	require.NoError(t, s.Load("testdata/skins/reachability.yaml", false))
+
+	assert.Equal(t, config.Color("#006b3c"), s.Reachability().AllowedColor)
+	assert.Equal(t, config.Color("#a51c30"), s.Reachability().DisallowedColor)
+	assert.Equal(t, config.Color("#9c5700"), s.Reachability().PartialDataColor)
+	assert.Equal(t, config.Color("#b58900"), s.Reachability().PartialColor)
+	assert.Equal(t, config.Color("#f5f5f5"), s.Reachability().UnknownColor)
+	assert.Equal(t, config.Color("#c05621"), s.Reachability().FocusColor)
 }
 
 func TestColor(t *testing.T) {

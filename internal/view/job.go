@@ -9,6 +9,7 @@ import (
 	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/dao"
 	"github.com/derailed/k9s/internal/ui"
+	"github.com/derailed/tcell/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -31,8 +32,19 @@ func NewJob(gvr *client.GVR) ResourceViewer {
 	)
 	j.GetTable().SetEnterFn(j.showPods)
 	j.GetTable().SetSortCol("AGE", true)
+	j.AddBindKeysFn(j.bindKeys)
 
 	return &j
+}
+
+func (j *Job) bindKeys(aa *ui.KeyActions) {
+	aa.Bulk(ui.KeyMap{
+		ui.KeyShiftR: ui.NewKeyAction("Network Reachability", j.networkPolicyGraphCmd, true),
+	})
+}
+
+func (j *Job) networkPolicyGraphCmd(evt *tcell.EventKey) *tcell.EventKey {
+	return gotoNetworkPolicyGraph(j.App(), "job", j.GetTable().GetSelectedItem(), evt)
 }
 
 func (*Job) showPods(app *App, _ ui.Tabular, gvr *client.GVR, path string) {

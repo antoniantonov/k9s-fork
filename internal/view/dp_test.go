@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/derailed/k9s/internal/client"
+	"github.com/derailed/k9s/internal/ui"
 	"github.com/derailed/k9s/internal/view"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,5 +18,7 @@ func TestDeploy(t *testing.T) {
 
 	require.NoError(t, v.Init(makeCtx(t)))
 	assert.Equal(t, "Deployments", v.Name())
-	assert.Len(t, v.Hints(), 15)
+	assert.Len(t, v.Hints(), 16)
+	_, ok := v.Actions().Get(ui.KeyShiftR)
+	assert.True(t, ok)
 }
