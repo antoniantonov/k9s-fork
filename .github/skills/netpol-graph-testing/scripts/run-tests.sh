@@ -249,7 +249,7 @@ phase_build_image() {
       fi
     fi
   fi
-  output="$("$REPO_ROOT/scripts/docker-build.sh")" || return 1
+  output="$("$REPO_ROOT/scripts/docker-build-and-run.sh" --build-only)" || return 1
   printf '%s\n' "$output"
   BUILT_IMAGE_TAG="$(printf '%s\n' "$output" | awk '/^==> built image:/ {print $4; exit}')"
   [[ -n "$BUILT_IMAGE_TAG" ]] || { echo "failed to parse built image tag" >&2; return 1; }

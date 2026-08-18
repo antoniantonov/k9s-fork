@@ -239,29 +239,32 @@ Binaries for Linux, Windows and Mac are available as tarballs in the [release pa
 
 #### Building a local versioned image
 
-  The `scripts/docker-build.sh` helper rebuilds the k9s Docker image locally
-  with `docker build` and tags it with the next patch version. It scans
-  existing local `k9s:X.Y.Z` image tags, picks the highest version, and
-  increments the patch component. If no versioned tag exists, it starts at
-  `0.0.1`. The script does not tag `latest`.
+  The `scripts/docker-build-and-run.sh` helper rebuilds the k9s Docker image
+  locally from scratch and tags it with the next patch version. It scans
+  existing local `k9s:X.Y.Z` image tags, picks the highest version, increments
+  the patch component, and removes older k9s images and their containers after
+  a successful build.
 
   ```shell
-  ./scripts/docker-build.sh
+  ./scripts/docker-build-and-run.sh --kubeconfig /path/to/kubeconfig
   ```
 
-  Set `IMAGE_NAME` to build and scan tags for a different local image name:
+  The script prints the exact `docker run` command and starts it. Use
+  `--build-only` to build, clean up, and print the command without starting
+  k9s. Without `--kubeconfig`, an internal kubeconfig is generated for the
+  active kind context; other contexts default to `$HOME/.kube/config`.
+
+  Set `IMAGE_NAME` to build and clean up a different local image name:
 
   ```shell
-  IMAGE_NAME=my-k9s ./scripts/docker-build.sh
+  IMAGE_NAME=my-k9s ./scripts/docker-build-and-run.sh --build-only \
+    --kubeconfig /path/to/kubeconfig
   ```
 
-  After a successful build the script prints a ready-to-paste command that
-  exports the active kind cluster's internal kubeconfig, joins its Docker
-  network, and opens the NetworkPolicy graph for
-  `deployment/api` in `netpol-demo-app`. It defaults to the `k9s-netpol`
-  cluster when the active context is not a kind context. Override
-  `KIND_CLUSTER`, `KIND_NETWORK`, `NPG_DEPLOYMENT`, or `NPG_NAMESPACE` when
-  building to customize the printed command.
+  The run command joins the kind Docker network when the kubeconfig's current
+  context is a local kind cluster and opens the NetworkPolicy graph for
+  `deployment/api` in `netpol-demo-app`. Override `KIND_NETWORK`,
+  `NPG_DEPLOYMENT`, or `NPG_NAMESPACE` to customize it.
 
   Populate or refresh the local kind demo topology with:
 
