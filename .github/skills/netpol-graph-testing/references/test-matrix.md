@@ -21,25 +21,26 @@ Automated cases are in `scripts/k9s-tui-smoke.exp`; setup/build phases are in `s
 | Context launch | Shift-R from Pod/Deployment/Job/Namespace | Manual-only | Requires navigating source resource tables |
 | `i` / `e` | Hide/show ingress and egress; both hidden placeholder | `direction-toggles-placeholder` | Verifies exact placeholder text |
 | `m` | Global Rules ↔ Primitives projection; both panels switch and Effective Applicability stays hidden in Primitives mode | `rules-primitives-global-toggle` | Also used by open-resource cases |
-| `f` | Primitive Kinds dialog; CIDR, Pod, Namespace, Deployment, Job; Apply/Cancel | `primitive-kinds-apply-cancel-zero` | Applies zero kinds and verifies empty-kinds message |
-| `o` | Open Rule is offered only for real rules and hidden in Primitives mode | `open-rule-only-for-real-rules`, `open-rule-hidden-in-primitives` | Synthetic default-deny is asserted not to advertise the action |
+| `f` | Primitive Kinds dialog; CIDR, Pod, Namespace, Deployment, Job; Apply/Cancel | `primitive-kinds-apply-cancel-zero` | Asserts both buttons are visible immediately at the smoke terminal's 50x200 size, without arrow-down scrolling; applies zero kinds and verifies the empty-kinds message |
+| `o` | Open selected native Kubernetes primitive from Subject, Ingress, Egress, Applicability, and Primitive Details | `open-primitive-from-subject`, `open-primitive-from-direction-panels`, `open-primitive-from-applicability`, `enter-navigation-primitive-details` | Eligible states assert the exact `<o> Open Primitive` header hint and select by that hint rather than fixed row ordering; Rules direction rows open their NetworkPolicy |
+| `o` disabled | Rule Details does not offer Open Primitive | `open-primitive-disabled-in-rule-details` | Rule Details remains open after lowercase `o` |
 | `s` | Subject picker lists Pod, Deployment, Job, Namespace subjects | `subject-picker-kinds` | Selection of each subject kind is manual-only in TUI; topology supports all |
 | `/` | Search Apply, Clear, Cancel | `search-apply-clear-cancel` | Uses `frontend` filter |
 | `r` | Auto-refresh toggle; no manual refresh shortcut is advertised | `auto-refresh-toggle`, `launch-npg-view` | Asserts status text and absence of `Ctrl-R` |
 | `y` | YAML view of selected NetworkPolicy; hidden for synthetic rules and CIDR applicability | `yaml-view`, `yaml-hidden-without-a-manifest` | Navigates to real rules by their advertised action |
 | `Enter` | Rule selected → Applicability focus | `enter-navigation-rule-selected` | Headline behavior |
-| `Enter` | No rule selected → Effective Applicability focus | `enter-navigation-effective-applicability` | Exercises the default launch state directly |
-| `Enter` | Primitives selected → details text focus | `enter-navigation-primitive-details` | Plain text detail pane |
-| `Enter` | Applicability focused → opens highlighted primitive; `Esc` returns | `enter-opens-applicability-primitive` | Moves off the first CIDR row before opening |
+| `Enter` | No rule selected → Effective Applicability focus | `enter-navigation-effective-applicability` | Exercises Egress from the default no-selection state; the selected-rule case exercises Ingress |
+| `Enter` | Primitives selected → details text focus | `enter-navigation-primitive-details` | Plain text detail pane; the case then verifies lowercase `o` opens the selected native primitive from Primitive Details |
+| `Enter` | Applicability focused → remains in Applicability | `enter-stays-in-applicability` | Selects a native row through the Open Primitive hint and proves a second Enter does not navigate |
 | `Ctrl-S` | **Set As Subject**: promote a supported Subject workload or applicability primitive to the graph subject | `ctrl-s-set-subject-from-subject-panel`, `ctrl-s-set-subject-from-applicability` | Promotes the selected API Pod from Subject, then independently filters Effective Applicability to `Deployment netpol-demo-web/frontend`; both cases assert focus returned to Subject through the renewed Ctrl-S hint |
-| `Esc` | Clear selection before back navigation; back from opened resource | `escape-clears-selection-before-back`, open cases | Dialog cancel also covered |
+| `Esc` | Clear selection before back navigation; back from opened primitive | `escape-clears-selection-before-back`, open-primitive cases | Dialog cancel also covered |
 | `←` / `→` | Focus Ingress/Egress | `left-right-direction-focus` | Uses ANSI cursor sequences |
 | `Tab` / `Shift-Tab` | Subject → Ingress → Ingress details → Ingress applicability → Egress → Egress details → Egress applicability focus ring | `tab-and-shift-tab-focus-ring` | Each direction owns the detail stops that follow it, so its applicability is reachable without passing through the other panel. Focus opens on Subject. Visual focus is indirectly asserted by stable repaint |
 | Freeze/hang | Rapid arrows, refreshes, mode/direction/autorefresh toggles while scrolling | `freeze-hang-stress` | Sends `SIGQUIT` on repaint timeout |
 
 ## Authoritative automated smoke inventory
 
-The Expect summary contains these 21 cases, each with an explicit verdict:
+The Expect summary contains these 23 cases, each with an explicit verdict:
 
 `launch-npg-view`, `subject-picker-kinds`, `direction-toggles-placeholder`,
 `rules-primitives-global-toggle`, `primitive-kinds-apply-cancel-zero`,
@@ -47,8 +48,10 @@ The Expect summary contains these 21 cases, each with an explicit verdict:
 `left-right-direction-focus`, `enter-navigation-rule-selected`,
 `enter-navigation-effective-applicability`,
 `enter-navigation-primitive-details`,
-`enter-opens-applicability-primitive`, `open-rule-only-for-real-rules`,
-`open-rule-hidden-in-primitives`, `yaml-view`,
+`enter-stays-in-applicability`, `open-primitive-from-subject`,
+`open-primitive-from-direction-panels`,
+`open-primitive-from-applicability`,
+`open-primitive-disabled-in-rule-details`, `yaml-view`,
 `yaml-hidden-without-a-manifest`, `auto-refresh-toggle`,
 `escape-clears-selection-before-back`,
 `ctrl-s-set-subject-from-subject-panel`,
@@ -66,4 +69,4 @@ The Expect summary contains these 21 cases, each with an explicit verdict:
 | Access state | Allowed, Disallowed, Partial, Unknown, Partial-data, rule-only `[EMPTY]` | Demo topology covers Allowed/Disallowed/Partial/Unknown, including zero-pod-pair primitives as `Unknown`; rule-level `[EMPTY]` remains for empty subject-policy matches; Partial-data requires induced informer/API warning and is manual-only |
 | Details target | Rule Details text, Applicability table with direction title, Effective Details, Effective Applicability with direction title, Primitive Details text | Enter navigation and Esc cases |
 | Dialogs | Subject picker, Primitive Kinds, Search | Dedicated dialog cases |
-| Resource opening | NetworkPolicy, Pod, Namespace, Deployment, Job, CIDR warning | `o`/Enter cases cover selected rows; exhaustive primitive-kind row selection manual-only |
+| Resource opening | NetworkPolicy, Pod, Namespace, Deployment, Job; CIDR remains non-openable | Lowercase `o` covers selected native rows from Subject, both Rules direction panels, Applicability, and Primitive Details; exhaustive primitive-kind row selection is manual-only |
