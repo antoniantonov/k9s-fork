@@ -152,7 +152,7 @@ proc ensure_primitives {} {
 }
 
 # The view opens focused on the subject panel, which is where the Tab ring
-# starts. Cases that drive a direction panel -- Open Rule, YAML, Enter
+# starts. Cases that drive a direction panel -- Open Primitive, YAML, Enter
 # navigation -- have to move focus there first. Left is honoured from the
 # subject but deliberately ignored once focus sits inside the detail pane, so
 # this only works on a freshly opened view, which start_case guarantees.
@@ -167,6 +167,14 @@ proc select_direction_row_with_hint {pattern description {max_moves 30}} {
   }
   fail_case "could not find $description"
   return 0
+}
+
+proc assert_native_primitive_view {{seconds 20}} {
+  return [assert_screen {Pods|pods\(|Namespaces|namespaces\(|Deployments|deployments\(|Jobs|jobs\(|Viewing v1/pods|Viewing v1/namespaces|Viewing apps/v1/deployments|Viewing batch/v1/jobs} $seconds]
+}
+
+proc assert_network_policy_view {{seconds 20}} {
+  return [assert_screen {networkpolicies\(|Viewing networking\.k8s\.io/v1/networkpolicies} $seconds]
 }
 
 proc finish_case {} {
@@ -234,7 +242,9 @@ start_case "primitive-kinds-apply-cancel-zero"
 ensure_rules
 send_key "m"
 send_key "f"
-if {[assert_all_screen {{Primitive Kinds} CIDR Pod Namespace Deployment Job} 10]} {
+if {[assert_all_screen {{Primitive Kinds} CIDR Pod Namespace Deployment Job Apply Cancel} 10]} {
+  # All controls, including both buttons, must fit at 50x200 before any arrow
+  # key can scroll the form.
   # Clear all five checkboxes, tab to Apply, press Enter.
   for {set i 0} {$i < 5} {incr i} { send_key " " 100; send_key "\t" 100 }
   send_key "\r"
@@ -301,71 +311,124 @@ pass_case
 
 start_case "enter-navigation-effective-applicability"
 ensure_rules
-focus_ingress
-# The graph opens without a selected rule, so Enter focuses the direction's
-# effective applicability table directly.
+# Cover the other direction: the graph opens without a selected rule, so Enter
+# on Egress focuses its effective applicability table directly.
+send_key "\033\[C"
 assert_screen {Effective Details|Selection: none} 15
-assert_screen {Effective Applicability \(Ingress\)} 15
+assert_screen {Effective Applicability \(Egress\)} 15
 send_key "\r"
-assert_all_screen {{Effective Applicability \(Ingress\)} Primitive Peer Opposite State Ports} 15
+assert_all_screen {{Effective Applicability \(Egress\)} Primitive Peer Opposite State Ports} 15
 pass_case
 
 start_case "enter-navigation-primitive-details"
 ensure_primitives
-# Select a primitive, then Enter focuses its text detail pane (there is no
-# applicability table in this projection).
+# Select a native primitive, then Enter focuses its text detail pane (there is
+# no applicability table in this projection). The same selected primitive must
+# remain openable with lowercase o from Primitive Details.
 focus_ingress
 assert_screen {Ingress · Primitives} 15
-send_key "\033\[B"
-assert_screen {Primitive Details} 15
-send_key "\r"
-assert_all_screen {{Primitive Details} {Direction: Ingress|Coverage:}} 15
-pass_case
+if {[select_direction_row_with_hint {Open Primitive} "a native ingress primitive"]} {
+  assert_screen {Primitive Details} 15
+  send_key "\r"
+  if {[assert_all_screen {{Primitive Details} {Direction: Ingress|Coverage:} {<o>} {Open Primitive}} 15]} {
+    send_key "o"
+    if {[assert_native_primitive_view 20]} {
+      send_key "\033"
+      finish_case
+    }
+  }
+}
 
-start_case "enter-opens-applicability-primitive"
+start_case "enter-stays-in-applicability"
 ensure_rules
 focus_ingress
-# Focus the applicability table, move off the first CIDR row so Enter opens a
-# Kubernetes resource instead of the CIDR flash path, then Esc returns.
+# Enter on a direction still focuses Applicability. Once there, move to any
+# native primitive advertised as openable and prove a second Enter stays put;
+# resource opening from Applicability belongs exclusively to lowercase o.
 assert_screen {Ingress · Rules} 15
 send_key "\r"
 assert_screen {Applicability \(Ingress\)} 15
-assert_screen {CIDR 192\.168\.0\.0/16} 15
-send_key "\033\[B"
-send_key "\r"
-if {[assert_screen {Pods|pods\(|Namespaces|namespaces\(|Deployments|deployments\(|Jobs|jobs\(|Viewing v1/pods|Viewing v1/namespaces|Viewing apps/v1/deployments|Viewing batch/v1/jobs} 20]} {
-  send_key "\033"
-  finish_case
+if {[select_direction_row_with_hint {Open Primitive} "a native applicability primitive"]} {
+  send_key "\r"
+  if {[assert_all_screen {{Applicability \(Ingress\)} {<o>} {Open Primitive}} 15]} {
+    pass_case
+  }
 }
 
-start_case "open-rule-only-for-real-rules"
+start_case "open-primitive-from-subject"
 ensure_rules
-focus_ingress
-# The first row is the synthetic default-deny, which is not a real rule and so
-# offers nothing to open.
-send_key "\033\[B"
-if {[screen_matches {<o>} 5]} {
-  fail_case "Open Rule is advertised for the synthetic default-deny row"
-} elseif {[select_direction_row_with_hint {<o>} "a real rule with the Open Rule hint"]} {
-  assert_screen {Open Rule} 20
+# The default Subject selection is a native Pod workload. The exact header hint
+# is both the eligibility assertion and the stable signal that the row loaded.
+if {[assert_all_screen {{Pod[[:space:]]+netpol-demo-app[[:space:]]+api-} {<o>} {Open Primitive}} 30]} {
   send_key "o"
-  assert_screen {NetworkPolicies|NetworkPolicy|policy} 20
-  send_key "\033"
-  assert_reachability_view 20
-  pass_case
+  if {[assert_native_primitive_view 20]} {
+    send_key "\033"
+    finish_case
+  }
 }
 
-start_case "open-rule-hidden-in-primitives"
+start_case "open-primitive-from-direction-panels"
 ensure_rules
 focus_ingress
-if {[select_direction_row_with_hint {<o>} "a real rule with the Open Rule hint"]} {
-  send_key "m"
-  assert_screen {Ingress · Primitives} 15
-  if {[screen_matches {Open Rule} 5]} {
-    fail_case "Open Rule must not be offered in Primitives mode"
-  } else {
-    send_key "m"
-    finish_case
+# Rules rows resolve to their native NetworkPolicy. Select by the renamed action
+# hint rather than row position so synthetic rows and ordering do not make the
+# smoke brittle, and exercise both direction panels independently.
+if {[select_direction_row_with_hint {Open Primitive} "an ingress NetworkPolicy"]} {
+  if {[assert_screen {<o>} 10]} {
+    send_key "o"
+    if {[assert_network_policy_view 20]} {
+      send_key "\033"
+      assert_screen {Ingress · Rules} 20
+      send_key "\033\[C"
+      assert_screen {Egress · Rules} 15
+      if {[select_direction_row_with_hint {Open Primitive} "an egress NetworkPolicy"]} {
+        if {[assert_screen {<o>} 10]} {
+          send_key "o"
+          if {[assert_network_policy_view 20]} {
+            send_key "\033"
+            finish_case
+          }
+        }
+      }
+    }
+  }
+}
+
+start_case "open-primitive-from-applicability"
+ensure_rules
+focus_ingress
+send_key "\r"
+assert_screen {Effective Applicability \(Ingress\)} 15
+if {[select_direction_row_with_hint {Open Primitive} "a native applicability primitive"]} {
+  if {[assert_screen {<o>} 10]} {
+    send_key "o"
+    if {[assert_native_primitive_view 20]} {
+      send_key "\033"
+      finish_case
+    }
+  }
+}
+
+start_case "open-primitive-disabled-in-rule-details"
+ensure_rules
+focus_ingress
+# A real rule supplies stable Rule Details, but that text pane is not itself a
+# primitive selection. Lowercase o must be absent and must leave the pane open.
+if {[select_direction_row_with_hint {<y>} "a real rule with Rule Details"]} {
+  send_key "\t"
+  if {[assert_screen {Rule Details} 15]} {
+    if {[screen_matches {<o>} 3] || [screen_matches {Open Primitive} 3]} {
+      fail_case "Open Primitive is advertised in Rule Details"
+    } else {
+      send_key "o"
+      if {[assert_screen {Rule Details} 10]} {
+        if {[screen_matches {<o>} 2] || [screen_matches {Open Primitive} 2]} {
+          fail_case "Open Primitive became available in Rule Details"
+        } else {
+          pass_case
+        }
+      }
+    }
   }
 }
 

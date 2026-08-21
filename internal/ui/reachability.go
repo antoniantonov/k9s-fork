@@ -1157,6 +1157,113 @@ type PrimitiveKindDialog struct {
 	cancel   func()
 }
 
+const (
+	primitiveKindDialogModalFrameSize = 4
+	primitiveKindDialogFormFrameSize  = 2
+	primitiveKindDialogModalTitle     = "<Primitive Kinds (global)>"
+)
+
+// DialogRect is a terminal rectangle for a modal dialog.
+type DialogRect struct {
+	X      int
+	Y      int
+	Width  int
+	Height int
+}
+
+// PrimitiveKindDialogRect returns a centered rectangle large enough for the
+// form's vertical item list and its single button row. The rectangle is always
+// clamped to the available terminal area.
+func PrimitiveKindDialogRect(form *tview.Form, terminalWidth, terminalHeight int) DialogRect {
+	terminalWidth = max(0, terminalWidth)
+	terminalHeight = max(0, terminalHeight)
+
+	contentWidth := 0
+	contentHeight := 0
+	if form != nil {
+		for index := range form.GetFormItemCount() {
+			item := form.GetFormItem(index)
+			fieldWidth := item.GetFieldWidth()
+			if fieldWidth == 0 {
+				fieldWidth = tview.DefaultFormFieldWidth
+			}
+			contentWidth = max(contentWidth, tview.TaggedStringWidth(item.GetLabel())+1+fieldWidth)
+		}
+
+		buttonsWidth := 0
+		for index := range form.GetButtonCount() {
+			if index > 0 {
+				buttonsWidth++
+			}
+			buttonsWidth += tview.TaggedStringWidth(form.GetButton(index).GetLabel()) + 4
+		}
+		contentWidth = max(contentWidth, buttonsWidth)
+		contentHeight = form.GetFormItemCount()
+		if form.GetButtonCount() > 0 {
+			contentHeight += 2
+		}
+	}
+
+	formWidth := contentWidth + primitiveKindDialogFormFrameSize
+	formHeight := contentHeight + primitiveKindDialogFormFrameSize
+	width := min(terminalWidth,
+		max(1, terminalWidth/3, formWidth)+primitiveKindDialogModalFrameSize)
+	height := min(terminalHeight, formHeight+primitiveKindDialogModalFrameSize)
+	return DialogRect{
+		X:      (terminalWidth - width) / 2,
+		Y:      (terminalHeight - height) / 2,
+		Width:  width,
+		Height: height,
+	}
+}
+
+// SizePrimitiveKindDialog computes and applies the dialog rectangle.
+func SizePrimitiveKindDialog(
+	modal *tview.ModalForm,
+	form *tview.Form,
+	terminalWidth, terminalHeight int,
+) DialogRect {
+	rect := PrimitiveKindDialogRect(form, terminalWidth, terminalHeight)
+	if modal != nil {
+		modal.SetRect(rect.X, rect.Y, rect.Width, rect.Height)
+	}
+	if modal == nil || form == nil {
+		return rect
+	}
+
+	form.SetDrawFunc(func(
+		screen tcell.Screen,
+		x, y, width, height int,
+	) (int, int, int, int) {
+		screenWidth, screenHeight := screen.Size()
+		drawRect := PrimitiveKindDialogRect(form, screenWidth, screenHeight)
+		modalX, modalY, modalWidth, modalHeight := modal.GetRect()
+		if modalX == drawRect.X && modalY == drawRect.Y &&
+			modalWidth == drawRect.Width && modalHeight == drawRect.Height {
+			return x, y, width, height
+		}
+
+		modal.SetRect(drawRect.X, drawRect.Y, drawRect.Width, drawRect.Height)
+		modalFrame := tview.NewBox().
+			SetBorder(true).
+			SetBorderPadding(1, 1, 1, 1).
+			SetTitle(primitiveKindDialogModalTitle).
+			SetTitleColor(tcell.ColorAqua).
+			SetBackgroundColor(form.GetBackgroundColor())
+		modalFrame.SetRect(drawRect.X, drawRect.Y, drawRect.Width, drawRect.Height)
+		modalFrame.Draw(screen)
+
+		formX, formY, formWidth, formHeight := modalFrame.GetInnerRect()
+		formFrame := tview.NewBox().
+			SetBorder(true).
+			SetBackgroundColor(form.GetBackgroundColor())
+		formFrame.SetRect(formX, formY, formWidth, formHeight)
+		formFrame.Draw(screen)
+		return formFrame.GetInnerRect()
+	})
+	return rect
+}
+
 // NewPrimitiveKindDialog creates a selector for all five primitive kinds. The
 // supplied set is cloned and is never mutated.
 func NewPrimitiveKindDialog(
@@ -1171,6 +1278,7 @@ func NewPrimitiveKindDialog(
 		cancel:   cancel,
 	}
 	d.SetBorder(true).SetTitle(" Primitive Kinds ")
+	d.SetItemPadding(0)
 	for _, kind := range primitiveKinds() {
 		d.AddCheckbox(kind.String(), d.selected.Has(kind), func(_ string, checked bool) {
 			if checked {
