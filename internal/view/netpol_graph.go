@@ -36,7 +36,7 @@ const (
 	netPolSearchPage      = "netpol-search"
 	netPolSubjectPage     = "netpol-subject"
 	subjectInfoRowLimit   = 300
-	openRuleHint          = "Open Rule"
+	openPrimitiveHint     = "Open Primitive"
 )
 
 // Section sizing. Every section above the applicability table is sized to its
@@ -650,7 +650,7 @@ func (v *NetworkPolicyGraph) loadPanel(direction netpol.Direction) {
 	panel.SetProjection(v.mode).
 		SetFilter(modeState.filter)
 	if v.mode == ui.PrimitivesProjection && len(v.kinds) == 0 {
-		panel.SetData(nil, nil).SetEmptyMessage("No primitive kinds selected. Press f to enable kinds.")
+		panel.SetData(nil, nil).SetEmptyMessage("No primitive kinds selected. Press p to enable kinds.")
 	} else {
 		cache := v.projection(direction)
 		panel.SetEmptyMessage("No reachability results match this view.").
@@ -1778,6 +1778,7 @@ func (v *NetworkPolicyGraph) openKindsDialog() {
 	styleForm(dialog.Form, &styles)
 	modal := tview.NewModalForm("<Primitive Kinds (global)>", dialog.Form)
 	modal.SetBackgroundColor(styles.BgColor.Color()).SetTextColor(styles.FgColor.Color())
+	ui.SizePrimitiveKindDialog(modal, dialog.Form, 0, 0)
 	modal.SetDoneFunc(func(int, string) { dialog.Cancel() })
 	v.app.Content.AddPage(netPolKindsDialogPage, modal, false, false)
 	v.app.Content.ShowPage(netPolKindsDialogPage)
@@ -2033,21 +2034,6 @@ func (v *NetworkPolicyGraph) restoreSearchFocus(stop focusStop) {
 	v.applyFocusTarget(stop.target)
 }
 
-// openRuleTarget resolves the NetworkPolicy backing the focused direction
-// panel's selection. Only a real rule qualifies: the view is in Rules mode, a
-// direction panel holds focus, and the highlighted row is not one of the
-// synthetic default-deny/unrestricted rows, which describe evaluated behaviour
-// rather than a policy that could be opened.
-func (v *NetworkPolicyGraph) openRuleTarget() (namespace, name string, found bool) {
-	if v.mode != ui.RulesProjection {
-		return "", "", false
-	}
-	if v.focusTarget != focusIngress && v.focusTarget != focusEgress {
-		return "", "", false
-	}
-	return v.selectedRulePolicy(v.focus)
-}
-
 // selectedRulePolicy returns the policy behind the direction's selected rule.
 func (v *NetworkPolicyGraph) selectedRulePolicy(direction netpol.Direction) (namespace, name string, found bool) {
 	if !v.state[direction].visible {
@@ -2062,21 +2048,6 @@ func (v *NetworkPolicyGraph) selectedRulePolicy(direction netpol.Direction) (nam
 		return "", "", false
 	}
 	return rule.ID.PolicyNamespace, rule.ID.PolicyName, true
-}
-
-// openRuleCmd navigates to the NetworkPolicy backing the selected rule and
-// pushes it onto the view stack so Esc returns to the reachability view.
-func (v *NetworkPolicyGraph) openRuleCmd(evt *tcell.EventKey) *tcell.EventKey {
-	if v.app == nil {
-		return evt
-	}
-	namespace, name, ok := v.openRuleTarget()
-	if !ok {
-		v.app.Flash().Info("Select a NetworkPolicy rule to open it")
-		return nil
-	}
-	v.app.gotoResource("networkpolicies", objectKey(namespace, name), false, true)
-	return nil
 }
 
 func (v *NetworkPolicyGraph) yamlCmd(_ *tcell.EventKey) *tcell.EventKey {
@@ -2239,8 +2210,8 @@ func (v *NetworkPolicyGraph) focusDirectionCmd(direction netpol.Direction) func(
 }
 
 // enterCmd walks focus into the detail pane so applicability rows can be
-// scrolled, then opens the highlighted resource on a second press. Open Rule
-// remains directly available from a direction panel on "o".
+// scrolled. Applicability owns Enter as an inert navigation key; resources are
+// opened consistently with "o".
 func (v *NetworkPolicyGraph) enterCmd(evt *tcell.EventKey) *tcell.EventKey {
 	switch v.focusTarget {
 	case focusSubject:
@@ -2254,41 +2225,40 @@ func (v *NetworkPolicyGraph) enterCmd(evt *tcell.EventKey) *tcell.EventKey {
 	case focusIngress, focusEgress:
 		return v.focusDetailPane(evt)
 	case focusApplicability:
-		return v.openApplicabilityCmd(evt)
+		return evt
 	case focusDetails:
-		// Primitives render a plain detail pane with no applicability table, so
-		// this is the only route to the resource behind the selection. "o" is
-		// deliberately not offered here: it only ever opens a NetworkPolicy.
+		if v.mode != ui.PrimitivesProjection ||
+			!v.state[v.focus].visible ||
+			v.panels[v.focus].SelectedID() == "" {
+			return evt
+		}
 		return v.openPrimitiveCmd(evt)
 	default:
 		return evt
 	}
 }
 
-// openPrimitiveCmd navigates to the resource backing the selected primitive.
-func (v *NetworkPolicyGraph) openPrimitiveCmd(evt *tcell.EventKey) *tcell.EventKey {
-	if v.app == nil {
-		return evt
+func (v *NetworkPolicyGraph) directionPrimitiveTarget(direction netpol.Direction) (command, path string, err error) {
+	id := v.panels[direction].SelectedID()
+	if !v.state[direction].visible || id == "" {
+		return "", "", errNoPrimitiveTarget
 	}
-	if v.mode != ui.PrimitivesProjection {
-		return evt
+	if v.mode == ui.RulesProjection {
+		namespace, name, ok := v.selectedRulePolicy(direction)
+		if !ok {
+			return "", "", errNoPrimitiveTarget
+		}
+		return "networkpolicies", objectKey(namespace, name), nil
 	}
-	id := v.panels[v.focus].SelectedID()
-	if !v.state[v.focus].visible || id == "" {
-		return evt
-	}
-	primitive, ok := v.selectedPrimitive(v.focus, id)
+	primitive, ok := v.selectedPrimitive(direction, id)
 	if !ok {
-		v.app.Flash().Info("Selected primitive is no longer available")
-		return nil
+		return "", "", errPrimitiveUnavailable
 	}
-	command, path := primitiveCommand(&primitive.Ref)
+	command, path = primitiveCommand(&primitive.Ref)
 	if command == "" {
-		v.app.Flash().Errf("CIDR primitives are not Kubernetes resources")
-		return nil
+		return "", "", errPrimitiveNotResource
 	}
-	v.app.gotoResource(command, path, false, true)
-	return nil
+	return command, path, nil
 }
 
 // focusDetailPane moves focus onto the applicability table when one is
@@ -2315,6 +2285,7 @@ func (v *NetworkPolicyGraph) focusDetailPane(evt *tcell.EventKey) *tcell.EventKe
 var (
 	errNoApplicabilityTable = errors.New("the detail pane renders no applicability table")
 	errNoApplicabilityRow   = errors.New("no applicability row is highlighted")
+	errNoPrimitiveTarget    = errors.New("no Kubernetes primitive is selected")
 	errPrimitiveUnavailable = errors.New("the highlighted primitive is no longer available")
 	errPrimitiveNotResource = errors.New("the highlighted primitive is not a Kubernetes resource")
 )
@@ -2412,13 +2383,38 @@ func (v *NetworkPolicyGraph) subjectPromotionTarget() (netpol.SubjectRef, bool) 
 	return v.applicabilitySubjectTarget()
 }
 
-// openApplicabilityCmd opens the primitive backing the highlighted
-// applicability row.
-func (v *NetworkPolicyGraph) openApplicabilityCmd(evt *tcell.EventKey) *tcell.EventKey {
+// openPrimitiveTarget resolves the native Kubernetes resource selected by the
+// focused pane. Rule detail text is intentionally excluded: only its
+// applicability rows identify primitives.
+func (v *NetworkPolicyGraph) openPrimitiveTarget() (command, path string, err error) {
+	switch v.focusTarget {
+	case focusSubject:
+		gvr, resourcePath, ok := v.workloadYAMLTarget()
+		if !ok {
+			return "", "", errNoPrimitiveTarget
+		}
+		return gvr.GVR().Resource, resourcePath, nil
+	case focusIngress, focusEgress:
+		return v.directionPrimitiveTarget(v.focus)
+	case focusApplicability:
+		return v.applicabilityTarget()
+	case focusDetails:
+		if v.mode != ui.PrimitivesProjection {
+			return "", "", errNoPrimitiveTarget
+		}
+		return v.directionPrimitiveTarget(v.focus)
+	default:
+		return "", "", errNoPrimitiveTarget
+	}
+}
+
+// openPrimitiveCmd opens the native Kubernetes resource selected by the
+// focused pane and pushes it onto the view stack.
+func (v *NetworkPolicyGraph) openPrimitiveCmd(evt *tcell.EventKey) *tcell.EventKey {
 	if v.app == nil {
 		return evt
 	}
-	command, path, err := v.applicabilityTarget()
+	command, path, err := v.openPrimitiveTarget()
 	if err != nil {
 		if errors.Is(err, errPrimitiveNotResource) {
 			v.app.Flash().Errf("CIDR primitives are not Kubernetes resources")
@@ -2472,7 +2468,7 @@ func (v *NetworkPolicyGraph) bindKeys() {
 		ui.KeyI:          ui.NewKeyAction("Toggle Ingress", func(*tcell.EventKey) *tcell.EventKey { v.toggleDirection(netpol.Ingress); return nil }, true),
 		ui.KeyE:          ui.NewKeyAction("Toggle Egress", func(*tcell.EventKey) *tcell.EventKey { v.toggleDirection(netpol.Egress); return nil }, true),
 		ui.KeyM:          ui.NewKeyAction("Toggle Mode", func(*tcell.EventKey) *tcell.EventKey { v.switchMode(); return nil }, true),
-		ui.KeyF:          ui.NewKeyAction("Primitive Kinds", func(*tcell.EventKey) *tcell.EventKey { v.openKindsDialog(); return nil }, true),
+		ui.KeyP:          ui.NewKeyAction("Primitive Kinds", func(*tcell.EventKey) *tcell.EventKey { v.openKindsDialog(); return nil }, true),
 		ui.KeyS:          ui.NewKeyAction("Subject", func(*tcell.EventKey) *tcell.EventKey { v.openSubjectDialog(); return nil }, true),
 		ui.KeyR:          ui.NewKeyAction("Toggle Auto-Refresh", func(*tcell.EventKey) *tcell.EventKey { v.toggleAutoRefresh(); return nil }, true),
 		tcell.KeyEnter:   ui.NewKeyAction("Focus Details/Open", v.enterCmd, false),
@@ -2510,8 +2506,8 @@ func (v *NetworkPolicyGraph) syncActions() {
 	} else {
 		v.actions.Delete(tcell.KeyCtrlS)
 	}
-	if _, _, ok := v.openRuleTarget(); ok {
-		v.actions.Add(ui.KeyO, ui.NewKeyAction(openRuleHint, v.openRuleCmd, true))
+	if _, _, err := v.openPrimitiveTarget(); err == nil {
+		v.actions.Add(ui.KeyO, ui.NewKeyAction(openPrimitiveHint, v.openPrimitiveCmd, true))
 	} else {
 		v.actions.Delete(ui.KeyO)
 	}

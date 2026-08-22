@@ -751,6 +751,98 @@ func TestPrimitiveKindDialogOwnsStateAndCallbacks(t *testing.T) {
 	assert.True(t, empty.SelectedKinds().Has(netpol.PrimitiveJob))
 }
 
+func TestPrimitiveKindDialogRect(t *testing.T) {
+	form := NewPrimitiveKindDialog(nil, nil, nil).Form
+	tests := []struct {
+		name          string
+		width, height int
+		want          DialogRect
+	}{
+		{
+			name:   "standard terminal",
+			width:  80,
+			height: 24,
+			want:   DialogRect{X: 25, Y: 5, Width: 30, Height: 13},
+		},
+		{
+			name:   "wide terminal",
+			width:  120,
+			height: 40,
+			want:   DialogRect{X: 38, Y: 13, Width: 44, Height: 13},
+		},
+		{
+			name:   "exact content size",
+			width:  26,
+			height: 13,
+			want:   DialogRect{Width: 26, Height: 13},
+		},
+		{
+			name:   "small terminal clamps both dimensions",
+			width:  20,
+			height: 8,
+			want:   DialogRect{Width: 20, Height: 8},
+		},
+		{
+			name:   "single cell terminal",
+			width:  1,
+			height: 1,
+			want:   DialogRect{Width: 1, Height: 1},
+		},
+		{
+			name:   "invalid terminal dimensions",
+			width:  -10,
+			height: -5,
+			want:   DialogRect{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, PrimitiveKindDialogRect(form, tt.width, tt.height))
+		})
+	}
+}
+
+func TestSizePrimitiveKindDialogAppliesRectAndPreservesFormContract(t *testing.T) {
+	applied := false
+	dialog := NewPrimitiveKindDialog(nil, func(sets.Set[netpol.PrimitiveKind]) {
+		applied = true
+	}, nil)
+	modal := tview.NewModalForm("<Primitive Kinds (global)>", dialog.Form)
+
+	rect := SizePrimitiveKindDialog(modal, dialog.Form, 80, 24)
+
+	assert.Equal(t, 5, dialog.GetFormItemCount())
+	assert.Equal(t, 2, dialog.GetButtonCount())
+	x, y, width, height := modal.GetRect()
+	assert.Equal(t, []int{rect.X, rect.Y, rect.Width, rect.Height}, []int{x, y, width, height})
+	dialog.GetFormItemByLabel("CIDR").(*tview.Checkbox).SetChecked(true)
+	dialog.Apply()
+	assert.True(t, applied, "sizing must not replace the form callbacks")
+
+	screen := tcell.NewSimulationScreen("UTF-8")
+	require.NoError(t, screen.Init())
+	t.Cleanup(screen.Fini)
+
+	screen.SetSize(20, 8)
+	modal.Draw(screen)
+	x, y, width, height = modal.GetRect()
+	assert.Equal(t, []int{0, 0, 20, 8}, []int{x, y, width, height},
+		"draw-time sizing must stay clamped after ModalForm recalculates its rectangle")
+
+	screen.SetSize(80, 24)
+	dialog.SetFocus(dialog.GetFormItemCount())
+	modal.Draw(screen)
+	firstX, firstY, _, _ := dialog.GetFormItem(0).GetRect()
+	_, lastY, _, _ := dialog.GetFormItem(dialog.GetFormItemCount() - 1).GetRect()
+	buttonX, buttonY, _, _ := dialog.GetButton(0).GetRect()
+	assert.GreaterOrEqual(t, firstX, rect.X)
+	assert.GreaterOrEqual(t, firstY, rect.Y)
+	assert.GreaterOrEqual(t, buttonX, rect.X)
+	assert.Equal(t, lastY+2, buttonY, "the button row follows the five compact checkbox rows")
+	assert.Less(t, buttonY, rect.Y+rect.Height)
+}
+
 func TestWrappedLineCount(t *testing.T) {
 	assert.Equal(t, 1, WrappedLineCount("", 10), "an empty string still occupies one line")
 	assert.Equal(t, 1, WrappedLineCount("hello", 10))

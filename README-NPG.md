@@ -216,6 +216,14 @@ The applicability table aggregates this check conservatively:
   an opposite NetworkPolicy side;
 - `n/a` is also shown when no concrete pair exists.
 
+```mermaid
+flowchart LR
+    S[Source pod] --> E["Source egress policy<br/>Peer for an egress row<br/>Opposite for an ingress row"]
+    E --> P{"Common protocol and<br/>destination port?"}
+    P --> I["Destination ingress policy<br/>Opposite for an egress row<br/>Peer for an ingress row"]
+    I --> D[Destination pod]
+```
+
 Always interpret `Peer`, `Opposite`, and `State` together. For example,
 `Peer=true`, `Opposite=false`, and `State=Disallowed` means that the selected
 side matched, but the complete end-to-end path was not allowed.
@@ -342,9 +350,11 @@ Primitive states mean:
 | `Unknown` | No definitive allow/deny result can be produced. This commonly occurs when there are no current pods to form a pair, or every pair depends on unresolved semantics such as an ambiguous named port. |
 | `Partial Data` | The cluster snapshot or pair evaluation is incomplete, so the displayed observations must not be treated as a complete result. |
 
-Press `Enter` to move from the direction panel to Primitive Details. Press
-`Enter` again to open Pod, Namespace, Deployment, or Job primitives. CIDRs are
-address ranges rather than Kubernetes resources and cannot be opened.
+Press `Enter` to move from the direction panel to Primitive Details. Press `o`
+from the direction panel or Primitive Details to open the selected Pod,
+Namespace, Deployment, or Job in its native k9s view. `Enter` from Primitive
+Details retains the same open behavior. CIDRs are address ranges rather than
+Kubernetes resources and cannot be opened.
 
 ### Details panel
 ![alt text](assets/npg/effective-details-demo.png)
@@ -451,7 +461,7 @@ ambiguous. `Partial Data` is different: it means the evaluator knows the
 snapshot is incomplete, for example because of missing RBAC access, a failed
 resource list/watch, or result truncation.
 
-The panel uses the globally enabled primitive kinds. Pressing `f` can therefore
+The panel uses the globally enabled primitive kinds. Pressing `p` can therefore
 add or remove rows from both the direction panels and applicability tables.
 Pressing `a` in Rules mode toggles both ingress and egress rule/effective
 applicability tables between all rows and exact Allowed rows only. Disallowed,
@@ -537,7 +547,8 @@ that direction panel restores a selection.
 | Ingress or Egress with a selected rule | Move directly to that rule's Applicability table when it has rows; otherwise move to Rule Details. |
 | Ingress or Egress with no selection | Move to Effective Applicability when it has rows; otherwise move to Effective Details. |
 | Ingress or Egress with a selected primitive | Move to Primitive Details. |
-| Applicability or Effective Applicability | Open the highlighted Pod, Namespace, Deployment, or Job primitive. A CIDR reports that it is not a Kubernetes resource. |
+| Applicability or Effective Applicability | Remain in the applicability table. Use `o` to open the highlighted Kubernetes primitive. |
+| Rule Details | No action. |
 | Primitive Details | Open the selected Pod, Namespace, Deployment, or Job primitive. A CIDR reports that it is not a Kubernetes resource. |
 
 `Ctrl-S` (**Set As Subject**) promotes the highlighted resource to the current subject and
@@ -549,11 +560,22 @@ reevaluates:
   ReplicaSet, StatefulSet, and DaemonSet rows are not supported subject kinds.
 
 The new subject begins with both directions and both projections cleared, and
-focus returns to Subject. Plain `Enter` retains its open-resource behavior and
-never promotes the subject.
+focus returns to Subject. Plain `Enter` never promotes the subject.
 
-In Rules mode, `Enter` does not directly open the NetworkPolicy. Use `o` while
-the real rule is selected and its direction panel has focus.
+### Open Primitive behavior
+
+When the focused selection maps to a native Kubernetes resource, the header
+shows `<o> Open Primitive`. Press `o` to open that resource in its native k9s
+view from:
+
+- Subject;
+- Ingress or Egress in Rules or Primitives mode;
+- Applicability or Effective Applicability;
+- Primitive Details.
+
+In Rules mode, a real direction-row selection opens its NetworkPolicy.
+`o` is hidden and unbound in Rule Details and whenever the selection is empty,
+synthetic, unavailable, or a CIDR.
 
 ### Escape behavior
 
@@ -574,13 +596,13 @@ the real rule is selected and its direction panel has focus.
 | `e` | Show or hide the Egress panel. |
 | `m` | Toggle both direction panels between Rules and Primitives mode. |
 | `s` | Open the subject picker. |
-| `f` | Open the global primitive-kind selector for CIDR, Pod, Namespace, Deployment, and Job. |
+| `p` | Open the global primitive-kind selector for CIDR, Pod, Namespace, Deployment, and Job. |
 | `a` | Toggle both ingress and egress rule/effective applicability tables between all rows and exact Allowed rows only. Available only in Rules mode; hidden/unbound in Primitives mode. |
 | `/` | Search/filter the focused Subject, direction, Rule/Primitive context, or Applicability panel. Hidden while Effective Details text has focus. |
 | `r` | Enable or disable automatic reevaluation every five seconds. |
-| `o` | Open the selected real NetworkPolicy rule. Available only in Rules mode while its direction panel has focus. |
+| `o` | **Open Primitive**: open the selected native Kubernetes resource from Subject, Ingress, Egress, Applicability, Effective Applicability, or Primitive Details. Hidden in Rule Details and for CIDRs, synthetic rows, or empty selections. |
 | `y` | Open YAML for the focused selected workload, real rule, resource primitive, or applicability row. Unavailable for CIDRs, synthetic rules, and empty selections. |
-| `Enter` | Move into Details/Applicability or open a highlighted primitive, depending on focus. |
+| `Enter` | Move from Subject or a direction panel into the graph's next focus stop. It is inert in Applicability and Rule Details, and retains open behavior in Primitive Details. |
 | `Ctrl-S` | **Set As Subject**: promote an eligible highlighted Pod, Deployment, Job, or Namespace applicability primitive—or Pod, Deployment, or Job Subject workload row—to the current subject and reevaluate. |
 | `Esc` | Clear the active direction selection first; otherwise cancel or go back. |
 | `Left` / `Right` | Focus Ingress/Egress, except when a Details widget owns the arrows for scrolling. |
@@ -610,8 +632,13 @@ The Subject picker opened with `s` supports:
 ---
 <br>
 
-The Primitive Kinds dialog opened with `f` supports standard form navigation:
+The Primitive Kinds dialog opened with `p` supports standard form navigation:
 ![alt text](assets/npg/primitive-kind-dialog.png)
+
+The dialog is sized so all five kind checkboxes and the Apply/Cancel buttons
+remain visible together on normal terminal sizes, and it is clamped safely to
+the available space on smaller terminals.
+
 | Key | Action |
 |---|---|
 | `Tab` / `Shift-Tab` | Move between kind checkboxes and Apply/Cancel buttons. |

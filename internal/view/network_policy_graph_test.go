@@ -283,6 +283,12 @@ func TestNetworkPolicyGraphGlobalKindsAndEmptySelection(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
 
+	kindsAction, ok := view.actions.Get(ui.KeyP)
+	require.True(t, ok)
+	assert.Equal(t, "Primitive Kinds", kindsAction.Description)
+	_, ok = view.actions.Get(ui.KeyF)
+	assert.False(t, ok, "f is no longer the Primitive Kinds shortcut")
+
 	view.kinds = sets.New[netpol.PrimitiveKind]()
 	view.loadPanel(netpol.Ingress)
 	view.updateDetails(netpol.Ingress)
@@ -294,6 +300,7 @@ func TestNetworkPolicyGraphGlobalKindsAndEmptySelection(t *testing.T) {
 
 	view.switchMode()
 	assert.Contains(t, view.panels[netpol.Ingress].GetCell(0, 0).Text, "No primitive kinds selected")
+	assert.Contains(t, view.panels[netpol.Ingress].GetCell(0, 0).Text, "Press p")
 	assert.True(t, view.panels[netpol.Ingress].GetCell(0, 0).NotSelectable)
 	assert.Contains(t, view.panels[netpol.Egress].GetCell(0, 0).Text, "No primitive kinds selected")
 
@@ -417,43 +424,81 @@ func TestNetworkPolicyGraphSwitchModeIsGlobal(t *testing.T) {
 	assert.Equal(t, ui.RulesProjection, view.panels[netpol.Egress].Projection())
 }
 
-func TestNetworkPolicyGraphOpenRuleKeys(t *testing.T) {
+func TestNetworkPolicyGraphOpenPrimitiveKeyByFocus(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	result := testSubjectResult()
 	view.applyResult(result)
-	// The view opens on the subject panel; Open Rule belongs to a direction.
+
+	assertOpen := func(wantCommand, wantPath string) {
+		t.Helper()
+		command, path, err := view.openPrimitiveTarget()
+		require.NoError(t, err)
+		assert.Equal(t, wantCommand, command)
+		assert.Equal(t, wantPath, path)
+
+		open, ok := view.actions.Get(ui.KeyO)
+		require.True(t, ok)
+		assert.Equal(t, "Open Primitive", open.Description)
+		assert.True(t, open.Opts.Visible)
+
+		var hintFound bool
+		for _, hint := range view.Hints() {
+			if hint.Mnemonic == "o" {
+				hintFound = true
+				assert.Equal(t, "Open Primitive", hint.Description)
+				assert.True(t, hint.Visible)
+			}
+		}
+		assert.True(t, hintFound, "<o> Open Primitive is advertised")
+	}
+
+	view.workloads = []ui.SubjectWorkload{{
+		Kind: "Deployment", Namespace: "payments", Name: "api", Status: "1/1",
+	}}
+	view.updateSubject()
+	view.applyFocusTarget(focusSubject)
+	view.syncActions()
+	assertOpen("deployments", "payments/api")
+	_, ok := view.actions.Get(ui.KeyShiftO)
+	assert.False(t, ok, "uppercase O is not the shortcut")
+
 	view.focusDirection(netpol.Ingress)
 	selectRule(t, view, result, netpol.Ingress, 0)
+	assertOpen("networkpolicies", "payments/allow-api")
 
-	open, ok := view.actions.Get(ui.KeyO)
-	require.True(t, ok)
-	assert.Equal(t, "Open Rule", open.Description)
-	assert.True(t, open.Opts.Visible)
+	view.focusDirection(netpol.Egress)
+	selectRule(t, view, result, netpol.Egress, 0)
+	assertOpen("networkpolicies", "payments/allow-api")
+
+	view.focusDirection(netpol.Ingress)
+	selectRule(t, view, result, netpol.Ingress, 0)
 	enterAction, ok := view.actions.Get(tcell.KeyEnter)
 	require.True(t, ok)
 	assert.Equal(t, "Focus Details/Open", enterAction.Description)
 	assert.False(t, enterAction.Opts.Visible)
 
-	// Enter now walks focus into the detail pane; only "o" opens directly.
-	o := tcell.NewEventKey(tcell.KeyRune, 'o', tcell.ModNone)
-	assert.Equal(t, o, view.keyboard(o), "nil-app rule navigation falls through without panicking")
 	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
 	assert.Nil(t, view.keyboard(enter))
 	assert.Equal(t, focusApplicability, view.focusTarget)
+	assertOpen("pods", "payments/peer")
+	assert.Equal(t, enter, view.keyboard(enter), "Enter is inert in Applicability")
+	assert.Equal(t, focusApplicability, view.focusTarget)
+
+	view.applyFocusTarget(focusDetails)
 	_, ok = view.actions.Get(ui.KeyO)
-	assert.False(t, ok, "the direction panel no longer holds focus")
+	assert.False(t, ok, "Rules details do not identify a primitive")
+	_, _, err := view.openPrimitiveTarget()
+	require.ErrorIs(t, err, errNoPrimitiveTarget)
+	assert.Equal(t, enter, view.keyboard(enter), "Enter remains inert in Rules details")
 
 	view.focusDirection(netpol.Ingress)
-	_, ok = view.actions.Get(ui.KeyO)
-	require.True(t, ok, "returning focus to the panel restores Open Rule")
-
 	view.switchMode()
 	require.Equal(t, ui.PrimitivesProjection, view.mode)
 	selectPrimitive(t, view, result, netpol.Ingress, netpol.PrimitivePod, 0)
-	_, ok = view.actions.Get(ui.KeyO)
-	assert.False(t, ok, "Open Rule only ever opens a NetworkPolicy")
+	assertOpen("pods", "payments/peer")
 	assert.Nil(t, view.keyboard(enter))
 	assert.Equal(t, focusDetails, view.focusTarget, "Primitives mode has no applicability table")
+	assertOpen("pods", "payments/peer")
 }
 
 func TestNetworkPolicyGraphName(t *testing.T) {
@@ -887,45 +932,38 @@ func TestNetworkPolicyGraphClearedSelectionRecoversOnNavigation(t *testing.T) {
 	assert.True(t, panel.HasSelection())
 }
 
-// Open Rule resolves the NetworkPolicy behind the selected rule and is only
-// offered while a direction panel holds focus in Rules mode.
-func TestNetworkPolicyGraphOpenRuleTargets(t *testing.T) {
+func TestNetworkPolicyGraphOpenPrimitiveHiddenWithoutSelection(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	result := testSubjectResult()
 	view.applyResult(result)
+
+	view.applyFocusTarget(focusSubject)
+	_, _, err := view.openPrimitiveTarget()
+	require.ErrorIs(t, err, errNoPrimitiveTarget)
+	_, ok := view.actions.Get(ui.KeyO)
+	assert.False(t, ok, "the empty subject workload table has no open target")
+
 	view.focusDirection(netpol.Ingress)
 	selectRule(t, view, result, netpol.Ingress, 0)
 
-	namespace, name, ok := view.openRuleTarget()
-	require.True(t, ok)
-	assert.Equal(t, "payments", namespace)
-	assert.Equal(t, "allow-api", name)
+	view.panels[netpol.Ingress].ClearSelection()
+	view.syncActions()
+	_, _, err = view.openPrimitiveTarget()
+	require.ErrorIs(t, err, errNoPrimitiveTarget)
+	_, ok = view.actions.Get(ui.KeyO)
+	assert.False(t, ok)
 
 	view.switchMode()
 	require.Equal(t, ui.PrimitivesProjection, view.mode)
-	selectPrimitive(t, view, result, netpol.Ingress, netpol.PrimitivePod, 0)
-	_, _, ok = view.openRuleTarget()
-	assert.False(t, ok, "Primitives mode never opens a rule")
-	primitive, ok := view.selectedPrimitive(netpol.Ingress, view.panels[netpol.Ingress].SelectedID())
-	require.True(t, ok)
-	command, path := primitiveCommand(&primitive.Ref)
-	assert.Equal(t, "pods", command)
-	assert.Equal(t, "payments/peer", path)
-
-	// With nothing selected there is no rule to open.
-	view.switchMode()
-	require.Equal(t, ui.RulesProjection, view.mode)
-	view.panels[netpol.Ingress].ClearSelection()
-	view.syncActions()
-	_, _, ok = view.openRuleTarget()
-	assert.False(t, ok)
+	view.applyFocusTarget(focusDetails)
+	_, _, err = view.openPrimitiveTarget()
+	require.ErrorIs(t, err, errNoPrimitiveTarget, "effective details are not a primitive row")
 	_, ok = view.actions.Get(ui.KeyO)
 	assert.False(t, ok)
 }
 
-// Synthetic default-deny/unrestricted rows have no backing NetworkPolicy, so
-// Open Rule must not be offered for them at all.
-func TestNetworkPolicyGraphOpenRuleSkipsSyntheticSelection(t *testing.T) {
+// Synthetic default-deny/unrestricted rows have no backing Kubernetes object.
+func TestNetworkPolicyGraphOpenPrimitiveSkipsSyntheticSelection(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.app = NewApp(config.NewConfig(nil))
 	result := testSubjectResult()
@@ -939,17 +977,17 @@ func TestNetworkPolicyGraphOpenRuleSkipsSyntheticSelection(t *testing.T) {
 	view.focusDirection(netpol.Ingress)
 	selectRule(t, view, result, netpol.Ingress, 0)
 
-	namespace, name, ok := view.openRuleTarget()
-	require.False(t, ok, "a synthetic rule references no NetworkPolicy")
-	require.Empty(t, namespace)
-	require.Empty(t, name)
-	_, ok = view.actions.Get(ui.KeyO)
+	_, _, err := view.openPrimitiveTarget()
+	require.ErrorIs(t, err, errNoPrimitiveTarget)
+	_, ok := view.actions.Get(ui.KeyO)
 	assert.False(t, ok, "the key hint must be hidden, not just inert")
+	o := tcell.NewEventKey(tcell.KeyRune, 'o', tcell.ModNone)
+	assert.Equal(t, o, view.keyboard(o), "an unbound invalid target cannot navigate")
 
 	evt := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
-	assert.Nil(t, view.openRuleCmd(evt), "an explicit call is consumed, not silently ignored")
+	assert.Nil(t, view.openPrimitiveCmd(evt), "an explicit invalid open reports feedback")
 	message := <-view.app.Flash().Channel()
-	assert.Contains(t, message.Text, "Select a NetworkPolicy rule")
+	assert.Contains(t, message.Text, "no Kubernetes primitive")
 }
 
 func TestNetworkPolicyGraphSubjectInfoReportsState(t *testing.T) {
@@ -1514,22 +1552,24 @@ func TestNetworkPolicyGraphEnterFallsBackWhenApplicabilityIsEmpty(t *testing.T) 
 	assert.Equal(t, focusDetails, view.focusTarget)
 }
 
-// A second Enter, from the applicability table, opens the highlighted primitive.
-func TestNetworkPolicyGraphEnterOpensHighlightedPrimitive(t *testing.T) {
+func TestNetworkPolicyGraphEnterIsInertOnApplicability(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
 	view.focusDirection(netpol.Ingress)
-	require.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
+	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+	require.Nil(t, view.enterCmd(enter))
 	require.Equal(t, focusApplicability, view.focusTarget)
 
 	command, path, err := view.applicabilityTarget()
 	require.NoError(t, err)
 	assert.Equal(t, "pods", command)
 	assert.Equal(t, "payments/peer", path)
+	assert.Equal(t, enter, view.enterCmd(enter))
+	assert.Equal(t, focusApplicability, view.focusTarget)
 }
 
 // CIDR rows describe address ranges, not Kubernetes objects.
-func TestNetworkPolicyGraphEnterReportsCIDRApplicabilityRow(t *testing.T) {
+func TestNetworkPolicyGraphOpenPrimitiveHiddenForCIDRApplicabilityRow(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.app = NewApp(config.NewConfig(nil))
 	result := testSubjectResult()
@@ -1556,15 +1596,17 @@ func TestNetworkPolicyGraphEnterReportsCIDRApplicabilityRow(t *testing.T) {
 	view.applyResult(result)
 	view.focusDirection(netpol.Ingress)
 
-	require.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
+	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+	require.Nil(t, view.enterCmd(enter))
 	require.Equal(t, focusApplicability, view.focusTarget)
 
 	_, _, err := view.applicabilityTarget()
 	require.ErrorIs(t, err, errPrimitiveNotResource)
-
-	assert.Nil(t, view.enterCmd(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)))
-	message := <-view.app.Flash().Channel()
-	assert.Contains(t, message.Text, "CIDR primitives are not Kubernetes resources")
+	_, ok := view.actions.Get(ui.KeyO)
+	assert.False(t, ok)
+	o := tcell.NewEventKey(tcell.KeyRune, 'o', tcell.ModNone)
+	assert.Equal(t, o, view.keyboard(o))
+	assert.Equal(t, enter, view.enterCmd(enter))
 }
 
 func TestNetworkPolicyGraphCtrlSIsDistinctFromPlainEnter(t *testing.T) {
@@ -1585,8 +1627,8 @@ func TestNetworkPolicyGraphCtrlSIsDistinctFromPlainEnter(t *testing.T) {
 	require.True(t, detail.SelectApplicabilityID(pod.StableID()))
 	view.syncActions()
 
-	// Plain Enter still follows the existing open-resource path. With no app
-	// installed it falls through and, critically, does not replace the subject.
+	// Plain Enter is inert in Applicability and, critically, does not replace
+	// the subject.
 	assert.Equal(t, plainEnter, view.keyboard(plainEnter))
 	assert.Equal(t, "api", view.subject.Name)
 
@@ -2781,8 +2823,8 @@ func TestNetworkPolicyGraphStylesChangedReachesPanels(t *testing.T) {
 		"the synthetic row follows the skin foreground")
 }
 
-// Primitives render no applicability table, so Enter on the detail pane is the
-// only route to the resource behind the selection.
+// Primitives render no applicability table, and Enter retains its existing
+// detail-pane open behavior alongside the direct "o" shortcut.
 func TestNetworkPolicyGraphEnterOpensSelectedPrimitive(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	result := testSubjectResult()
@@ -2793,8 +2835,12 @@ func TestNetworkPolicyGraphEnterOpensSelectedPrimitive(t *testing.T) {
 	selectPrimitive(t, view, result, netpol.Ingress, netpol.PrimitivePod, 0)
 
 	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+	_, ok := view.actions.Get(ui.KeyO)
+	require.True(t, ok)
 	require.Nil(t, view.enterCmd(enter))
 	require.Equal(t, focusDetails, view.focusTarget, "primitives have no applicability table")
+	_, ok = view.actions.Get(ui.KeyO)
+	require.True(t, ok, "primitive details retain the direct open shortcut")
 
 	// A second Enter routes to the primitive rather than dead-ending. With no
 	// app wired it falls through instead of navigating.
@@ -2831,10 +2877,14 @@ func TestNetworkPolicyGraphEnterReportsCIDRPrimitive(t *testing.T) {
 	view.focusDirection(netpol.Ingress)
 	require.Equal(t, ui.PrimitivesProjection, view.mode)
 	selectPrimitive(t, view, result, netpol.Ingress, netpol.PrimitiveCIDR, 0)
+	_, ok := view.actions.Get(ui.KeyO)
+	assert.False(t, ok, "CIDR rows do not advertise Open Primitive")
 
 	enter := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
 	require.Nil(t, view.enterCmd(enter))
 	require.Equal(t, focusDetails, view.focusTarget)
+	_, ok = view.actions.Get(ui.KeyO)
+	assert.False(t, ok, "CIDR details do not advertise Open Primitive")
 	assert.Nil(t, view.enterCmd(enter), "the key must be consumed, not silently ignored")
 	message := <-view.app.Flash().Channel()
 	assert.Contains(t, message.Text, "not Kubernetes resources")
