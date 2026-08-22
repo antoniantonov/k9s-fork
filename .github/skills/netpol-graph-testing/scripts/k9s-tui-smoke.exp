@@ -241,19 +241,19 @@ if {[assert_all_screen {{Ingress · Primitives} {Egress · Primitives} {Effectiv
 start_case "primitive-kinds-apply-cancel-zero"
 ensure_rules
 send_key "m"
-send_key "f"
+send_key "p"
 if {[assert_all_screen {{Primitive Kinds} CIDR Pod Namespace Deployment Job Apply Cancel} 10]} {
   # All controls, including both buttons, must fit at 50x200 before any arrow
   # key can scroll the form.
   # Clear all five checkboxes, tab to Apply, press Enter.
   for {set i 0} {$i < 5} {incr i} { send_key " " 100; send_key "\t" 100 }
   send_key "\r"
-  assert_screen {No primitive kinds selected\. Press f to enable kinds\.} 10
-  send_key "f"
+  assert_screen {No primitive kinds selected\. Press p to enable kinds\.} 10
+  send_key "p"
   assert_screen {Primitive Kinds} 10
   send_key "\033"
-  assert_screen {No primitive kinds selected\. Press f to enable kinds\.} 10
-  send_key "f"
+  assert_screen {No primitive kinds selected\. Press p to enable kinds\.} 10
+  send_key "p"
   for {set i 0} {$i < 5} {incr i} { send_key " " 100; send_key "\t" 100 }
   send_key "\r"
   send_key "m"

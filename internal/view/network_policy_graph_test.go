@@ -283,6 +283,12 @@ func TestNetworkPolicyGraphGlobalKindsAndEmptySelection(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.applyResult(testSubjectResult())
 
+	kindsAction, ok := view.actions.Get(ui.KeyP)
+	require.True(t, ok)
+	assert.Equal(t, "Primitive Kinds", kindsAction.Description)
+	_, ok = view.actions.Get(ui.KeyF)
+	assert.False(t, ok, "f is no longer the Primitive Kinds shortcut")
+
 	view.kinds = sets.New[netpol.PrimitiveKind]()
 	view.loadPanel(netpol.Ingress)
 	view.updateDetails(netpol.Ingress)
@@ -294,6 +300,7 @@ func TestNetworkPolicyGraphGlobalKindsAndEmptySelection(t *testing.T) {
 
 	view.switchMode()
 	assert.Contains(t, view.panels[netpol.Ingress].GetCell(0, 0).Text, "No primitive kinds selected")
+	assert.Contains(t, view.panels[netpol.Ingress].GetCell(0, 0).Text, "Press p")
 	assert.True(t, view.panels[netpol.Ingress].GetCell(0, 0).NotSelectable)
 	assert.Contains(t, view.panels[netpol.Egress].GetCell(0, 0).Text, "No primitive kinds selected")
 

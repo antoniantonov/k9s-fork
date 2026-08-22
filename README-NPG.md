@@ -461,7 +461,7 @@ ambiguous. `Partial Data` is different: it means the evaluator knows the
 snapshot is incomplete, for example because of missing RBAC access, a failed
 resource list/watch, or result truncation.
 
-The panel uses the globally enabled primitive kinds. Pressing `f` can therefore
+The panel uses the globally enabled primitive kinds. Pressing `p` can therefore
 add or remove rows from both the direction panels and applicability tables.
 Pressing `a` in Rules mode toggles both ingress and egress rule/effective
 applicability tables between all rows and exact Allowed rows only. Disallowed,
@@ -596,7 +596,7 @@ synthetic, unavailable, or a CIDR.
 | `e` | Show or hide the Egress panel. |
 | `m` | Toggle both direction panels between Rules and Primitives mode. |
 | `s` | Open the subject picker. |
-| `f` | Open the global primitive-kind selector for CIDR, Pod, Namespace, Deployment, and Job. |
+| `p` | Open the global primitive-kind selector for CIDR, Pod, Namespace, Deployment, and Job. |
 | `a` | Toggle both ingress and egress rule/effective applicability tables between all rows and exact Allowed rows only. Available only in Rules mode; hidden/unbound in Primitives mode. |
 | `/` | Search/filter the focused Subject, direction, Rule/Primitive context, or Applicability panel. Hidden while Effective Details text has focus. |
 | `r` | Enable or disable automatic reevaluation every five seconds. |
@@ -632,7 +632,7 @@ The Subject picker opened with `s` supports:
 ---
 <br>
 
-The Primitive Kinds dialog opened with `f` supports standard form navigation:
+The Primitive Kinds dialog opened with `p` supports standard form navigation:
 ![alt text](assets/npg/primitive-kind-dialog.png)
 
 The dialog is sized so all five kind checkboxes and the Apply/Cancel buttons

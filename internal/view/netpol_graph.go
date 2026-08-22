@@ -650,7 +650,7 @@ func (v *NetworkPolicyGraph) loadPanel(direction netpol.Direction) {
 	panel.SetProjection(v.mode).
 		SetFilter(modeState.filter)
 	if v.mode == ui.PrimitivesProjection && len(v.kinds) == 0 {
-		panel.SetData(nil, nil).SetEmptyMessage("No primitive kinds selected. Press f to enable kinds.")
+		panel.SetData(nil, nil).SetEmptyMessage("No primitive kinds selected. Press p to enable kinds.")
 	} else {
 		cache := v.projection(direction)
 		panel.SetEmptyMessage("No reachability results match this view.").
@@ -2468,7 +2468,7 @@ func (v *NetworkPolicyGraph) bindKeys() {
 		ui.KeyI:          ui.NewKeyAction("Toggle Ingress", func(*tcell.EventKey) *tcell.EventKey { v.toggleDirection(netpol.Ingress); return nil }, true),
 		ui.KeyE:          ui.NewKeyAction("Toggle Egress", func(*tcell.EventKey) *tcell.EventKey { v.toggleDirection(netpol.Egress); return nil }, true),
 		ui.KeyM:          ui.NewKeyAction("Toggle Mode", func(*tcell.EventKey) *tcell.EventKey { v.switchMode(); return nil }, true),
-		ui.KeyF:          ui.NewKeyAction("Primitive Kinds", func(*tcell.EventKey) *tcell.EventKey { v.openKindsDialog(); return nil }, true),
+		ui.KeyP:          ui.NewKeyAction("Primitive Kinds", func(*tcell.EventKey) *tcell.EventKey { v.openKindsDialog(); return nil }, true),
 		ui.KeyS:          ui.NewKeyAction("Subject", func(*tcell.EventKey) *tcell.EventKey { v.openSubjectDialog(); return nil }, true),
 		ui.KeyR:          ui.NewKeyAction("Toggle Auto-Refresh", func(*tcell.EventKey) *tcell.EventKey { v.toggleAutoRefresh(); return nil }, true),
 		tcell.KeyEnter:   ui.NewKeyAction("Focus Details/Open", v.enterCmd, false),
