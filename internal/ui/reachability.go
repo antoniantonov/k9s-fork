@@ -1018,9 +1018,10 @@ func colorName(color tcell.Color) string {
 func RuleDetailsText(rule netpol.RuleResult) string {
 	var b strings.Builder
 	state, label := ruleState(&rule)
-	fmt.Fprintf(&b, "Policy: %s/%s\nPolicy type: %s (%s)\nPolicy UID: %s\nDirection: %s\nAction: %s\nRule index: %d\nState: %s (%s)\nPolicy pod selector: %s\nSubjects: %d/%d\nPeers:\n",
+	fmt.Fprintf(&b, "Policy: %s/%s\nPolicy type: %s (%s)\nPolicy API version: %s\nPolicy UID: %s\nDirection: %s\nAction: %s\nRule index: %d\nState: %s (%s)\nPolicy pod selector: %s\nSubjects: %d/%d\nPeers:\n",
 		valueOrDash(rule.ID.PolicyNamespace), valueOrDash(rule.ID.PolicyName),
-		rule.ID.SourceType(), rule.ID.SourceType().Kind(), valueOrDash(string(rule.ID.PolicyUID)),
+		rule.ID.SourceType(), rule.ID.SourceType().Kind(), valueOrDash(rule.ID.PolicyVersion),
+		valueOrDash(string(rule.ID.PolicyUID)),
 		rule.ID.Direction, rule.ID.Action.String(),
 		rule.ID.Index, state, label, valueOrDash(rule.PolicySelector),
 		rule.SubjectMatchCount, rule.SubjectPodCount)

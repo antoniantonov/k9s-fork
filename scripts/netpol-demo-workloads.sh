@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright Authors of K9s
 #
-# Populates a minimal but complete set of workloads and NetworkPolicies to
+# Populates a minimal but complete set of workloads and network policies to
 # exercise the K9s NetworkPolicy reachability view (:netpolgraph / :npgraph /
 # :npg, or Shift-R from Pod/Deployment/Job/Namespace views).
 #
@@ -17,6 +17,8 @@
 #                 ipBlock with except, empty from/to (allow-all), empty ports,
 #                 named ports, numeric ports, endPort ranges, default deny,
 #                 and unrestricted (no isolating policy)
+#   APIs          NetworkPolicy, CiliumNetworkPolicy,
+#                 CiliumClusterwideNetworkPolicy, Istio AuthorizationPolicy
 #   Owners        Deployment/ReplicaSet, Job, StatefulSet, DaemonSet, bare pod
 #
 # Usage:
@@ -65,6 +67,25 @@ usage() {
       print
     }
   ' "$0"
+}
+
+ensure_demo_crd() {
+  local name="$1"
+  if "${KUBECTL[@]}" get crd "$name" >/dev/null 2>&1; then
+    echo "==> reusing installed CRD $name"
+    return 0
+  fi
+  echo "==> installing graph-only demo CRD $name"
+  "${KUBECTL[@]}" apply -f -
+  "${KUBECTL[@]}" wait --for=condition=Established "crd/$name" --timeout="$TIMEOUT"
+}
+
+delete_owned_demo_crd() {
+  local name="$1" owned
+  owned=$("${KUBECTL[@]}" get crd "$name" -o jsonpath='{.metadata.annotations.k9scli\.io/netpol-demo-owned}' 2>/dev/null || true)
+  if [[ "$owned" == "true" ]]; then
+    "${KUBECTL[@]}" delete crd "$name" --ignore-not-found --wait=true
+  fi
 }
 
 build_kubectl() {
@@ -162,6 +183,12 @@ check_topology() {
   check_resource "app network policies" "${KUBECTL[@]}" get networkpolicy -n "$NS_APP" default-deny-all allow-frontend-ingress allow-monitoring-ingress allow-cidr-ingress allow-dns-egress allow-api-egress-db allow-db-ingress-api allow-api-egress-external allow-api-egress-ambiguous allow-ambiguous-ingress-api allow-cache-ingress-all || failures=$((failures + 1))
   check_resource "web network policies" "${KUBECTL[@]}" get networkpolicy -n "$NS_WEB" web-default-deny-egress frontend-egress-to-api || failures=$((failures + 1))
   check_resource "untrusted network policy" "${KUBECTL[@]}" get networkpolicy -n "$NS_UNTRUSTED" deny-all-egress || failures=$((failures + 1))
+  check_resource "CiliumNetworkPolicy CRD" "${KUBECTL[@]}" get crd ciliumnetworkpolicies.cilium.io || failures=$((failures + 1))
+  check_resource "CiliumClusterwideNetworkPolicy CRD" "${KUBECTL[@]}" get crd ciliumclusterwidenetworkpolicies.cilium.io || failures=$((failures + 1))
+  check_resource "AuthorizationPolicy CRD" "${KUBECTL[@]}" get crd authorizationpolicies.security.istio.io || failures=$((failures + 1))
+  check_resource "app Cilium network policy" "${KUBECTL[@]}" get ciliumnetworkpolicies.cilium.io -n "$NS_APP" demo-cnp-frontend || failures=$((failures + 1))
+  check_resource "clusterwide Cilium network policy" "${KUBECTL[@]}" get ciliumclusterwidenetworkpolicies.cilium.io demo-ccnp-monitoring || failures=$((failures + 1))
+  check_resource "app Istio authorization policy" "${KUBECTL[@]}" get authorizationpolicies.security.istio.io -n "$NS_APP" demo-authz-api || failures=$((failures + 1))
 
   for ns in "$NS_APP" "$NS_WEB" "$NS_MON" "$NS_UNTRUSTED" "$NS_OPEN"; do
     check_resource "deployments ready in $ns" "${KUBECTL[@]}" wait --for=condition=Available deployment --all -n "$ns" --timeout=1s || failures=$((failures + 1))
@@ -281,8 +308,13 @@ else
 fi
 
 if [[ "$DELETE" -eq 1 ]]; then
+  "${KUBECTL[@]}" delete ciliumclusterwidenetworkpolicies.cilium.io demo-ccnp-monitoring \
+    --ignore-not-found --wait=true 2>/dev/null || true
   echo "==> deleting namespaces: ${ALL_NS[*]}"
   "${KUBECTL[@]}" delete namespace "${ALL_NS[@]}" --ignore-not-found --wait=true
+  delete_owned_demo_crd ciliumnetworkpolicies.cilium.io
+  delete_owned_demo_crd ciliumclusterwidenetworkpolicies.cilium.io
+  delete_owned_demo_crd authorizationpolicies.security.istio.io
   echo "==> done"
   exit 0
 fi
@@ -295,6 +327,103 @@ fi
 
 # Long-running command: busybox has no `sleep infinity`, so loop instead.
 IDLE_CMD='while true; do sleep 3600; done'
+
+ensure_demo_crd ciliumnetworkpolicies.cilium.io <<'YAML'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ciliumnetworkpolicies.cilium.io
+  annotations:
+    k9scli.io/netpol-demo-owned: "true"
+spec:
+  group: cilium.io
+  names:
+    kind: CiliumNetworkPolicy
+    listKind: CiliumNetworkPolicyList
+    plural: ciliumnetworkpolicies
+    singular: ciliumnetworkpolicy
+    shortNames: [cnp]
+  scope: Namespaced
+  versions:
+    - name: v2
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+            specs:
+              type: array
+              items:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+YAML
+
+ensure_demo_crd ciliumclusterwidenetworkpolicies.cilium.io <<'YAML'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ciliumclusterwidenetworkpolicies.cilium.io
+  annotations:
+    k9scli.io/netpol-demo-owned: "true"
+spec:
+  group: cilium.io
+  names:
+    kind: CiliumClusterwideNetworkPolicy
+    listKind: CiliumClusterwideNetworkPolicyList
+    plural: ciliumclusterwidenetworkpolicies
+    singular: ciliumclusterwidenetworkpolicy
+    shortNames: [ccnp]
+  scope: Cluster
+  versions:
+    - name: v2
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+            specs:
+              type: array
+              items:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+YAML
+
+ensure_demo_crd authorizationpolicies.security.istio.io <<'YAML'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: authorizationpolicies.security.istio.io
+  annotations:
+    k9scli.io/netpol-demo-owned: "true"
+spec:
+  group: security.istio.io
+  names:
+    kind: AuthorizationPolicy
+    listKind: AuthorizationPolicyList
+    plural: authorizationpolicies
+    singular: authorizationpolicy
+    shortNames: [authz]
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+YAML
 
 echo "==> applying namespaces, workloads and network policies (prefix: $PREFIX)"
 
@@ -915,6 +1044,61 @@ metadata:
 spec:
   podSelector: {}
   policyTypes: [Egress]
+---
+################################################################################
+# Optional policy APIs. These duplicate selected native allows so the graph can
+# expose each source type without changing the demo's established reachability.
+################################################################################
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: demo-cnp-frontend
+  namespace: ${NS_APP}
+spec:
+  endpointSelector:
+    matchLabels:
+      k8s:app: api
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:app: frontend
+            k8s:io.kubernetes.pod.namespace: ${NS_WEB}
+      toPorts:
+        - ports:
+            - {port: "8080", protocol: TCP}
+---
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: demo-ccnp-monitoring
+spec:
+  endpointSelector:
+    matchLabels:
+      k8s:app: api
+      k8s:io.kubernetes.pod.namespace: ${NS_APP}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:app: prometheus
+            k8s:io.kubernetes.pod.namespace: ${NS_MON}
+      toPorts:
+        - ports:
+            - {port: "9090", protocol: TCP}
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: demo-authz-api
+  namespace: ${NS_APP}
+spec:
+  selector:
+    matchLabels:
+      app: api
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            ports: ["8080", "9090"]
 YAML
 
 if [[ "$WAIT" -eq 1 ]]; then

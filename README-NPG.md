@@ -5,9 +5,11 @@ K9s.
 ![alt text](assets/npg/intro.png)
 ## 1. What Is Network Policy Graph?
 
-Network Policy Graph is a read-only reachability view for standard Kubernetes
-`networking.k8s.io/v1` `NetworkPolicy` resources. It explains how NetworkPolicy
-affects traffic to and from a selected workload, called the **subject**.
+Network Policy Graph is a read-only reachability view for Kubernetes
+`NetworkPolicy`, Cilium `CiliumNetworkPolicy` and
+`CiliumClusterwideNetworkPolicy`, and Istio `AuthorizationPolicy` resources. It
+explains how those policies affect traffic to and from a selected workload,
+called the **subject**.
 
 NPG is intended to answer questions such as:
 
@@ -25,9 +27,9 @@ NPG evaluates concrete pod-to-pod paths. For a path to be allowed:
 2. The destination pod's ingress policy must allow it.
 3. The two sides must allow at least one common protocol and destination port.
 
-NetworkPolicy rules are additive allow rules; they are not explicit deny rules.
-A disallowed result normally means that a pod is isolated in that direction and
-no matching allow rule permits the peer and port.
+Kubernetes NetworkPolicy rules are additive allow rules. Cilium and Istio
+policies can also contribute explicit deny rules, which take precedence over
+matching allows.
 
 NPG can be opened with:
 
@@ -50,9 +52,9 @@ aliases such as `po`, `deploy`, `jobs`, and `ns` are accepted. Examples:
 The same panel can be opened from a selected Pod, Deployment, Job, or Namespace
 by pressing `Shift-R`.
 
-The panel does not edit, create, or delete NetworkPolicies. It evaluates the
-current cluster snapshot and provides navigation to related resources and YAML.
-Opening a resource leaves NPG and pushes the resource view onto the normal K9s
+The panel does not edit, create, or delete policies. It evaluates the current
+cluster snapshot and provides navigation to related resources and YAML. Opening
+a resource leaves NPG and pushes the resource view onto the normal K9s
 breadcrumb stack.
 
 While NPG is active, the status row beneath the K9s logo shows the
@@ -62,10 +64,23 @@ is not a global K9s status.
 NPG evaluates reachability once when opened. Automatic refresh is disabled by
 default. It can be enabled at a five-second interval with `r`.
 
-NPG models the standard Kubernetes NetworkPolicy API, not guaranteed packet
-delivery. CNI behavior, NAT, `hostNetwork`, node-local traffic, service meshes,
-cloud firewalls, vendor-specific policies, application authorization, and
-other networking layers may change the real result.
+NPG models the supported declarative policy fields, not guaranteed packet
+delivery. CNI behavior, NAT, `hostNetwork`, node-local traffic, sidecar
+enrollment, cloud firewalls, and other networking layers may change the real
+result. Dynamic Cilium destinations such as FQDNs, Services, CIDR groups, nodes,
+and cloud-provider groups, plus Istio external authorization, `targetRefs`,
+forwarded-client IPs, JWT identities, and negative ports or CIDRs, are reported
+as incomplete rather than guessed.
+
+Kubernetes and Cilium policies form the network layer. Istio authorization is a
+second destination-ingress layer; both layers must permit a pod-to-pod path.
+Istio `ALLOW` activates default deny for selected destinations and Istio
+`DENY` overrides matching allows. `AUDIT` and dry-run policies do not enforce
+reachability in the graph. Istio policy scope assumes the default
+`istio-system` mesh root namespace, and principal matching assumes the default
+`cluster.local` trust domain; these assumptions are shown in Rule Details.
+AuthorizationPolicy is TCP/HTTP-scoped, so network-layer UDP and SCTP
+permissions pass through unchanged.
 
 ## 2. Terminology
 
@@ -151,14 +166,19 @@ An egress rule:
 End-to-end egress reachability also requires the destination pod's ingress side
 to allow compatible traffic.
 
-### NetworkPolicy rules
+### Policy rules
 
-A NetworkPolicy rule is one entry in `spec.ingress` or `spec.egress`. NPG
-identifies a real rule by:
+A policy rule is a Kubernetes or Cilium ingress/egress entry, or an Istio
+authorization rule. NPG identifies a real rule by:
 
+- policy type (`np`, `cnp`, `ccnp`, or `authz`);
 - policy namespace and name;
+- allow or deny action;
 - direction;
 - zero-based rule index.
+
+Cilium resources with multiple top-level `specs` also include the spec index in
+their stable rule identity.
 
 Rules can match peers with:
 
@@ -319,11 +339,11 @@ state, and the full state is shown in Rule Details.
 | `[EMPTY]` | No subject pod was available or no selected subject pod matched the rule. Non-synthetic empty rules are hidden; synthetic explanation rows remain visible. |
 
 Synthetic rows use the normal foreground color instead of an allow/deny color
-because they are explanations, not real NetworkPolicy rules.
+because they are explanations, not real policy rules.
 
 When a real rule is selected and the direction panel has focus:
 
-- `o` opens the NetworkPolicy resource;
+- `o` opens the Kubernetes, Cilium, or Istio policy resource;
 - `y` opens its YAML.
 
 These actions are unavailable for synthetic rules.
@@ -365,7 +385,7 @@ The Details panel follows the active direction and current selection.
 When a rule is selected in Rules mode, Rule Details contains:
 
 - direction and subject identity;
-- policy namespace, name, and UID;
+- policy type, namespace, name, API version, UID, and allow/deny action;
 - zero-based rule index;
 - rule state;
 - policy pod selector;
@@ -373,6 +393,7 @@ When a rule is selected in Rules mode, Rule Details contains:
 - each peer selector or IP block;
 - ports;
 - rendered rule YAML;
+- notes about conservatively approximated semantics;
 - contributing evidence;
 - warnings.
 

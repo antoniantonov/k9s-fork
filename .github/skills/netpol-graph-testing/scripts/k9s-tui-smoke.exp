@@ -151,6 +151,23 @@ proc ensure_primitives {} {
   assert_screen {Ingress · Primitives} 15
 }
 
+proc verify_custom_policy_rule {policy type_pattern api_pattern} {
+  ensure_rules
+  focus_ingress
+  send_key "/"
+  if {![assert_screen {Reachability Search|Filter:} 10]} { return }
+  send_key $policy
+  send_key "\t"
+  send_key "\r"
+  if {![assert_screen $policy 15]} { return }
+  send_key "\033\[B"
+  if {![assert_all_screen [list $policy $type_pattern {Rule Details} {<y>}] 20]} { return }
+  send_key "y"
+  if {![assert_screen $api_pattern 20]} { return }
+  send_key "\033"
+  finish_case
+}
+
 # The view opens focused on the subject panel, which is where the Tab ring
 # starts. Cases that drive a direction panel -- Open Primitive, YAML, Enter
 # navigation -- have to move focus there first. Left is honoured from the
@@ -444,6 +461,15 @@ if {[select_direction_row_with_hint {<y>} "a real rule with the YAML hint"]} {
     finish_case
   }
 }
+
+start_case "cilium-network-policy-details-and-yaml"
+verify_custom_policy_rule demo-cnp-frontend {Policy type: cnp \(CiliumNetworkPolicy\)} {cilium\.io/v2}
+
+start_case "cilium-clusterwide-policy-details-and-yaml"
+verify_custom_policy_rule demo-ccnp-monitoring {Policy type: ccnp \(CiliumClusterwideNetworkPolicy\)} {cilium\.io/v2}
+
+start_case "istio-authorization-policy-details-and-yaml"
+verify_custom_policy_rule demo-authz-api {Policy type: authz \(AuthorizationPolicy\)} {security\.istio\.io/v1}
 
 start_case "yaml-hidden-without-a-manifest"
 ensure_rules

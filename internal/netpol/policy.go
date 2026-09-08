@@ -28,8 +28,9 @@ const (
 )
 
 type normalizedSelector struct {
-	Pod       metav1.LabelSelector
-	Namespace *metav1.LabelSelector
+	Pod            metav1.LabelSelector
+	Namespace      *metav1.LabelSelector
+	ServiceAccount *metav1.LabelSelector
 }
 
 type normalizedPolicy struct {
@@ -67,19 +68,20 @@ type normalizedRule struct {
 }
 
 type normalizedPeer struct {
-	PodSelector          *metav1.LabelSelector
-	NamespaceSelector    *metav1.LabelSelector
-	AllNamespaces        bool
-	IPBlocks             []netv1.IPBlock
-	MatchPodIPs          bool
-	Namespaces           []string
-	NotNamespaces        []string
-	ServiceAccounts      []string
-	NotServiceAccounts   []string
-	Principals           []string
-	NotPrincipals        []string
-	RequestPrincipals    []string
-	NotRequestPrincipals []string
+	PodSelector            *metav1.LabelSelector
+	NamespaceSelector      *metav1.LabelSelector
+	ServiceAccountSelector *metav1.LabelSelector
+	AllNamespaces          bool
+	IPBlocks               []netv1.IPBlock
+	MatchPodIPs            bool
+	Namespaces             []string
+	NotNamespaces          []string
+	ServiceAccounts        []string
+	NotServiceAccounts     []string
+	Principals             []string
+	NotPrincipals          []string
+	RequestPrincipals      []string
+	NotRequestPrincipals   []string
 }
 
 func (p *normalizedPolicy) direction(direction Direction) *normalizedDirection {
@@ -108,11 +110,17 @@ func (p *normalizedPolicy) ruleID(direction Direction, rule *normalizedRule) Rul
 }
 
 func (p *normalizedPolicy) selectorString() string {
-	pod := labelSelectorString(&p.Selector.Pod)
-	if p.Selector.Namespace == nil {
-		return pod
+	parts := []string{"podSelector=" + labelSelectorString(&p.Selector.Pod)}
+	if p.Selector.Namespace != nil {
+		parts = append(parts, "namespaceSelector="+labelSelectorString(p.Selector.Namespace))
 	}
-	return fmt.Sprintf("namespaceSelector=%s, podSelector=%s", labelSelectorString(p.Selector.Namespace), pod)
+	if p.Selector.ServiceAccount != nil {
+		parts = append(parts, "serviceAccountSelector="+labelSelectorString(p.Selector.ServiceAccount))
+	}
+	if len(parts) == 1 {
+		return strings.TrimPrefix(parts[0], "podSelector=")
+	}
+	return strings.Join(parts, ", ")
 }
 
 func normalizeSnapshotPolicies(snapshot *Snapshot) ([]normalizedPolicy, map[string]error) {
@@ -424,9 +432,10 @@ func normalizeCiliumTrafficRule(
 			)
 			errs = append(errs, selectorErrs...)
 			peer := normalizedPeer{
-				PodSelector:       selector.Pod.DeepCopy(),
-				NamespaceSelector: selector.Namespace.DeepCopy(),
-				AllNamespaces:     selector.Namespace != nil || policy.ClusterScoped,
+				PodSelector:            selector.Pod.DeepCopy(),
+				NamespaceSelector:      selector.Namespace.DeepCopy(),
+				ServiceAccountSelector: selector.ServiceAccount.DeepCopy(),
+				AllNamespaces:          selector.Namespace != nil || policy.ClusterScoped,
 			}
 			rule.Peers = append(rule.Peers, peer)
 		}
@@ -515,18 +524,24 @@ func normalizeCiliumSelector(
 		Pod: metav1.LabelSelector{MatchLabels: map[string]string{}},
 	}
 	namespace := metav1.LabelSelector{MatchLabels: map[string]string{}}
+	serviceAccount := metav1.LabelSelector{MatchLabels: map[string]string{}}
 	var errs []error
 	namespaceConstrained := false
+	serviceAccountConstrained := false
 	for key, value := range source.MatchLabels {
 		target, normalizedKey, err := ciliumSelectorKey(key)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		if target == "namespace" {
+		switch target {
+		case "namespace":
 			namespace.MatchLabels[normalizedKey] = value
 			namespaceConstrained = true
-		} else {
+		case "serviceaccount":
+			serviceAccount.MatchLabels[normalizedKey] = value
+			serviceAccountConstrained = true
+		default:
 			selector.Pod.MatchLabels[normalizedKey] = value
 		}
 	}
@@ -538,10 +553,14 @@ func normalizeCiliumSelector(
 		}
 		requirement.Key = normalizedKey
 		requirement.Values = slices.Clone(requirement.Values)
-		if target == "namespace" {
+		switch target {
+		case "namespace":
 			namespace.MatchExpressions = append(namespace.MatchExpressions, requirement)
 			namespaceConstrained = true
-		} else {
+		case "serviceaccount":
+			serviceAccount.MatchExpressions = append(serviceAccount.MatchExpressions, requirement)
+			serviceAccountConstrained = true
+		default:
 			selector.Pod.MatchExpressions = append(selector.Pod.MatchExpressions, requirement)
 		}
 	}
@@ -552,12 +571,20 @@ func normalizeCiliumSelector(
 	if namespaceConstrained {
 		selector.Namespace = &namespace
 	}
+	if serviceAccountConstrained {
+		selector.ServiceAccount = &serviceAccount
+	}
 	if _, err := metav1.LabelSelectorAsSelector(&selector.Pod); err != nil {
 		errs = append(errs, fmt.Errorf("invalid endpoint pod selector: %w", err))
 	}
 	if selector.Namespace != nil {
 		if _, err := metav1.LabelSelectorAsSelector(selector.Namespace); err != nil {
 			errs = append(errs, fmt.Errorf("invalid endpoint namespace selector: %w", err))
+		}
+	}
+	if selector.ServiceAccount != nil {
+		if _, err := metav1.LabelSelectorAsSelector(selector.ServiceAccount); err != nil {
+			errs = append(errs, fmt.Errorf("invalid endpoint service account selector: %w", err))
 		}
 	}
 	return selector, errs
@@ -571,6 +598,12 @@ func ciliumSelectorKey(key string) (target, normalized string, err error) {
 		return "namespace", "kubernetes.io/metadata.name", nil
 	case strings.HasPrefix(key, "io.cilium.k8s.namespace.labels."):
 		return "namespace", strings.TrimPrefix(key, "io.cilium.k8s.namespace.labels."), nil
+	case key == "io.cilium.k8s.policy.serviceaccount":
+		return "serviceaccount", "name", nil
+	case key == "io.cilium.k8s.policy.cluster":
+		return "", "", errors.New("Cilium cluster identity selectors require the local cluster name")
+	case strings.HasPrefix(key, "io.cilium.k8s.policy."):
+		return "", "", fmt.Errorf("Cilium identity selector %q is not supported", key)
 	case strings.HasPrefix(key, "reserved:"):
 		return "", "", fmt.Errorf("reserved Cilium selector %q is outside the pod graph", key)
 	case strings.Contains(key, ":"):
@@ -787,6 +820,7 @@ func normalizeIstioPolicy(object *unstructured.Unstructured) ([]normalizedPolicy
 		Type:       PolicyTypeIstioAuthorizationPolicy,
 		Version:    resource.APIVersion,
 		Layer:      policyLayerAuthorization,
+		Notes:      []string{"Istio mesh root namespace is assumed to be istio-system"},
 	}
 	if resource.Spec.Selector != nil {
 		policy.Selector.Pod.MatchLabels = mapsClone(resource.Spec.Selector.MatchLabels)
@@ -840,6 +874,9 @@ func normalizeIstioRule(
 	for _, from := range source.From {
 		peer, peerErrs := normalizeIstioSource(policy.Namespace, &from.Source)
 		rule.Peers = append(rule.Peers, peer)
+		if len(from.Source.Principals)+len(from.Source.NotPrincipals) > 0 {
+			rule.Notes = append(rule.Notes, "Istio principal matching assumes the default cluster.local trust domain")
+		}
 		errs = append(errs, peerErrs...)
 		if len(peerErrs) > 0 {
 			rule.Disabled = true
@@ -853,10 +890,28 @@ func normalizeIstioRule(
 	if len(source.When) > 0 {
 		rule.Notes = append(rule.Notes, "Istio when conditions are not rendered; reachability means at least one request can match")
 	}
+	if action == PolicyActionDeny && istioRuleHasUnmodeledPredicates(source) {
+		errs = append(errs, errors.New("DENY has unmodeled L7 or when predicates; its ports are not subtracted"))
+		rule.Disabled = true
+	}
 	rule.PeerStrings = normalizedPeerStrings(rule.Peers, false)
 	rule.Notes = uniqueStrings(append(rule.Notes, policy.Notes...))
 	rule.Warnings = errorStrings(errs)
 	return rule, errs
+}
+
+func istioRuleHasUnmodeledPredicates(rule *istioRule) bool {
+	if len(rule.When) > 0 {
+		return true
+	}
+	for _, item := range rule.To {
+		operation := item.Operation
+		if len(operation.Hosts)+len(operation.NotHosts)+len(operation.Methods)+
+			len(operation.NotMethods)+len(operation.Paths)+len(operation.NotPaths) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeIstioSource(policyNamespace string, source *istioSource) (normalizedPeer, []error) {
@@ -996,7 +1051,12 @@ func normalizedPolicySelectsPod(policy *normalizedPolicy, pod *corev1.Pod, names
 	if !matchesSelector(policy.Selector.Pod, pod.Labels) {
 		return false
 	}
-	return policy.Selector.Namespace == nil || matchesSelector(*policy.Selector.Namespace, namespaceLabels(namespace, pod.Namespace))
+	if policy.Selector.Namespace != nil &&
+		!matchesSelector(*policy.Selector.Namespace, namespaceLabels(namespace, pod.Namespace)) {
+		return false
+	}
+	return policy.Selector.ServiceAccount == nil ||
+		matchesSelector(*policy.Selector.ServiceAccount, serviceAccountLabels(pod))
 }
 
 func normalizedRulePeersMatch(
@@ -1037,6 +1097,10 @@ func normalizedPeerMatchesPod(
 		return false
 	}
 	if peer.PodSelector != nil && !matchesSelector(*peer.PodSelector, pod.Labels) {
+		return false
+	}
+	if peer.ServiceAccountSelector != nil &&
+		!matchesSelector(*peer.ServiceAccountSelector, serviceAccountLabels(pod)) {
 		return false
 	}
 	if !matchesPatterns(pod.Namespace, peer.Namespaces) || matchesAnyPattern(pod.Namespace, peer.NotNamespaces) {
@@ -1084,6 +1148,7 @@ func normalizedPeerMatchesCIDR(peer *normalizedPeer, ref *PrimitiveRef) bool {
 	}
 	return peer.PodSelector == nil &&
 		peer.NamespaceSelector == nil &&
+		peer.ServiceAccountSelector == nil &&
 		len(peer.Namespaces) == 0 &&
 		len(peer.NotNamespaces) == 0 &&
 		len(peer.ServiceAccounts) == 0 &&
@@ -1139,6 +1204,14 @@ func namespaceLabels(namespace *corev1.Namespace, name string) map[string]string
 	return labels
 }
 
+func serviceAccountLabels(pod *corev1.Pod) map[string]string {
+	name := pod.Spec.ServiceAccountName
+	if name == "" {
+		name = "default"
+	}
+	return map[string]string{"name": name}
+}
+
 func matchesPatterns(value string, patterns []string) bool {
 	return len(patterns) == 0 || matchesAnyPattern(value, patterns)
 }
@@ -1181,6 +1254,9 @@ func normalizedPeerStrings(peers []normalizedPeer, matchNone bool) []string {
 		}
 		if peer.PodSelector != nil {
 			parts = append(parts, "podSelector="+labelSelectorString(peer.PodSelector))
+		}
+		if peer.ServiceAccountSelector != nil {
+			parts = append(parts, "serviceAccountSelector="+labelSelectorString(peer.ServiceAccountSelector))
 		}
 		appendValues := func(name string, values []string) {
 			if len(values) > 0 {

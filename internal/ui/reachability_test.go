@@ -482,10 +482,12 @@ func TestRuleDetailsShowsCustomPolicyTypeActionAndNotes(t *testing.T) {
 		t.Run(test.policyType.String(), func(t *testing.T) {
 			rule := testRules()[0]
 			rule.ID.PolicyType = test.policyType
+			rule.ID.PolicyVersion = "example.io/v1"
 			rule.ID.Action = netpol.PolicyActionDeny
 			rule.Notes = []string{"conditional request semantics are existential"}
 			text := RuleDetailsText(rule)
 			assert.Contains(t, text, "Policy type: "+test.want)
+			assert.Contains(t, text, "Policy API version: example.io/v1")
 			assert.Contains(t, text, "Action: deny")
 			assert.Contains(t, text, "Notes:\n  - conditional request semantics are existential")
 		})

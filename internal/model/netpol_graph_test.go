@@ -60,6 +60,11 @@ func TestNetPolGraphRefreshBuildsClusterSnapshot(t *testing.T) {
 	if snapshot.GeneratedAt.IsZero() {
 		t.Fatal("snapshot generation time was not recorded")
 	}
+	if snapshot.CiliumNetworkPolicies[0].GetName() != "cnp" ||
+		snapshot.CiliumClusterwideNetworkPolicies[0].GetName() != "ccnp" ||
+		snapshot.IstioAuthorizationPolicies[0].GetAPIVersion() != "security.istio.io/v1" {
+		t.Fatalf("custom policy objects were not preserved: %+v", snapshot)
+	}
 	if evaluator.lastSubject() != subject {
 		t.Fatalf("expected subject %+v, got %+v", subject, evaluator.lastSubject())
 	}

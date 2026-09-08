@@ -529,22 +529,41 @@ func permissionsForNormalizedRule(rule *normalizedRule, destination *corev1.Pod)
 }
 
 func combinePolicyLayers(network, authorization Decision) Decision {
-	permissions, known := intersectPermissions(network.Permissions, authorization.Permissions)
+	var networkTCP, networkNonTCP []PortPermission
+	for _, permission := range network.Permissions {
+		if normalizedProtocol(permission.Protocol) == corev1.ProtocolTCP {
+			networkTCP = append(networkTCP, permission)
+		} else {
+			networkNonTCP = append(networkNonTCP, permission)
+		}
+	}
+	tcpPermissions, known := intersectPermissions(networkTCP, authorization.Permissions)
+	permissions := canonicalPermissions(append(networkNonTCP, tcpPermissions...))
 	decision := Decision{
 		Permissions: permissions,
 		Evidence:    uniqueEvidence(append(network.Evidence, authorization.Evidence...)),
 		Warnings:    uniqueStrings(append(network.Warnings, authorization.Warnings...)),
 	}
 	switch {
-	case network.State == AccessDisallowed || authorization.State == AccessDisallowed:
+	case network.State == AccessDisallowed:
 		decision.State = AccessDisallowed
-		decision.Explanation = "network and authorization policy layers must both allow traffic"
+		decision.Explanation = "network policy permits no traffic"
 	case knownPermissions(permissions):
 		decision.State = AccessAllowed
-		decision.Explanation = "network and authorization policy layers both allow traffic"
+		if authorization.State == AccessDisallowed {
+			decision.Explanation = "Istio authorization denies TCP, but non-TCP network permissions remain"
+		} else {
+			decision.Explanation = "network policy and TCP-scoped authorization both permit traffic"
+		}
 		if network.State == AccessUnknown || authorization.State == AccessUnknown || !known {
 			decision.Warnings = uniqueStrings(append(decision.Warnings, "additional traffic may be affected by unresolved policy constraints"))
 		}
+	case authorization.State == AccessDisallowed:
+		decision.State = AccessDisallowed
+		decision.Explanation = "Istio authorization permits no TCP traffic and no non-TCP network permissions remain"
+	case len(permissions) == 0 && network.State != AccessUnknown && authorization.State != AccessUnknown && known:
+		decision.State = AccessDisallowed
+		decision.Explanation = "network and authorization policy layers permit no common TCP traffic"
 	default:
 		decision.State = AccessUnknown
 		decision.Explanation = "network and authorization policy layers have no definitely common ports"

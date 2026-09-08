@@ -506,8 +506,9 @@ K9s uses aliases to navigate most K8s resources.
 
 ## NetworkPolicy Reachability
 
-The NetworkPolicy reachability view explains effective **Kubernetes
-NetworkPolicy** connectivity. Open it with:
+The NetworkPolicy reachability view explains effective connectivity from
+Kubernetes `NetworkPolicy`, Cilium `CiliumNetworkPolicy` and
+`CiliumClusterwideNetworkPolicy`, and Istio `AuthorizationPolicy`. Open it with:
 
 ```text
 :netpolgraph <kind> <name> [namespace]
@@ -547,7 +548,7 @@ Each direction has two display modes, but the projection mode is shared
 between ingress and egress: pressing `m` switches both directions at once.
 Per-direction filters, selection, and scroll position remain independent.
 
-- **Rules** lists the NetworkPolicy rules selecting the subject, including
+- **Rules** lists the policy rules selecting the subject, including
   synthetic unrestricted/default-deny explanations where applicable.
 - **Primitives** evaluates reachable CIDRs, Pods, Namespaces, Deployments, and
   Jobs. Press `f` to enable or disable these five primitive kinds; the
@@ -586,7 +587,7 @@ one direction is hidden. If both directions are hidden, the subject and details
 remain visible.
 
 Press `o` to open the Kubernetes resource behind the selected row. Rules mode
-opens the NetworkPolicy; Primitives mode opens the selected Pod, Namespace,
+opens the Kubernetes, Cilium, or Istio policy; Primitives mode opens the selected Pod, Namespace,
 Deployment, or Job. CIDR primitives are not Kubernetes resources and cannot be
 opened. The reachability view appears in the breadcrumb trail as `<npg>`, so
 opening a resource pushes it onto the stack and `Esc` walks back through
