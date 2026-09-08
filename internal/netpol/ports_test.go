@@ -72,6 +72,33 @@ func TestAmbiguousNamedPortAndIntersections(t *testing.T) {
 	require.Empty(t, intersection)
 }
 
+func TestSubtractPermissions(t *testing.T) {
+	deniedPort := intstr.FromInt32(8080)
+	allowed, known := subtractPermissions(
+		[]PortPermission{
+			{Protocol: corev1.ProtocolTCP, All: true},
+			{Protocol: corev1.ProtocolUDP, All: true},
+		},
+		[]PortPermission{{Protocol: corev1.ProtocolTCP, Port: &deniedPort}},
+	)
+	require.True(t, known)
+	require.Equal(t, []string{"TCP/1-8079", "TCP/8081-65535", "UDP/all"}, permissionStrings(allowed))
+
+	allowed, known = subtractPermissions(
+		[]PortPermission{{Protocol: corev1.ProtocolTCP, All: true}},
+		[]PortPermission{{Protocol: corev1.ProtocolTCP, All: true}},
+	)
+	require.True(t, known)
+	require.Empty(t, allowed)
+
+	allowed, known = subtractPermissions(
+		[]PortPermission{{Protocol: corev1.ProtocolTCP, All: true}},
+		[]PortPermission{{Protocol: corev1.ProtocolTCP, Unknown: true}},
+	)
+	require.False(t, known)
+	require.Equal(t, []string{"TCP/all"}, permissionStrings(allowed))
+}
+
 func permissionStrings(permissions []PortPermission) []string {
 	out := make([]string, 0, len(permissions))
 	for _, permission := range permissions {

@@ -1018,9 +1018,11 @@ func colorName(color tcell.Color) string {
 func RuleDetailsText(rule netpol.RuleResult) string {
 	var b strings.Builder
 	state, label := ruleState(&rule)
-	fmt.Fprintf(&b, "Policy: %s/%s\nPolicy UID: %s\nDirection: %s\nRule index: %d\nState: %s (%s)\nPolicy pod selector: %s\nSubjects: %d/%d\nPeers:\n",
-		valueOrDash(rule.ID.PolicyNamespace), valueOrDash(rule.ID.PolicyName), valueOrDash(string(rule.ID.PolicyUID)),
-		rule.ID.Direction, rule.ID.Index, state, label, valueOrDash(rule.PolicySelector),
+	fmt.Fprintf(&b, "Policy: %s/%s\nPolicy type: %s (%s)\nPolicy UID: %s\nDirection: %s\nAction: %s\nRule index: %d\nState: %s (%s)\nPolicy pod selector: %s\nSubjects: %d/%d\nPeers:\n",
+		valueOrDash(rule.ID.PolicyNamespace), valueOrDash(rule.ID.PolicyName),
+		rule.ID.SourceType(), rule.ID.SourceType().Kind(), valueOrDash(string(rule.ID.PolicyUID)),
+		rule.ID.Direction, rule.ID.Action.String(),
+		rule.ID.Index, state, label, valueOrDash(rule.PolicySelector),
 		rule.SubjectMatchCount, rule.SubjectPodCount)
 	if len(rule.Peers) == 0 {
 		fmt.Fprintf(&b, "  - %s\n", valueOrDash(rule.PeerSummary))
@@ -1032,6 +1034,7 @@ func RuleDetailsText(rule netpol.RuleResult) string {
 	if rule.YAML != "" {
 		fmt.Fprintf(&b, "Rule YAML:\n%s\n", rule.YAML)
 	}
+	appendNotes(&b, rule.Notes)
 	appendEvidence(&b, rule.Evidence)
 	appendWarnings(&b, rule.Warnings)
 	return strings.TrimRight(b.String(), "\n")
@@ -1136,6 +1139,16 @@ func appendEvidence(b *strings.Builder, evidence []netpol.PolicyEvidence) {
 			summary = item.RuleID.String()
 		}
 		fmt.Fprintf(b, "  - %s\n", summary)
+	}
+}
+
+func appendNotes(b *strings.Builder, notes []string) {
+	if len(notes) == 0 {
+		return
+	}
+	b.WriteString("Notes:\n")
+	for _, note := range notes {
+		fmt.Fprintf(b, "  - %s\n", note)
 	}
 }
 

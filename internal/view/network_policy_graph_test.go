@@ -2746,6 +2746,68 @@ func TestWorkloadAndPrimitiveGVRs(t *testing.T) {
 	assert.False(t, ok)
 }
 
+func TestNetworkPolicyGraphCustomPolicyTargets(t *testing.T) {
+	tests := []struct {
+		name string
+		id   netpol.RuleID
+		gvr  *client.GVR
+		path string
+	}{
+		{
+			name: "network policy",
+			id:   netpol.RuleID{PolicyNamespace: "payments", PolicyName: "native"},
+			gvr:  client.NpGVR,
+			path: "payments/native",
+		},
+		{
+			name: "Cilium network policy",
+			id: netpol.RuleID{
+				PolicyNamespace: "payments", PolicyName: "cilium",
+				PolicyType: netpol.PolicyTypeCiliumNetworkPolicy,
+			},
+			gvr:  client.CnpGVR,
+			path: "payments/cilium",
+		},
+		{
+			name: "Cilium clusterwide network policy",
+			id: netpol.RuleID{
+				PolicyName: "cluster", PolicyType: netpol.PolicyTypeCiliumClusterwideNetworkPolicy,
+			},
+			gvr:  client.CcnpGVR,
+			path: "-/cluster",
+		},
+		{
+			name: "Istio v1 authorization policy",
+			id: netpol.RuleID{
+				PolicyNamespace: "payments", PolicyName: "authz",
+				PolicyType: netpol.PolicyTypeIstioAuthorizationPolicy, PolicyVersion: "security.istio.io/v1",
+			},
+			gvr:  client.AuthzGVR,
+			path: "payments/authz",
+		},
+		{
+			name: "Istio v1beta1 authorization policy",
+			id: netpol.RuleID{
+				PolicyNamespace: "payments", PolicyName: "authz",
+				PolicyType: netpol.PolicyTypeIstioAuthorizationPolicy, PolicyVersion: "security.istio.io/v1beta1",
+			},
+			gvr:  client.AuthzV1BetaGVR,
+			path: "payments/authz",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gvr, ok := policyGVR(test.id)
+			require.True(t, ok)
+			assert.Equal(t, test.gvr, gvr)
+			assert.Equal(t, test.path, policyPath(test.id))
+		})
+	}
+
+	_, ok := policyGVR(netpol.RuleID{SyntheticKind: "default-deny"})
+	assert.False(t, ok)
+}
+
 // The applicability table is what this view exists to show, so a long rule
 // detail text must not push it down to its bare minimum.
 func TestNetworkPolicyGraphApplicabilityKeepsItsShare(t *testing.T) {

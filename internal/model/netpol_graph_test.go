@@ -19,10 +19,12 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
 )
@@ -35,6 +37,9 @@ func TestNetPolGraphRefreshBuildsClusterSnapshot(t *testing.T) {
 	factory.add(client.DpGVR, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "deployment", Namespace: "ns"}})
 	factory.add(client.RsGVR, &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "replicaset", Namespace: "ns"}})
 	factory.add(client.JobGVR, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns"}})
+	factory.add(client.CnpGVR, customPolicy("cilium.io/v2", "CiliumNetworkPolicy", "ns", "cnp"))
+	factory.add(client.CcnpGVR, customPolicy("cilium.io/v2", "CiliumClusterwideNetworkPolicy", "", "ccnp"))
+	factory.add(client.AuthzGVR, customPolicy("security.istio.io/v1", "AuthorizationPolicy", "ns", "authz"))
 
 	evaluator := &netPolGraphEvaluator{}
 	model := NewNetPolGraph(evaluator)
@@ -47,7 +52,9 @@ func TestNetPolGraphRefreshBuildsClusterSnapshot(t *testing.T) {
 
 	snapshot := evaluator.lastSnapshot()
 	if len(snapshot.Pods) != 1 || len(snapshot.Namespaces) != 1 || len(snapshot.NetworkPolicies) != 1 ||
-		len(snapshot.Deployments) != 1 || len(snapshot.ReplicaSets) != 1 || len(snapshot.Jobs) != 1 {
+		len(snapshot.CiliumNetworkPolicies) != 1 || len(snapshot.CiliumClusterwideNetworkPolicies) != 1 ||
+		len(snapshot.IstioAuthorizationPolicies) != 1 || len(snapshot.Deployments) != 1 ||
+		len(snapshot.ReplicaSets) != 1 || len(snapshot.Jobs) != 1 {
 		t.Fatalf("unexpected snapshot sizes: %+v", snapshot)
 	}
 	if snapshot.GeneratedAt.IsZero() {
@@ -56,10 +63,18 @@ func TestNetPolGraphRefreshBuildsClusterSnapshot(t *testing.T) {
 	if evaluator.lastSubject() != subject {
 		t.Fatalf("expected subject %+v, got %+v", subject, evaluator.lastSubject())
 	}
+	clusterScopedLists := 0
 	for _, namespace := range factory.namespaces() {
-		if namespace != client.BlankNamespace {
-			t.Fatalf("expected cluster-wide list, got namespace %q", namespace)
+		switch namespace {
+		case client.BlankNamespace:
+		case client.ClusterScope:
+			clusterScopedLists++
+		default:
+			t.Fatalf("expected all-namespace or cluster-scoped list, got namespace %q", namespace)
 		}
+	}
+	if clusterScopedLists != 1 {
+		t.Fatalf("expected one cluster-scoped list, got %d", clusterScopedLists)
 	}
 }
 
@@ -93,6 +108,56 @@ func TestNetPolGraphPartialSnapshotReturnsResultAndError(t *testing.T) {
 	}
 	if _, ok := model.LastRefresh().Incomplete["networkpolicies"]; !ok {
 		t.Fatal("refresh metadata did not retain partial failure")
+	}
+}
+
+func TestSelectOptionalResourcePrefersServedVersionAndFallsBack(t *testing.T) {
+	discovery := &optionalPolicyDiscovery{
+		resources: map[string][]metav1.APIResource{
+			"security.istio.io/v1":      {{Name: "peerauthentications"}},
+			"security.istio.io/v1beta1": {{Name: "authorizationpolicies"}},
+		},
+	}
+	gvr, err := selectOptionalResource(discovery, []*client.GVR{client.AuthzGVR, client.AuthzV1BetaGVR})
+	if err != nil {
+		t.Fatalf("select optional resource: %v", err)
+	}
+	if gvr != client.AuthzV1BetaGVR {
+		t.Fatalf("expected v1beta1 fallback, got %v", gvr)
+	}
+
+	discovery.resources["security.istio.io/v1"] = []metav1.APIResource{{Name: "authorizationpolicies"}}
+	gvr, err = selectOptionalResource(discovery, []*client.GVR{client.AuthzGVR, client.AuthzV1BetaGVR})
+	if err != nil {
+		t.Fatalf("select preferred resource: %v", err)
+	}
+	if gvr != client.AuthzGVR {
+		t.Fatalf("expected preferred v1 resource, got %v", gvr)
+	}
+}
+
+func TestSelectOptionalResourceIgnoresMissingAPIGroups(t *testing.T) {
+	discovery := &optionalPolicyDiscovery{
+		resources: map[string][]metav1.APIResource{
+			"security.istio.io/v1beta1": {{Name: "authorizationpolicies"}},
+		},
+		errs: map[string]error{
+			"security.istio.io/v1": apierrors.NewNotFound(
+				schema.GroupResource{Group: "security.istio.io", Resource: "v1"}, "",
+			),
+		},
+	}
+	gvr, err := selectOptionalResource(discovery, []*client.GVR{client.AuthzGVR, client.AuthzV1BetaGVR})
+	if err != nil {
+		t.Fatalf("missing API group should be ignored: %v", err)
+	}
+	if gvr != client.AuthzV1BetaGVR {
+		t.Fatalf("expected v1beta1 fallback, got %v", gvr)
+	}
+
+	discovery.errs["security.istio.io/v1"] = errors.New("discovery unavailable")
+	if _, err := selectOptionalResource(discovery, []*client.GVR{client.AuthzGVR}); err == nil {
+		t.Fatal("expected non-absence discovery error")
 	}
 }
 
@@ -276,11 +341,38 @@ type netPolGraphFactory struct {
 	getPaths  []string
 }
 
+type optionalPolicyDiscovery struct {
+	resources map[string][]metav1.APIResource
+	errs      map[string]error
+}
+
+func (d *optionalPolicyDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+	if err := d.errs[groupVersion]; err != nil {
+		return nil, err
+	}
+	return &metav1.APIResourceList{
+		GroupVersion: groupVersion,
+		APIResources: d.resources[groupVersion],
+	}, nil
+}
+
 func newNetPolGraphFactory() *netPolGraphFactory {
 	return &netPolGraphFactory{
 		inventory: make(map[string][]runtime.Object),
 		errs:      make(map[string]error),
 	}
+}
+
+func customPolicy(apiVersion, kind, namespace, name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": apiVersion,
+		"kind":       kind,
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": namespace,
+		},
+		"spec": map[string]any{},
+	}}
 }
 
 func (f *netPolGraphFactory) add(gvr *client.GVR, object runtime.Object) {

@@ -19,6 +19,8 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -484,8 +486,95 @@ func buildNetPolSnapshot(ctx context.Context, factory dao.Factory, subject netpo
 	snapshot.Deployments = convertSnapshotObjects[appsv1.Deployment]("deployments", list("deployments", client.DpGVR), &snapshot)
 	snapshot.ReplicaSets = convertSnapshotObjects[appsv1.ReplicaSet]("replicasets", list("replicasets", client.RsGVR), &snapshot)
 	snapshot.Jobs = convertSnapshotObjects[batchv1.Job]("jobs", list("jobs", client.JobGVR), &snapshot)
+	loadOptionalPolicyResources(ctx, factory, &snapshot)
 	injectSelectedSubject(ctx, factory, subject, &snapshot)
 	return snapshot
+}
+
+func loadOptionalPolicyResources(ctx context.Context, factory dao.Factory, snapshot *netpol.Snapshot) {
+	type optionalResource struct {
+		name       string
+		namespace  string
+		candidates []*client.GVR
+		assign     func([]unstructured.Unstructured)
+	}
+	resources := []optionalResource{
+		{
+			name: "ciliumnetworkpolicies", namespace: client.BlankNamespace,
+			candidates: []*client.GVR{client.CnpGVR},
+			assign: func(items []unstructured.Unstructured) {
+				snapshot.CiliumNetworkPolicies = items
+			},
+		},
+		{
+			name: "ciliumclusterwidenetworkpolicies", namespace: client.ClusterScope,
+			candidates: []*client.GVR{client.CcnpGVR},
+			assign: func(items []unstructured.Unstructured) {
+				snapshot.CiliumClusterwideNetworkPolicies = items
+			},
+		},
+		{
+			name: "authorizationpolicies", namespace: client.BlankNamespace,
+			candidates: []*client.GVR{client.AuthzGVR, client.AuthzV1BetaGVR},
+			assign: func(items []unstructured.Unstructured) {
+				snapshot.IstioAuthorizationPolicies = items
+			},
+		},
+	}
+	for _, resource := range resources {
+		if err := ctx.Err(); err != nil {
+			snapshot.Incomplete[resource.name] = err
+			continue
+		}
+		gvr, err := discoverOptionalResource(factory, resource.candidates)
+		if err != nil {
+			snapshot.Incomplete[resource.name] = err
+			continue
+		}
+		if gvr == nil {
+			continue
+		}
+		objects, err := factory.List(gvr, resource.namespace, true, labels.Everything())
+		if err != nil {
+			snapshot.Incomplete[resource.name] = err
+			continue
+		}
+		resource.assign(convertSnapshotObjects[unstructured.Unstructured](resource.name, objects, snapshot))
+	}
+}
+
+func discoverOptionalResource(factory dao.Factory, candidates []*client.GVR) (*client.GVR, error) {
+	connection := factory.Client()
+	if connection == nil {
+		return candidates[0], nil
+	}
+	discoveryClient, err := connection.CachedDiscovery()
+	if err != nil {
+		return nil, fmt.Errorf("discover optional policy resource: %w", err)
+	}
+	return selectOptionalResource(discoveryClient, candidates)
+}
+
+type optionalResourceDiscoverer interface {
+	ServerResourcesForGroupVersion(string) (*metav1.APIResourceList, error)
+}
+
+func selectOptionalResource(discoveryClient optionalResourceDiscoverer, candidates []*client.GVR) (*client.GVR, error) {
+	for _, candidate := range candidates {
+		resources, err := discoveryClient.ServerResourcesForGroupVersion(candidate.GV().String())
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("discover %s: %w", candidate, err)
+		}
+		for _, resource := range resources.APIResources {
+			if resource.Name == candidate.R() {
+				return candidate, nil
+			}
+		}
+	}
+	return nil, nil
 }
 
 func injectSelectedSubject(ctx context.Context, factory dao.Factory, subject netpol.SubjectRef, snapshot *netpol.Snapshot) {

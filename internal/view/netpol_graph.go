@@ -2035,19 +2035,19 @@ func (v *NetworkPolicyGraph) restoreSearchFocus(stop focusStop) {
 }
 
 // selectedRulePolicy returns the policy behind the direction's selected rule.
-func (v *NetworkPolicyGraph) selectedRulePolicy(direction netpol.Direction) (namespace, name string, found bool) {
+func (v *NetworkPolicyGraph) selectedRulePolicy(direction netpol.Direction) (netpol.RuleID, bool) {
 	if !v.state[direction].visible {
-		return "", "", false
+		return netpol.RuleID{}, false
 	}
 	id := v.panels[direction].SelectedID()
 	if id == "" {
-		return "", "", false
+		return netpol.RuleID{}, false
 	}
 	rule, ok := v.selectedRule(direction, id)
 	if !ok || rule.Synthetic || rule.ID.PolicyName == "" {
-		return "", "", false
+		return netpol.RuleID{}, false
 	}
-	return rule.ID.PolicyNamespace, rule.ID.PolicyName, true
+	return rule.ID, true
 }
 
 func (v *NetworkPolicyGraph) yamlCmd(_ *tcell.EventKey) *tcell.EventKey {
@@ -2112,11 +2112,15 @@ func (v *NetworkPolicyGraph) directionYAMLTarget(direction netpol.Direction) (*c
 		return nil, "", false
 	}
 	if v.mode == ui.RulesProjection {
-		namespace, name, ok := v.selectedRulePolicy(direction)
+		ruleID, ok := v.selectedRulePolicy(direction)
 		if !ok {
 			return nil, "", false
 		}
-		return client.NpGVR, objectKey(namespace, name), true
+		gvr, ok := policyGVR(ruleID)
+		if !ok {
+			return nil, "", false
+		}
+		return gvr, policyPath(ruleID), true
 	}
 	primitive, ok := v.selectedPrimitive(direction, id)
 	if !ok {
@@ -2178,6 +2182,32 @@ func primitiveGVR(ref *netpol.PrimitiveRef) (*client.GVR, string, bool) {
 	default:
 		return nil, "", false
 	}
+}
+
+func policyGVR(ruleID netpol.RuleID) (*client.GVR, bool) {
+	switch ruleID.SourceType() {
+	case netpol.PolicyTypeNetworkPolicy:
+		return client.NpGVR, true
+	case netpol.PolicyTypeCiliumNetworkPolicy:
+		return client.CnpGVR, true
+	case netpol.PolicyTypeCiliumClusterwideNetworkPolicy:
+		return client.CcnpGVR, true
+	case netpol.PolicyTypeIstioAuthorizationPolicy:
+		if strings.HasSuffix(ruleID.PolicyVersion, "/v1beta1") {
+			return client.AuthzV1BetaGVR, true
+		}
+		return client.AuthzGVR, true
+	default:
+		return nil, false
+	}
+}
+
+func policyPath(ruleID netpol.RuleID) string {
+	namespace := ruleID.PolicyNamespace
+	if ruleID.SourceType() == netpol.PolicyTypeCiliumClusterwideNetworkPolicy {
+		namespace = client.ClusterScope
+	}
+	return client.FQN(namespace, ruleID.PolicyName)
 }
 
 // escapeCmd clears the focused panel selection so the details pane shows the
@@ -2244,11 +2274,15 @@ func (v *NetworkPolicyGraph) directionPrimitiveTarget(direction netpol.Direction
 		return "", "", errNoPrimitiveTarget
 	}
 	if v.mode == ui.RulesProjection {
-		namespace, name, ok := v.selectedRulePolicy(direction)
+		ruleID, ok := v.selectedRulePolicy(direction)
 		if !ok {
 			return "", "", errNoPrimitiveTarget
 		}
-		return "networkpolicies", objectKey(namespace, name), nil
+		gvr, ok := policyGVR(ruleID)
+		if !ok {
+			return "", "", errNoPrimitiveTarget
+		}
+		return gvr.R(), policyPath(ruleID), nil
 	}
 	primitive, ok := v.selectedPrimitive(direction, id)
 	if !ok {
