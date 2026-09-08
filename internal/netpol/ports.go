@@ -111,6 +111,69 @@ func intersectPermissions(a, b []PortPermission) ([]PortPermission, bool) {
 	return canonicalPermissions(out), known
 }
 
+func subtractPermissions(allowed, denied []PortPermission) ([]PortPermission, bool) {
+	if len(denied) == 0 {
+		return canonicalPermissions(allowed), true
+	}
+	out := slices.Clone(allowed)
+	known := true
+	for _, deny := range denied {
+		var next []PortPermission
+		for _, allow := range out {
+			remaining, exact := subtractPermission(allow, deny)
+			known = known && exact
+			next = append(next, remaining...)
+		}
+		out = next
+	}
+	return canonicalPermissions(out), known
+}
+
+func subtractPermission(allowed, denied PortPermission) ([]PortPermission, bool) {
+	if !protocolsEqual(allowed.Protocol, denied.Protocol) {
+		return []PortPermission{allowed}, true
+	}
+	if allowed.Unknown || denied.Unknown {
+		return []PortPermission{allowed}, false
+	}
+	allowStart, allowEnd, allowNumeric := permissionBounds(allowed)
+	denyStart, denyEnd, denyNumeric := permissionBounds(denied)
+	if !allowNumeric || !denyNumeric {
+		return []PortPermission{allowed}, false
+	}
+	if denyEnd < allowStart || denyStart > allowEnd {
+		return []PortPermission{allowed}, true
+	}
+	var out []PortPermission
+	if denyStart > allowStart {
+		out = append(out, rangePermission(allowed.Protocol, allowStart, denyStart-1))
+	}
+	if denyEnd < allowEnd {
+		out = append(out, rangePermission(allowed.Protocol, denyEnd+1, allowEnd))
+	}
+	return out, true
+}
+
+func permissionBounds(permission PortPermission) (start, end int32, numeric bool) {
+	if permission.All || permission.Port == nil {
+		return 1, 65535, true
+	}
+	if permission.Port.Type != intstr.Int {
+		return 0, 0, false
+	}
+	start, end = permissionRange(permission)
+	return start, end, true
+}
+
+func rangePermission(protocol corev1.Protocol, start, end int32) PortPermission {
+	port := intstr.FromInt32(start)
+	permission := PortPermission{Protocol: normalizedProtocol(protocol), Port: &port}
+	if end != start {
+		permission.EndPort = &end
+	}
+	return permission
+}
+
 func canonicalPermissions(in []PortPermission) []PortPermission {
 	seen := map[string]PortPermission{}
 	for _, p := range in {
