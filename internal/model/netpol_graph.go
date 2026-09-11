@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -462,8 +465,9 @@ func (m *NetPolGraph) isCurrent(generation uint64, subject netpol.SubjectRef) bo
 
 func buildNetPolSnapshot(ctx context.Context, factory dao.Factory, subject netpol.SubjectRef) netpol.Snapshot {
 	snapshot := netpol.Snapshot{
-		Incomplete:  make(map[string]error),
-		GeneratedAt: time.Now(),
+		IstioRootNamespace: netpol.DefaultIstioRootNamespace,
+		Incomplete:         make(map[string]error),
+		GeneratedAt:        time.Now(),
 	}
 	list := func(name string, gvr *client.GVR) []runtime.Object {
 		if err := ctx.Err(); err != nil {
@@ -540,6 +544,61 @@ func loadOptionalPolicyResources(ctx context.Context, factory dao.Factory, snaps
 			continue
 		}
 		resource.assign(convertSnapshotObjects[unstructured.Unstructured](resource.name, objects, snapshot))
+	}
+	loadIstioRootNamespace(factory, snapshot)
+}
+
+func loadIstioRootNamespace(factory dao.Factory, snapshot *netpol.Snapshot) {
+	if len(snapshot.IstioAuthorizationPolicies) == 0 {
+		return
+	}
+	objects, err := factory.List(client.CmGVR, client.BlankNamespace, true, labels.Everything())
+	if err != nil {
+		snapshot.Incomplete["istio-mesh-config"] = fmt.Errorf("list Istio mesh config: %w", err)
+		return
+	}
+	configMaps := convertSnapshotObjects[corev1.ConfigMap]("istio-mesh-config", objects, snapshot)
+	roots := map[string]struct{}{}
+	for index := range configMaps {
+		configMap := &configMaps[index]
+		if configMap.Name != "istio" && !strings.HasPrefix(configMap.Name, "istio-") {
+			continue
+		}
+		raw := configMap.Data["mesh"]
+		if raw == "" {
+			continue
+		}
+		var meshConfig struct {
+			RootNamespace string `yaml:"rootNamespace"`
+		}
+		if err := yaml.Unmarshal([]byte(raw), &meshConfig); err != nil {
+			snapshot.Incomplete["istio-mesh-config"] = errors.Join(
+				snapshot.Incomplete["istio-mesh-config"],
+				fmt.Errorf("parse ConfigMap %s/%s mesh config: %w", configMap.Namespace, configMap.Name, err),
+			)
+			continue
+		}
+		if meshConfig.RootNamespace != "" {
+			roots[meshConfig.RootNamespace] = struct{}{}
+		}
+	}
+	if len(roots) == 0 {
+		return
+	}
+	if len(roots) > 1 {
+		values := make([]string, 0, len(roots))
+		for root := range roots {
+			values = append(values, root)
+		}
+		slices.Sort(values)
+		snapshot.Incomplete["istio-mesh-config"] = errors.Join(
+			snapshot.Incomplete["istio-mesh-config"],
+			fmt.Errorf("multiple Istio root namespaces discovered: %s", strings.Join(values, ", ")),
+		)
+		return
+	}
+	for root := range roots {
+		snapshot.IstioRootNamespace = root
 	}
 }
 

@@ -69,16 +69,20 @@ delivery. CNI behavior, NAT, `hostNetwork`, node-local traffic, sidecar
 enrollment, cloud firewalls, and other networking layers may change the real
 result. Dynamic Cilium destinations such as FQDNs, Services, CIDR groups, nodes,
 and cloud-provider groups, plus Istio external authorization, `targetRefs`,
-forwarded-client IPs, JWT identities, and negative ports or CIDRs, are reported
-as incomplete rather than guessed.
+`when` conditions, forwarded-client IPs, JWT identities, and negative ports or
+CIDRs, are reported as incomplete rather than guessed.
 
 Kubernetes and Cilium policies form the network layer. Istio authorization is a
 second destination-ingress layer; both layers must permit a pod-to-pod path.
 Istio `ALLOW` activates default deny for selected destinations and Istio
 `DENY` overrides matching allows. `AUDIT` and dry-run policies do not enforce
-reachability in the graph. Istio policy scope assumes the default
-`istio-system` mesh root namespace, and principal matching assumes the default
-`cluster.local` trust domain; these assumptions are shown in Rule Details.
+reachability in the graph. NPG resolves the mesh root namespace from installed
+Istio mesh ConfigMaps and otherwise uses Istio's `istio-system` default.
+Unavailable, invalid, or conflicting mesh configuration is reported as partial
+data. Certificate-derived source namespace, service-account, principal, and
+trust-domain constraints require mTLS state that is not present in the graph
+snapshot. NPG approximates them from workload metadata using the default
+`cluster.local` trust domain and labels the result partial data.
 AuthorizationPolicy is TCP/HTTP-scoped, so network-layer UDP and SCTP
 permissions pass through unchanged.
 
@@ -171,7 +175,8 @@ to allow compatible traffic.
 A policy rule is a Kubernetes or Cilium ingress/egress entry, or an Istio
 authorization rule. NPG identifies a real rule by:
 
-- policy type (`np`, `cnp`, `ccnp`, or `authz`);
+- policy type (`NetworkPolicy`, `CiliumNetworkPolicy`,
+  `CiliumClusterwideNetworkPolicy`, or `AuthorizationPolicy`);
 - policy namespace and name;
 - allow or deny action;
 - direction;
@@ -324,9 +329,10 @@ Rules are rendered as two-line blocks without a header.
 | Displayed field | Meaning | Possible values |
 |---|---|---|
 | Rule identity | Policy namespace/name and zero-based rule index. Synthetic rows use their synthetic name and index `-1`. | `payments/allow-api #0`, `default-deny #-1`, `unrestricted #-1`. |
+| Type | API policy type supplying the rule. | `NetworkPolicy`, `CiliumNetworkPolicy`, `CiliumClusterwideNetworkPolicy`, `AuthorizationPolicy`, or `Synthetic`. |
 | Ports | Permissions contributed by the rule. | Protocol/all, numeric ports, ranges, named or unknown ports, or `no ports`. |
-| `subjects matched/selected` | Number of subject pods for which the rule contributed evidence divided by the number selected by the policy for that direction. | For example, `subjects 2/3`. |
-| `peer` | Compact summary of the rule's peer selectors. | `all peers`, selector text, CIDR text, `default-deny`, or `unrestricted`. |
+| `subjects matched/selected` | Number of subject pods for which the rule contributed evidence divided by the subject pods selected by the policy for that direction. Ingress subjects are destinations; egress subjects are sources. | For example, `subjects 2/3`. |
+| `peer` | Compact summary of the opposite endpoint matched by the rule. For ingress the peer is a source; for egress it is a destination. | `all peers`, selector text, CIDR text, `default-deny`, or `unrestricted`. |
 
 Rules do not use a separate visible state column. The row color carries the
 state, and the full state is shown in Rule Details.

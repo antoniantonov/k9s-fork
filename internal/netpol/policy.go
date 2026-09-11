@@ -74,6 +74,7 @@ type normalizedPeer struct {
 	AllNamespaces          bool
 	IPBlocks               []netv1.IPBlock
 	MatchPodIPs            bool
+	CIDRMatchUnsupported   bool
 	Namespaces             []string
 	NotNamespaces          []string
 	ServiceAccounts        []string
@@ -82,6 +83,8 @@ type normalizedPeer struct {
 	NotPrincipals          []string
 	RequestPrincipals      []string
 	NotRequestPrincipals   []string
+	TrustDomains           []string
+	NotTrustDomains        []string
 }
 
 func (p *normalizedPolicy) direction(direction Direction) *normalizedDirection {
@@ -132,7 +135,7 @@ func normalizeSnapshotPolicies(snapshot *Snapshot) ([]normalizedPolicy, map[stri
 	failures := make(map[string][]error)
 	appendResources := func(resource string, objects []unstructured.Unstructured, policyType PolicyType) {
 		for index := range objects {
-			normalized, errs := normalizeCustomPolicy(&objects[index], policyType)
+			normalized, errs := normalizeCustomPolicy(&objects[index], policyType, snapshot.IstioRootNamespace)
 			policies = append(policies, normalized...)
 			for _, err := range errs {
 				failures[resource] = append(failures[resource], fmt.Errorf("%s: %w", objectIdentity(&objects[index]), err))
@@ -203,12 +206,16 @@ func normalizeNetworkPolicyPeers(peers []netv1.NetworkPolicyPeer) []normalizedPe
 	return out
 }
 
-func normalizeCustomPolicy(object *unstructured.Unstructured, policyType PolicyType) ([]normalizedPolicy, []error) {
+func normalizeCustomPolicy(
+	object *unstructured.Unstructured,
+	policyType PolicyType,
+	istioRootNamespace string,
+) ([]normalizedPolicy, []error) {
 	switch policyType {
 	case PolicyTypeCiliumNetworkPolicy, PolicyTypeCiliumClusterwideNetworkPolicy:
 		return normalizeCiliumPolicy(object, policyType)
 	case PolicyTypeIstioAuthorizationPolicy:
-		return normalizeIstioPolicy(object)
+		return normalizeIstioPolicy(object, istioRootNamespace)
 	default:
 		return nil, []error{fmt.Errorf("unsupported policy type %q", policyType)}
 	}
@@ -779,6 +786,8 @@ type istioSource struct {
 	NotIPBlocks          []string `json:"notIpBlocks,omitempty"`
 	RemoteIPBlocks       []string `json:"remoteIpBlocks,omitempty"`
 	NotRemoteIPBlocks    []string `json:"notRemoteIpBlocks,omitempty"`
+	TrustDomains         []string `json:"trustDomains,omitempty"`
+	NotTrustDomains      []string `json:"notTrustDomains,omitempty"`
 }
 
 type istioTo struct {
@@ -796,7 +805,7 @@ type istioOperation struct {
 	NotPaths   []string `json:"notPaths,omitempty"`
 }
 
-func normalizeIstioPolicy(object *unstructured.Unstructured) ([]normalizedPolicy, []error) {
+func normalizeIstioPolicy(object *unstructured.Unstructured, rootNamespace string) ([]normalizedPolicy, []error) {
 	var resource istioPolicyResource
 	if err := decodeUnstructured(object, &resource); err != nil {
 		return nil, []error{err}
@@ -814,20 +823,26 @@ func normalizeIstioPolicy(object *unstructured.Unstructured) ([]normalizedPolicy
 	if action == "AUDIT" {
 		return nil, nil
 	}
+	if rootNamespace == "" {
+		rootNamespace = DefaultIstioRootNamespace
+	}
 
 	policy := normalizedPolicy{
 		ObjectMeta: *resource.Metadata.DeepCopy(),
 		Type:       PolicyTypeIstioAuthorizationPolicy,
 		Version:    resource.APIVersion,
 		Layer:      policyLayerAuthorization,
-		Notes:      []string{"Istio mesh root namespace is assumed to be istio-system"},
+		Notes:      []string{"Istio principal and trust-domain matching assumes cluster.local"},
 	}
 	if resource.Spec.Selector != nil {
 		policy.Selector.Pod.MatchLabels = mapsClone(resource.Spec.Selector.MatchLabels)
 	}
-	if policy.Namespace == "istio-system" {
+	if policy.Namespace == rootNamespace {
 		policy.ClusterScoped = true
-		policy.Notes = append(policy.Notes, "policy is treated as mesh-wide because it is in the default Istio root namespace")
+		policy.Notes = append(policy.Notes, fmt.Sprintf(
+			"policy is treated as mesh-wide because %s is the resolved Istio root namespace",
+			rootNamespace,
+		))
 	}
 
 	var errs []error
@@ -872,15 +887,10 @@ func normalizeIstioRule(
 	}
 	var errs []error
 	for _, from := range source.From {
-		peer, peerErrs := normalizeIstioSource(policy.Namespace, &from.Source)
+		peer, peerErrs, invalid := normalizeIstioSource(policy.Namespace, &from.Source)
 		rule.Peers = append(rule.Peers, peer)
-		if len(from.Source.Principals)+len(from.Source.NotPrincipals) > 0 {
-			rule.Notes = append(rule.Notes, "Istio principal matching assumes the default cluster.local trust domain")
-		}
 		errs = append(errs, peerErrs...)
-		if len(peerErrs) > 0 {
-			rule.Disabled = true
-		}
+		rule.Disabled = rule.Disabled || invalid
 	}
 	ports, notes, portErrs, invalid := normalizeIstioOperations(source.To)
 	rule.Ports = ports
@@ -888,10 +898,11 @@ func normalizeIstioRule(
 	errs = append(errs, portErrs...)
 	rule.Disabled = rule.Disabled || invalid
 	if len(source.When) > 0 {
-		rule.Notes = append(rule.Notes, "Istio when conditions are not rendered; reachability means at least one request can match")
+		errs = append(errs, errors.New("Istio when conditions cannot be evaluated from the policy snapshot"))
+		rule.Disabled = true
 	}
 	if action == PolicyActionDeny && istioRuleHasUnmodeledPredicates(source) {
-		errs = append(errs, errors.New("DENY has unmodeled L7 or when predicates; its ports are not subtracted"))
+		errs = append(errs, errors.New("DENY has unmodeled L7 predicates; its ports are not subtracted"))
 		rule.Disabled = true
 	}
 	rule.PeerStrings = normalizedPeerStrings(rule.Peers, false)
@@ -901,9 +912,6 @@ func normalizeIstioRule(
 }
 
 func istioRuleHasUnmodeledPredicates(rule *istioRule) bool {
-	if len(rule.When) > 0 {
-		return true
-	}
 	for _, item := range rule.To {
 		operation := item.Operation
 		if len(operation.Hosts)+len(operation.NotHosts)+len(operation.Methods)+
@@ -914,7 +922,7 @@ func istioRuleHasUnmodeledPredicates(rule *istioRule) bool {
 	return false
 }
 
-func normalizeIstioSource(policyNamespace string, source *istioSource) (normalizedPeer, []error) {
+func normalizeIstioSource(policyNamespace string, source *istioSource) (normalizedPeer, []error, bool) {
 	peer := normalizedPeer{
 		AllNamespaces:        true,
 		Namespaces:           slices.Clone(source.Namespaces),
@@ -925,27 +933,58 @@ func normalizeIstioSource(policyNamespace string, source *istioSource) (normaliz
 		NotPrincipals:        slices.Clone(source.NotPrincipals),
 		RequestPrincipals:    slices.Clone(source.RequestPrincipals),
 		NotRequestPrincipals: slices.Clone(source.NotRequestPrincipals),
+		TrustDomains:         slices.Clone(source.TrustDomains),
+		NotTrustDomains:      slices.Clone(source.NotTrustDomains),
 		MatchPodIPs:          len(source.IPBlocks) > 0,
 	}
 	var errs []error
+	invalid := false
 	for _, value := range source.IPBlocks {
 		block, err := istioIPBlock(value)
 		if err != nil {
 			errs = append(errs, err)
+			invalid = true
 			continue
 		}
 		peer.IPBlocks = append(peer.IPBlocks, block)
 	}
 	if len(source.NotIPBlocks) > 0 {
 		errs = append(errs, errors.New("notIpBlocks cannot be represented without CIDR subtraction"))
+		invalid = true
 	}
 	if len(source.RemoteIPBlocks) > 0 || len(source.NotRemoteIPBlocks) > 0 {
 		errs = append(errs, errors.New("remoteIpBlocks depend on proxy forwarding configuration"))
+		invalid = true
 	}
 	if len(source.RequestPrincipals) > 0 || len(source.NotRequestPrincipals) > 0 {
 		errs = append(errs, errors.New("requestPrincipals depend on JWT request identity"))
+		invalid = true
 	}
-	return peer, errs
+	if istioSourceHasPeerIdentityConstraints(source) {
+		errs = append(errs, errors.New(
+			"Istio peer identity constraints assume mTLS identity is available and use the default cluster.local trust domain",
+		))
+	}
+	if len(peer.IPBlocks) > 0 && istioSourceHasIdentityConstraints(source) {
+		peer.CIDRMatchUnsupported = true
+		errs = append(errs, errors.New("CIDR applicability cannot prove identity constraints ANDed with ipBlocks"))
+	}
+	return peer, errs, invalid
+}
+
+func istioSourceHasIdentityConstraints(source *istioSource) bool {
+	return len(source.Principals)+len(source.NotPrincipals)+
+		len(source.RequestPrincipals)+len(source.NotRequestPrincipals)+
+		len(source.Namespaces)+len(source.NotNamespaces)+
+		len(source.ServiceAccounts)+len(source.NotServiceAccounts)+
+		len(source.TrustDomains)+len(source.NotTrustDomains) > 0
+}
+
+func istioSourceHasPeerIdentityConstraints(source *istioSource) bool {
+	return len(source.Principals)+len(source.NotPrincipals)+
+		len(source.Namespaces)+len(source.NotNamespaces)+
+		len(source.ServiceAccounts)+len(source.NotServiceAccounts)+
+		len(source.TrustDomains)+len(source.NotTrustDomains) > 0
 }
 
 func normalizeServiceAccounts(namespace string, values []string) []string {
@@ -1119,6 +1158,10 @@ func normalizedPeerMatchesPod(
 	if !matchesPatterns(principal, peer.Principals) || matchesAnyPattern(principal, peer.NotPrincipals) {
 		return false
 	}
+	if !matchesPatterns("cluster.local", peer.TrustDomains) ||
+		matchesAnyPattern("cluster.local", peer.NotTrustDomains) {
+		return false
+	}
 	return len(peer.RequestPrincipals) == 0 && len(peer.NotRequestPrincipals) == 0
 }
 
@@ -1138,6 +1181,9 @@ func normalizedRuleMatchesCIDR(rule *normalizedRule, ref *PrimitiveRef) (bool, i
 }
 
 func normalizedPeerMatchesCIDR(peer *normalizedPeer, ref *PrimitiveRef) bool {
+	if peer.CIDRMatchUnsupported {
+		return false
+	}
 	if len(peer.IPBlocks) > 0 {
 		for index := range peer.IPBlocks {
 			if ipBlockContains(&peer.IPBlocks[index], ref) {
@@ -1154,7 +1200,9 @@ func normalizedPeerMatchesCIDR(peer *normalizedPeer, ref *PrimitiveRef) bool {
 		len(peer.ServiceAccounts) == 0 &&
 		len(peer.NotServiceAccounts) == 0 &&
 		len(peer.Principals) == 0 &&
-		len(peer.NotPrincipals) == 0
+		len(peer.NotPrincipals) == 0 &&
+		len(peer.TrustDomains) == 0 &&
+		len(peer.NotTrustDomains) == 0
 }
 
 func podMatchesIPBlocks(pod *corev1.Pod, blocks []netv1.IPBlock) bool {
@@ -1269,6 +1317,8 @@ func normalizedPeerStrings(peers []normalizedPeer, matchNone bool) []string {
 		appendValues("notServiceAccounts", peer.NotServiceAccounts)
 		appendValues("principals", peer.Principals)
 		appendValues("notPrincipals", peer.NotPrincipals)
+		appendValues("trustDomains", peer.TrustDomains)
+		appendValues("notTrustDomains", peer.NotTrustDomains)
 		if len(parts) == 0 {
 			parts = append(parts, "all peers")
 		}

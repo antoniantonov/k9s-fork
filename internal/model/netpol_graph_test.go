@@ -6,6 +6,7 @@ package model
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -64,6 +65,9 @@ func TestNetPolGraphRefreshBuildsClusterSnapshot(t *testing.T) {
 		snapshot.CiliumClusterwideNetworkPolicies[0].GetName() != "ccnp" ||
 		snapshot.IstioAuthorizationPolicies[0].GetAPIVersion() != "security.istio.io/v1" {
 		t.Fatalf("custom policy objects were not preserved: %+v", snapshot)
+	}
+	if snapshot.IstioRootNamespace != netpol.DefaultIstioRootNamespace {
+		t.Fatalf("expected default Istio root namespace, got %q", snapshot.IstioRootNamespace)
 	}
 	if evaluator.lastSubject() != subject {
 		t.Fatalf("expected subject %+v, got %+v", subject, evaluator.lastSubject())
@@ -164,6 +168,80 @@ func TestSelectOptionalResourceIgnoresMissingAPIGroups(t *testing.T) {
 	if _, err := selectOptionalResource(discovery, []*client.GVR{client.AuthzGVR}); err == nil {
 		t.Fatal("expected non-absence discovery error")
 	}
+}
+
+func TestLoadIstioRootNamespace(t *testing.T) {
+	newSnapshot := func() netpol.Snapshot {
+		return netpol.Snapshot{
+			IstioAuthorizationPolicies: []unstructured.Unstructured{*customPolicy(
+				"security.istio.io/v1", "AuthorizationPolicy", "payments", "authz",
+			)},
+			IstioRootNamespace: netpol.DefaultIstioRootNamespace,
+			Incomplete:         map[string]error{},
+		}
+	}
+
+	t.Run("resolved from revision config", func(t *testing.T) {
+		factory := newNetPolGraphFactory()
+		factory.add(client.CmGVR, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: "default"},
+			Data:       map[string]string{"mesh": "rootNamespace: ignored"},
+		})
+		factory.add(client.CmGVR, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "istio-canary", Namespace: "istio-system"},
+			Data:       map[string]string{"mesh": "rootNamespace: mesh-root\n"},
+		})
+		snapshot := newSnapshot()
+		loadIstioRootNamespace(factory, &snapshot)
+		if snapshot.IstioRootNamespace != "mesh-root" {
+			t.Fatalf("expected resolved root namespace, got %q", snapshot.IstioRootNamespace)
+		}
+		if len(snapshot.Incomplete) != 0 {
+			t.Fatalf("unexpected root namespace errors: %v", snapshot.Incomplete)
+		}
+	})
+
+	t.Run("ambiguous revisions are partial", func(t *testing.T) {
+		factory := newNetPolGraphFactory()
+		for name, root := range map[string]string{"istio": "root-a", "istio-canary": "root-b"} {
+			factory.add(client.CmGVR, &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "istio-system"},
+				Data:       map[string]string{"mesh": "rootNamespace: " + root},
+			})
+		}
+		snapshot := newSnapshot()
+		loadIstioRootNamespace(factory, &snapshot)
+		if snapshot.IstioRootNamespace != netpol.DefaultIstioRootNamespace {
+			t.Fatalf("ambiguous roots must retain the default, got %q", snapshot.IstioRootNamespace)
+		}
+		if err := snapshot.Incomplete["istio-mesh-config"]; err == nil ||
+			!strings.Contains(err.Error(), "multiple Istio root namespaces") {
+			t.Fatalf("expected ambiguity error, got %v", err)
+		}
+	})
+
+	t.Run("list and parse failures are partial", func(t *testing.T) {
+		factory := newNetPolGraphFactory()
+		factory.errs[client.CmGVR.String()] = errors.New("configmaps forbidden")
+		snapshot := newSnapshot()
+		loadIstioRootNamespace(factory, &snapshot)
+		if err := snapshot.Incomplete["istio-mesh-config"]; err == nil ||
+			!errors.Is(err, factory.errs[client.CmGVR.String()]) {
+			t.Fatalf("expected wrapped list error, got %v", err)
+		}
+
+		factory = newNetPolGraphFactory()
+		factory.add(client.CmGVR, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "istio", Namespace: "istio-system"},
+			Data:       map[string]string{"mesh": "rootNamespace: ["},
+		})
+		snapshot = newSnapshot()
+		loadIstioRootNamespace(factory, &snapshot)
+		if err := snapshot.Incomplete["istio-mesh-config"]; err == nil ||
+			!strings.Contains(err.Error(), "parse ConfigMap") {
+			t.Fatalf("expected parse error, got %v", err)
+		}
+	})
 }
 
 func TestNetPolGraphRejectsStaleGeneration(t *testing.T) {

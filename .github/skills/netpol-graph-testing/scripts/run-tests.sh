@@ -9,7 +9,7 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 DEMO_SCRIPT="$SCRIPT_DIR/netpol-demo-workloads.sh"
 EXPECT_SCRIPT="$SCRIPT_DIR/k9s-tui-smoke.exp"
-PHASES=(preflight ensure-cluster ensure-workloads go-tests build-image tui-tests report)
+PHASES=(preflight ensure-cluster ensure-workloads go-tests coverage build-image tui-tests report)
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="$SKILL_DIR/runs/$RUN_ID"
 CLUSTER="k9s-netpol"
@@ -35,7 +35,7 @@ usage() {
 Usage: $0 [options]
 
 Options:
-  --only PHASE          run one phase (preflight, ensure-cluster, ensure-workloads, go-tests, build-image, tui-tests, report)
+  --only PHASE          run one phase (preflight, ensure-cluster, ensure-workloads, go-tests, coverage, build-image, tui-tests, report)
   --skip PHASE          skip a phase; may be repeated
   --from PHASE          run from PHASE through report
   --force-workloads     repopulate workloads even when --check succeeds
@@ -272,6 +272,22 @@ phase_go_tests() {
   # here. Run the full packages manually to audit those separately.
   go test -race ./internal/ui/ -run 'Reachability|DirectionPanel|SubjectInfo|SubjectPicker|PrimitiveKind|RuleDetails|Applicability' || return 1
   go test -race ./internal/model/ -run 'NetPolGraph|NetworkPolicyGraph' || return 1
+}
+
+phase_coverage() {
+  local profile="$RUN_DIR/diff-coverage.out"
+  local base="${DIFF_COVER_BASE:-master}"
+  cd "$REPO_ROOT"
+  go test \
+    -coverpkg=./internal/netpol,./internal/model,./internal/ui,./internal/view,./internal/client,./.github/skills/netpol-graph-testing/diffcover \
+    -coverprofile="$profile" \
+    ./internal/netpol ./internal/model ./internal/ui ./internal/view \
+    ./.github/skills/netpol-graph-testing/diffcover || return 1
+  go run ./.github/skills/netpol-graph-testing/diffcover \
+    --base "$base" \
+    --profile "$profile" \
+    --threshold 80 \
+    --file-threshold internal/netpol/policy.go=80
 }
 
 resolve_test_image() {

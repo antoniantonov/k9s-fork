@@ -20,7 +20,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-const DefaultResultLimit = 5_000
+const (
+	DefaultResultLimit        = 5_000
+	DefaultIstioRootNamespace = "istio-system"
+)
 
 type Direction uint8
 
@@ -393,6 +396,7 @@ type Snapshot struct {
 	CiliumNetworkPolicies            []unstructured.Unstructured
 	CiliumClusterwideNetworkPolicies []unstructured.Unstructured
 	IstioAuthorizationPolicies       []unstructured.Unstructured
+	IstioRootNamespace               string
 	Deployments                      []appsv1.Deployment
 	ReplicaSets                      []appsv1.ReplicaSet
 	Jobs                             []batchv1.Job

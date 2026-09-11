@@ -8,6 +8,7 @@ Automated cases are in `scripts/k9s-tui-smoke.exp`; setup/build phases are in `s
 |---|---|---|
 | Cluster/workload setup | `ensure-cluster`, `ensure-workloads`, `--force-workloads` | `netpol-demo-workloads.sh --check` runs before every path that can populate workloads |
 | Default Go validation | Full run | `go clean -cache -testcache` and `go test ./...` run before the scoped race suites |
+| Branch-diff coverage | `coverage` | Committed branch and local working-tree production Go changes are at least 80% covered overall, and `internal/netpol/policy.go` is at least 80%; `DIFF_COVER_BASE` overrides `master` |
 | Cached image build | Default run | A matching tree cache may be reused, but its tag is resolved and recorded as an immutable image ID |
 | Clean image build | `--clean-image` / `--no-image-cache` | A unique tag is built with `docker build --pull --no-cache`; `.image-cache` and other local images are never fallback candidates |
 | Exact-image TUI | Successful build, or `--only tui-tests --image REF` | The requested/built ref is resolved once and both the probe and Expect smoke run use that immutable image ID |
@@ -27,7 +28,9 @@ Automated cases are in `scripts/k9s-tui-smoke.exp`; setup/build phases are in `s
 | `s` | Subject picker lists Pod, Deployment, Job, Namespace subjects | `subject-picker-kinds` | Selection of each subject kind is manual-only in TUI; topology supports all |
 | `/` | Search Apply, Clear, Cancel | `search-apply-clear-cancel` | Uses `frontend` filter |
 | `r` | Auto-refresh toggle; no manual refresh shortcut is advertised | `auto-refresh-toggle`, `launch-npg-view` | Asserts status text and absence of `Ctrl-R` |
-| `y` | YAML view of selected NetworkPolicy; hidden for synthetic rules and CIDR applicability | `yaml-view`, `yaml-hidden-without-a-manifest` | Navigates to real rules by their advertised action |
+| Rule type column | Rules show the full policy type between name and ports for native and custom policies | `rule-policy-type-column` | Verifies `NetworkPolicy`, `CiliumNetworkPolicy`, `CiliumClusterwideNetworkPolicy`, and `AuthorizationPolicy` against live rules and their expected ports |
+| Custom policies | CNP-only frontend allow, CCNP-only cross-namespace monitoring allow, Istio TCP authorization deny, policy type, native resource opening, and YAML | `cilium-network-policy-details-and-yaml`, `cilium-clusterwide-policy-details-and-yaml`, `istio-authorization-policy-details-and-yaml`, `istio-authorization-effective-deny` | Applicability states and ports prove each custom API affects the effective graph rather than only appearing as metadata |
+| `y` | YAML view of selected Kubernetes, Cilium, or Istio policy; hidden for synthetic rules and CIDR applicability | `yaml-view`, three custom-policy cases, `yaml-hidden-without-a-manifest` | Navigates to real rules by their advertised action |
 | `Enter` | Rule selected → Applicability focus | `enter-navigation-rule-selected` | Headline behavior |
 | `Enter` | No rule selected → Effective Applicability focus | `enter-navigation-effective-applicability` | Exercises Egress from the default no-selection state; the selected-rule case exercises Ingress |
 | `Enter` | Primitives selected → details text focus | `enter-navigation-primitive-details` | Plain text detail pane; the case then verifies lowercase `o` opens the selected native primitive from Primitive Details |
@@ -40,7 +43,7 @@ Automated cases are in `scripts/k9s-tui-smoke.exp`; setup/build phases are in `s
 
 ## Authoritative automated smoke inventory
 
-The Expect summary contains these 23 cases, each with an explicit verdict:
+The Expect summary contains these 28 cases, each with an explicit verdict:
 
 `launch-npg-view`, `subject-picker-kinds`, `direction-toggles-placeholder`,
 `rules-primitives-global-toggle`, `primitive-kinds-apply-cancel-zero`,
@@ -52,6 +55,11 @@ The Expect summary contains these 23 cases, each with an explicit verdict:
 `open-primitive-from-direction-panels`,
 `open-primitive-from-applicability`,
 `open-primitive-disabled-in-rule-details`, `yaml-view`,
+`rule-policy-type-column`,
+`cilium-network-policy-details-and-yaml`,
+`cilium-clusterwide-policy-details-and-yaml`,
+`istio-authorization-policy-details-and-yaml`,
+`istio-authorization-effective-deny`,
 `yaml-hidden-without-a-manifest`, `auto-refresh-toggle`,
 `escape-clears-selection-before-back`,
 `ctrl-s-set-subject-from-subject-panel`,
@@ -66,7 +74,7 @@ The Expect summary contains these 23 cases, each with an explicit verdict:
 | Primitive kind | CIDR, Pod, Namespace, Deployment, Job | Demo topology + `primitive-kinds-apply-cancel-zero`; resource opening covered for selected primitive, exhaustive kind-by-kind opening manual-only |
 | Projection | Rules, Primitives | `rules-primitives-global-toggle`, Enter/open cases |
 | Direction | Ingress, Egress | Launch, direction toggle/focus, shared mode cases |
-| Access state | Allowed, Disallowed, Partial, Unknown, Partial-data, rule-only `[EMPTY]` | Demo topology covers Allowed/Disallowed/Partial/Unknown, including zero-pod-pair primitives as `Unknown`; rule-level `[EMPTY]` remains for empty subject-policy matches; Partial-data requires induced informer/API warning and is manual-only |
+| Access state | Allowed, Disallowed, Partial, Unknown, Partial-data, rule-only `[EMPTY]` | Demo topology covers Allowed/Disallowed/Partial/Unknown, including a deterministic Istio-caused Disallowed TCP path and zero-pod-pair primitives as `Unknown`; rule-level `[EMPTY]` remains for empty subject-policy matches; Partial-data requires induced informer/API warning and is manual-only |
 | Details target | Rule Details text, Applicability table with direction title, Effective Details, Effective Applicability with direction title, Primitive Details text | Enter navigation and Esc cases |
 | Dialogs | Subject picker, Primitive Kinds, Search | Dedicated dialog cases |
 | Resource opening | NetworkPolicy, Pod, Namespace, Deployment, Job; CIDR remains non-openable | Lowercase `o` covers selected native rows from Subject, both Rules direction panels, Applicability, and Primitive Details; exhaustive primitive-kind row selection is manual-only |

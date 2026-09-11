@@ -130,6 +130,8 @@ func (e *engine) RuleApplicability(result SubjectResult, direction Direction, id
 				overlap, known = intersectPermissions(selectedPermissions, oppositePermissions)
 				effective = effective && oppositeEvidence && knownPermissions(overlap) && (known || knownPermissions(overlap))
 			}
+			overlap, _ = intersectPermissions(overlap, pair.Decision.Permissions)
+			effective = effective && knownPermissions(overlap)
 			if !effective {
 				allEffective = false
 			} else {
@@ -772,7 +774,7 @@ func policyEvidence(
 		PolicyTypes: slices.Clone(policy.PolicyTypes), PeerIndex: peerIndex,
 		Ports: slices.Clone(permissions),
 		Summary: fmt.Sprintf("%s %s/%s %s rule %d matched peer %d",
-			policy.Type, policy.Namespace, policy.Name, rule.Action, rule.Index, peerIndex),
+			policy.Type.Kind(), policy.Namespace, policy.Name, rule.Action, rule.Index, peerIndex),
 	}
 }
 

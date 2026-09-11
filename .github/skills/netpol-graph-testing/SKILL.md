@@ -49,7 +49,13 @@ Only run the population path when `--check` fails, unless `--force-workloads` is
 .github/skills/netpol-graph-testing/scripts/run-tests.sh --only tui-tests --image sha256:<image-id>
 ```
 
-Phases: `preflight`, `ensure-cluster`, `ensure-workloads`, `go-tests`, `build-image`, `tui-tests`, `report`. Use `--only PHASE`, `--skip PHASE`, `--from PHASE`, `--rebuild`, `--clean-image`/`--no-image-cache`, `--image REF`, and `--force-workloads` as needed.
+Phases: `preflight`, `ensure-cluster`, `ensure-workloads`, `go-tests`,
+`coverage`, `build-image`, `tui-tests`, `report`. The coverage phase compares
+the merge base of `${DIFF_COVER_BASE:-master}` with the current working tree and
+requires at least 80% changed-statement coverage both overall and in
+`internal/netpol/policy.go`. Use `--only PHASE`, `--skip PHASE`, `--from PHASE`,
+`--rebuild`, `--clean-image`/`--no-image-cache`, `--image REF`, and
+`--force-workloads` as needed.
 
 Logs land under `.github/skills/netpol-graph-testing/runs/<timestamp>/`, with one log per phase plus the expect session log. `image.ref`, `image.id`, and `image.source` record the resolved tag/reference, immutable image ID, and selection path used by TUI tests. A clean build never falls back to `.image-cache` or another local image. Failures should be read from the named phase log; TUI stress timeouts send `SIGQUIT` to the container to capture goroutines.
 
@@ -63,7 +69,7 @@ parse this block rather than those lines:
 === smoke case summary ===
   PASS   launch-npg-view
   ...
-=== 21 case(s), 0 failure(s) ===
+=== 28 case(s), 0 failure(s) ===
 ```
 
 Every started case is guaranteed to record a verdict; a case that falls through
@@ -85,6 +91,11 @@ perl -pe 's/\e\[[0-9;?]*[a-zA-Z]//g; s/\e[()][AB012]//g; s/\r/\n/g' \
 `./internal/ui/` and `./internal/model/`. Those two packages carry pre-existing
 upstream races in `TestFlash`, `TestFlashBurst`, `TestShowPrompt` and
 `TestUpdateLogs`, which fail at the base commit and are unrelated to this view.
+
+The `coverage` phase reruns the changed NPG packages with a combined cover
+profile, tests the repository-local diff coverage parser, and fails unless the
+aggregate and `internal/netpol/policy.go` changed-statement thresholds both
+reach 80%.
 
 ## Cleanup
 

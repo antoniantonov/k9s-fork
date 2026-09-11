@@ -150,6 +150,21 @@ check_resource() {
   return 1
 }
 
+check_resource_absent() {
+  local description="$1" output
+  shift
+  if ! output=$("$@" 2>/dev/null); then
+    printf '  [error] %s\n' "$description"
+    return 1
+  fi
+  if [[ -n "$output" ]]; then
+    printf '  [stale] %s\n' "$description"
+    return 1
+  fi
+  printf '  [ok]   %s\n' "$description"
+  return 0
+}
+
 check_ready_pod_for_selector() {
   local description="$1" namespace="$2" selector="$3" ready
   ready=$("${KUBECTL[@]}" get pods -n "$namespace" -l "$selector" \
@@ -180,7 +195,13 @@ check_topology() {
   check_resource "untrusted deployment" "${KUBECTL[@]}" get deployment -n "$NS_UNTRUSTED" client || failures=$((failures + 1))
   check_resource "open deployment" "${KUBECTL[@]}" get deployment -n "$NS_OPEN" open-app || failures=$((failures + 1))
 
-  check_resource "app network policies" "${KUBECTL[@]}" get networkpolicy -n "$NS_APP" default-deny-all allow-frontend-ingress allow-monitoring-ingress allow-cidr-ingress allow-dns-egress allow-api-egress-db allow-db-ingress-api allow-api-egress-external allow-api-egress-ambiguous allow-ambiguous-ingress-api allow-cache-ingress-all || failures=$((failures + 1))
+  check_resource "app network policies" "${KUBECTL[@]}" get networkpolicy -n "$NS_APP" default-deny-all allow-authz-probe-ingress allow-cidr-ingress allow-dns-egress allow-api-egress-db allow-db-ingress-api allow-api-egress-external allow-api-egress-ambiguous allow-ambiguous-ingress-api allow-cache-ingress-all || failures=$((failures + 1))
+  check_resource_absent "obsolete allow-frontend-ingress is absent" \
+    "${KUBECTL[@]}" get networkpolicy -n "$NS_APP" allow-frontend-ingress --ignore-not-found -o name ||
+    failures=$((failures + 1))
+  check_resource_absent "obsolete allow-monitoring-ingress is absent" \
+    "${KUBECTL[@]}" get networkpolicy -n "$NS_APP" allow-monitoring-ingress --ignore-not-found -o name ||
+    failures=$((failures + 1))
   check_resource "web network policies" "${KUBECTL[@]}" get networkpolicy -n "$NS_WEB" web-default-deny-egress frontend-egress-to-api || failures=$((failures + 1))
   check_resource "untrusted network policy" "${KUBECTL[@]}" get networkpolicy -n "$NS_UNTRUSTED" deny-all-egress || failures=$((failures + 1))
   check_resource "CiliumNetworkPolicy CRD" "${KUBECTL[@]}" get crd ciliumnetworkpolicies.cilium.io || failures=$((failures + 1))
@@ -426,6 +447,10 @@ spec:
 YAML
 
 echo "==> applying namespaces, workloads and network policies (prefix: $PREFIX)"
+
+"${KUBECTL[@]}" delete networkpolicy -n "$NS_APP" \
+  allow-frontend-ingress allow-monitoring-ingress \
+  --ignore-not-found --wait=true >/dev/null 2>&1 || true
 
 "${KUBECTL[@]}" apply -f - <<YAML
 ################################################################################
@@ -824,12 +849,13 @@ spec:
   podSelector: {}
   policyTypes: [Ingress, Egress]
 ---
-# Single peer with BOTH selectors: intersection of namespace and pod selectors.
-# Named port "http" resolves to 8080 on the api pods.
+# This native allow makes open-app -> api:7070 valid at the network layer. The
+# Istio AuthorizationPolicy below intentionally omits 7070, so the effective
+# graph result proves that the authorization layer denies the TCP path.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: allow-frontend-ingress
+  name: allow-authz-probe-ingress
   namespace: ${NS_APP}
 spec:
   podSelector:
@@ -838,28 +864,11 @@ spec:
   ingress:
     - from:
         - namespaceSelector:
-            matchLabels: {team: web}
+            matchLabels: {team: open}
           podSelector:
-            matchLabels: {app: frontend}
+            matchLabels: {app: open-app}
       ports:
-        - {protocol: TCP, port: http}
----
-# namespaceSelector alone: every pod in matching namespaces.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-monitoring-ingress
-  namespace: ${NS_APP}
-spec:
-  podSelector:
-    matchLabels: {app: api}
-  policyTypes: [Ingress]
-  ingress:
-    - from:
-        - namespaceSelector:
-            matchLabels: {team: observability}
-      ports:
-        - {protocol: TCP, port: 9090}
+        - {protocol: TCP, port: 7070}
 ---
 # ipBlock ingress peer with except -> CIDR primitives in the ingress panel.
 apiVersion: networking.k8s.io/v1
@@ -1046,8 +1055,11 @@ spec:
   policyTypes: [Egress]
 ---
 ################################################################################
-# Optional policy APIs. These duplicate selected native allows so the graph can
-# expose each source type without changing the demo's established reachability.
+# Optional policy APIs. The Cilium policies are the only network-layer ingress
+# allows for their respective peers, so their applicability rows prove that
+# CNP and CCNP change effective reachability. Istio permits those paths but
+# excludes the native 7070 probe above, proving its independent authorization
+# layer affects the final result.
 ################################################################################
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy

@@ -68,8 +68,10 @@ type reachabilityBlock struct {
 	label     string
 	synthetic bool
 	primary   string
+	ruleType  string
 	secondary string
 	detail    string
+	peer      string
 }
 
 // blockCell is one rendered cell of a block row.
@@ -347,14 +349,12 @@ func (p *DirectionPanel) ContentHeight() int {
 	return rows + 2
 }
 
-// blockColumns returns the cells of a block's two rendered rows. The Rules
-// projection drops the leading state column: now that only applicable rules are
-// listed it carried nothing but the occasional badge, and the row color says
-// the same thing without spending a column on it.
+// blockColumns returns the cells of a block's two rendered rows. Rules show the
+// source policy type between the rule identity and its ports.
 func (p *DirectionPanel) blockColumns(block *reachabilityBlock) (top, bottom []blockCell) {
 	if p.projection == RulesProjection {
-		return []blockCell{{block.primary, true}, {block.secondary, true}},
-			[]blockCell{{block.detail, true}, {"", true}}
+		return []blockCell{{block.primary, true}, {block.ruleType, false}, {block.secondary, true}},
+			[]blockCell{{block.detail, true}, {"", false}, {block.peer, true}}
 	}
 	return []blockCell{{block.label, false}, {block.primary, true}, {block.secondary, true}},
 		[]blockCell{{"", false}, {block.detail, true}, {"", true}}
@@ -451,10 +451,20 @@ func (p *DirectionPanel) project() []reachabilityBlock {
 				label:     label,
 				synthetic: rule.Synthetic,
 				primary:   formatRuleName(rule),
+				ruleType:  rule.ID.SourceType().Kind(),
 				secondary: permissions,
-				detail:    fmt.Sprintf("subjects %d/%d · peer %s", rule.SubjectMatchCount, rule.SubjectPodCount, valueOrDash(rule.PeerSummary)),
+				detail:    fmt.Sprintf("subjects %d/%d", rule.SubjectMatchCount, rule.SubjectPodCount),
+				peer:      "peer " + valueOrDash(rule.PeerSummary),
 			}
-			block.search = strings.Join([]string{block.label, block.primary, block.secondary, block.detail, strings.Join(rule.Warnings, " ")}, " ")
+			block.search = strings.Join([]string{
+				block.label,
+				block.primary,
+				block.ruleType,
+				block.secondary,
+				block.detail,
+				block.peer,
+				strings.Join(rule.Warnings, " "),
+			}, " ")
 			if matchesReachabilityFilter(block.search, p.filter) {
 				blocks = append(blocks, block)
 			}
@@ -1018,9 +1028,9 @@ func colorName(color tcell.Color) string {
 func RuleDetailsText(rule netpol.RuleResult) string {
 	var b strings.Builder
 	state, label := ruleState(&rule)
-	fmt.Fprintf(&b, "Policy: %s/%s\nPolicy type: %s (%s)\nPolicy API version: %s\nPolicy UID: %s\nDirection: %s\nAction: %s\nRule index: %d\nState: %s (%s)\nPolicy pod selector: %s\nSubjects: %d/%d\nPeers:\n",
+	fmt.Fprintf(&b, "Policy: %s/%s\nPolicy type: %s\nPolicy API version: %s\nPolicy UID: %s\nDirection: %s\nAction: %s\nRule index: %d\nState: %s (%s)\nPolicy pod selector: %s\nSubjects: %d/%d\nPeers:\n",
 		valueOrDash(rule.ID.PolicyNamespace), valueOrDash(rule.ID.PolicyName),
-		rule.ID.SourceType(), rule.ID.SourceType().Kind(), valueOrDash(rule.ID.PolicyVersion),
+		rule.ID.SourceType().Kind(), valueOrDash(rule.ID.PolicyVersion),
 		valueOrDash(string(rule.ID.PolicyUID)),
 		rule.ID.Direction, rule.ID.Action.String(),
 		rule.ID.Index, state, label, valueOrDash(rule.PolicySelector),

@@ -151,7 +151,7 @@ proc ensure_primitives {} {
   assert_screen {Ingress · Primitives} 15
 }
 
-proc verify_custom_policy_rule {policy type_pattern api_pattern} {
+proc verify_custom_policy_rule {policy type_pattern api_pattern resource_pattern peer_pattern port_pattern} {
   ensure_rules
   focus_ingress
   send_key "/"
@@ -161,11 +161,37 @@ proc verify_custom_policy_rule {policy type_pattern api_pattern} {
   send_key "\r"
   if {![assert_screen $policy 15]} { return }
   send_key "\033\[B"
-  if {![assert_all_screen [list $policy $type_pattern {Rule Details} {<y>}] 20]} { return }
+  if {![assert_all_screen [list $policy $type_pattern {Rule Details} {<o>} {<y>}] 20]} { return }
+  send_key "o"
+  if {![assert_screen $resource_pattern 20]} { return }
+  send_key "\033"
   send_key "y"
   if {![assert_screen $api_pattern 20]} { return }
   send_key "\033"
+  send_key "\r"
+  if {![assert_screen {Applicability \(Ingress\)} 15]} { return }
+  send_key "/"
+  if {![assert_screen {Reachability Search|Filter:} 10]} { return }
+  send_key $peer_pattern
+  send_key "\t"
+  send_key "\r"
+  if {![assert_all_screen [list $peer_pattern {Allowed} $port_pattern] 20]} { return }
   finish_case
+}
+
+proc verify_rule_type_column {policy rendered_name type_pattern port_pattern} {
+  send_key "/"
+  if {![assert_screen {Reachability Search|Filter:} 10]} { return 0 }
+  send_key $policy
+  send_key "\t"
+  send_key "\r"
+  set row_pattern "${rendered_name}(.|\r|\n)*${type_pattern}(.|\r|\n)*${port_pattern}"
+  if {![assert_screen $row_pattern 20]} { return 0 }
+  send_key "/"
+  if {![assert_screen {Filter:} 10]} { return 0 }
+  send_key "\t\t"
+  send_key "\r"
+  return [assert_screen {Ingress · Rules} 10]
 }
 
 # The view opens focused on the subject panel, which is where the Tab ring
@@ -462,14 +488,47 @@ if {[select_direction_row_with_hint {<y>} "a real rule with the YAML hint"]} {
   }
 }
 
+start_case "rule-policy-type-column"
+ensure_rules
+focus_ingress
+set type_column_ok 1
+foreach {policy rendered_name type_pattern port_pattern} {
+  allow-authz-probe-ingress {netpol-demo-app/allow-authz-probe-ingress #0} {NetworkPolicy} {TCP/7070}
+  demo-cnp-frontend {netpol-demo-app/demo-cnp-frontend #0} {CiliumNetworkPolicy} {TCP/8080}
+  demo-ccnp-monitoring {demo-ccnp-monitoring #0} {CiliumClusterwideNetworkPolicy} {TCP/9090}
+  demo-authz-api {netpol-demo-app/demo-authz-api #0} {AuthorizationPolicy} {TCP/8080}
+} {
+  if {![verify_rule_type_column $policy $rendered_name $type_pattern $port_pattern]} {
+    set type_column_ok 0
+    break
+  }
+}
+if {$type_column_ok} { finish_case }
+
 start_case "cilium-network-policy-details-and-yaml"
-verify_custom_policy_rule demo-cnp-frontend {Policy type: cnp \(CiliumNetworkPolicy\)} {cilium\.io/v2}
+verify_custom_policy_rule demo-cnp-frontend {Policy type: CiliumNetworkPolicy} {cilium\.io/v2} {ciliumnetworkpolicies|Viewing cilium\.io/v2/ciliumnetworkpolicies} {Deployment netpol-demo-web/frontend} {TCP/8080}
 
 start_case "cilium-clusterwide-policy-details-and-yaml"
-verify_custom_policy_rule demo-ccnp-monitoring {Policy type: ccnp \(CiliumClusterwideNetworkPolicy\)} {cilium\.io/v2}
+verify_custom_policy_rule demo-ccnp-monitoring {Policy type: CiliumClusterwideNetworkPolicy} {cilium\.io/v2} {ciliumclusterwidenetworkpolicies|Viewing cilium\.io/v2/ciliumclusterwidenetworkpolicies} {Deployment netpol-demo-monitoring/prometheus} {TCP/9090}
 
 start_case "istio-authorization-policy-details-and-yaml"
-verify_custom_policy_rule demo-authz-api {Policy type: authz \(AuthorizationPolicy\)} {security\.istio\.io/v1}
+verify_custom_policy_rule demo-authz-api {Policy type: AuthorizationPolicy} {security\.istio\.io/v1} {authorizationpolicies|Viewing security\.istio\.io/v1/authorizationpolicies} {Deployment netpol-demo-web/frontend} {TCP/8080}
+
+start_case "istio-authorization-effective-deny"
+ensure_rules
+focus_ingress
+send_key "\r"
+if {[assert_screen {Effective Applicability \(Ingress\)} 15]} {
+  send_key "/"
+  if {[assert_screen {Reachability Search|Filter:} 10]} {
+    send_key "Deployment netpol-demo-open/open-app"
+    send_key "\t"
+    send_key "\r"
+    if {[assert_all_screen {{Deployment netpol-demo-open/open-app} {Disallowed} {no ports}} 20]} {
+      pass_case
+    }
+  }
+}
 
 start_case "yaml-hidden-without-a-manifest"
 ensure_rules
@@ -479,16 +538,29 @@ send_key "\033\[B"
 if {[screen_matches {<y>} 5]} {
   fail_case "YAML is advertised for the synthetic default-deny row"
 } elseif {[select_direction_row_with_hint {<y>} "a real rule with the YAML hint"]} {
-  # Walk into the applicability table and land on the CIDR row, which is not a
-  # Kubernetes resource and therefore has no manifest either.
+  # Filter the applicability table to a CIDR so selection does not depend on
+  # how many CIDR policies the custom-policy fixtures add.
   send_key "\r"
-  assert_screen {CIDR 192\.168\.0\.0/16} 15
-  if {[screen_matches {<y>} 5]} {
-    fail_case "YAML is advertised for a CIDR applicability row"
-  } else {
-    send_key "\033\[B"
-    assert_screen {<y>} 20
-    pass_case
+  if {[assert_screen {Applicability \(Ingress\)} 15]} {
+    send_key "/"
+    if {[assert_screen {Reachability Search|Filter:} 10]} {
+      send_key "CIDR 192.168.0.0/16"
+      send_key "\t"
+      send_key "\r"
+      if {[assert_screen {CIDR 192\.168\.0\.0/16} 15]} {
+        if {[screen_matches {<y>} 5]} {
+          fail_case "YAML is advertised for a CIDR applicability row"
+        } else {
+          send_key "/"
+          assert_screen {Filter:} 10
+          send_key "\t\t"
+          send_key "\r"
+          if {[select_direction_row_with_hint {<y>} "a resource applicability row with the YAML hint"]} {
+            pass_case
+          }
+        }
+      }
+    }
   }
 }
 
