@@ -115,6 +115,7 @@ func (e *engine) RuleApplicability(result SubjectResult, direction Direction, id
 		row := ApplicabilityRow{Primitive: *primitive}
 		allEffective := len(primitive.PairDecisions) > 0
 		anyEffective := false
+		unknownPairs := 0
 		var permissions []PortPermission
 		for pairIndex := range primitive.PairDecisions {
 			pair := &primitive.PairDecisions[pairIndex]
@@ -124,45 +125,57 @@ func (e *engine) RuleApplicability(result SubjectResult, direction Direction, id
 				continue
 			}
 			row.PeerMatches = true
-			selectedPermissions := evidencePermissions(pair.Decision.Evidence, &id)
-			effective := pair.Decision.State == AccessAllowed
-			overlap := selectedPermissions
-			if primitive.Ref.Kind != PrimitiveCIDR {
-				oppositePermissions, oppositeEvidence := evidencePermissionsForDirection(pair.Decision.Evidence, opposite(direction))
-				var known bool
-				overlap, known = intersectPermissions(selectedPermissions, oppositePermissions)
-				effective = effective && oppositeEvidence && knownPermissions(overlap) && (known || knownPermissions(overlap))
+			if id.Action == PolicyActionDeny || pair.Decision.State == AccessDisallowed {
+				allEffective = false
+				continue
 			}
-			overlap, _ = intersectPermissions(overlap, pair.Decision.Permissions)
-			effective = effective && knownPermissions(overlap)
+			selectedPermissions := evidencePermissions(pair.Decision.Evidence, &id)
+			possible := selectedPermissions
+			if primitive.Ref.Kind != PrimitiveCIDR {
+				oppositePermissions, _ := evidencePermissionsForDirection(pair.Decision.Evidence, opposite(direction))
+				possible, _ = intersectPermissions(possible, oppositePermissions)
+			}
+			overlap, _ := intersectPermissions(possible, pair.Decision.Permissions)
+			var guaranteed []PortPermission
+			for _, permission := range overlap {
+				if !permission.Unknown {
+					guaranteed = append(guaranteed, permission)
+				}
+			}
+			effective := len(guaranteed) > 0
+			uncertain := !effective && len(overlap) > 0
+			if primitive.Ref.Kind == PrimitiveCIDR && slices.Contains(pair.Decision.Warnings, cidrPartialDeny) {
+				// CIDR allow evidence already excludes whole-range denies.
+				// Only its remaining possible ports can vary by address.
+				unguaranteed, _ := subtractPermissions(possible, guaranteed)
+				if len(unguaranteed) > 0 {
+					effective, uncertain = false, true
+				}
+			}
 			if !effective {
 				allEffective = false
-				if primitive.Ref.Kind == PrimitiveCIDR && pair.Decision.State == AccessUnknown {
-					for _, permission := range overlap {
-						if !permission.Unknown {
-							permissions = append(permissions, permission)
-						}
-					}
-				}
 			} else {
 				anyEffective = true
-				permissions = append(permissions, overlap...)
 			}
+			if uncertain {
+				unknownPairs++
+			}
+			permissions = append(permissions, guaranteed...)
 		}
 		row.OppositeSideAllows = row.PeerMatches && allEffective
 		row.Permissions = canonicalPermissions(permissions)
 		switch {
 		case primitive.State == AccessPartialData:
 			row.EffectiveState = AccessPartialData
-		case primitive.State == AccessUnknown && row.PeerMatches && id.Action != PolicyActionDeny:
-			row.EffectiveState = AccessUnknown
 		case len(primitive.PairDecisions) == 0:
 			// Nothing was evaluated: no concrete pod pairs exist, so the rule's
 			// effect on this peer is unknown rather than denied.
 			row.EffectiveState = AccessUnknown
 		case allEffective:
 			row.EffectiveState = AccessAllowed
-		case anyEffective:
+		case unknownPairs == len(primitive.PairDecisions):
+			row.EffectiveState = AccessUnknown
+		case anyEffective || unknownPairs > 0:
 			row.EffectiveState = AccessPartial
 		default:
 			row.EffectiveState = AccessDisallowed
@@ -348,18 +361,18 @@ func (e *engine) evaluatePair(x *snapshotIndex, source, destination *corev1.Pod)
 	case egress.State == AccessDisallowed || ingress.State == AccessDisallowed:
 		decision.State = AccessDisallowed
 		decision.Explanation = "traffic is denied because source egress and destination ingress must both allow it"
+	case len(permissions) == 0:
+		decision.State = AccessDisallowed
+		decision.Explanation = "source egress and destination ingress allow no common protocol/port"
 	case knownPermissions(permissions):
 		decision.State = AccessAllowed
 		decision.Explanation = "source egress and destination ingress both definitely allow traffic"
 		if egress.State == AccessUnknown || ingress.State == AccessUnknown || !known {
 			decision.Warnings = uniqueStrings(append(decision.Warnings, "additional traffic may be allowed by an unresolved named destination port"))
 		}
-	case egress.State == AccessUnknown || ingress.State == AccessUnknown || !known:
+	default:
 		decision.State = AccessUnknown
 		decision.Explanation = "traffic cannot be determined because a named destination port is ambiguous"
-	case len(permissions) == 0:
-		decision.State = AccessDisallowed
-		decision.Explanation = "source egress and destination ingress allow no common protocol/port"
 	}
 	return decision
 }
@@ -467,6 +480,16 @@ func (e *engine) evaluateCIDRSide(x *snapshotIndex, direction Direction, pod *co
 		// A different containment-only result means permissions can vary within
 		// the CIDR, not that every address is uniformly denied.
 		possible := evaluate(contains)
+		// Bound each allow's evidence by the post-deny possible result before
+		// attributing uncertainty to that selected rule. Keep deny evidence
+		// and the rule's separately recorded declared ports intact.
+		for index := range decision.Evidence {
+			item := &decision.Evidence[index]
+			if item.RuleID.Action != PolicyActionDeny {
+				item.Ports, _ = intersectPermissions(item.Ports, possible.Permissions)
+			}
+		}
+		decision.Evidence = uniqueEvidence(decision.Evidence)
 		if permissionsKey(decision.Permissions) != permissionsKey(possible.Permissions) {
 			decision.State = AccessUnknown
 			decision.Explanation = cidrPartialDeny
@@ -616,7 +639,7 @@ func combinePolicyLayers(network, authorization Decision) Decision {
 	case authorization.State == AccessDisallowed:
 		decision.State = AccessDisallowed
 		decision.Explanation = "Istio authorization permits no TCP traffic and no non-TCP network permissions remain"
-	case len(permissions) == 0 && network.State != AccessUnknown && authorization.State != AccessUnknown && known:
+	case len(permissions) == 0:
 		decision.State = AccessDisallowed
 		decision.Explanation = "network and authorization policy layers permit no common TCP traffic"
 	default:

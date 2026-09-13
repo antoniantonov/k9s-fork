@@ -12,11 +12,14 @@ Automated cases are in `scripts/k9s-tui-smoke.exp`; setup/build phases are in `s
 | Cached image build | Default run | Tracked and untracked build sources affect the fingerprint; errors cannot reuse a cache; its tag is resolved and recorded as an immutable image ID |
 | Clean image build | `--clean-image` / `--no-image-cache` | A unique tag is built with `docker build --pull --no-cache`; `.image-cache` and other local images are never fallback candidates |
 | Exact-image TUI | Successful build, or `--only tui-tests --image REF` | The requested/built ref is resolved once and both the probe and Expect smoke run use that immutable image ID |
+| Startup/command readiness | Each fresh process and edge-subject command | Bounded fresh-frame waits require the expected subject and ready workload rows, open then closed command prompt, and no evaluation/workload-loading marker; Partial Data is permitted; failed setup stops further input but retains explicit verdicts |
+| Shared terminal reader | Snapshot, regex, grouped, navigation and prompt waits | One drain/repaint per operation; terminal cells and split escapes advance incrementally without repeatedly parsing the full prefix; the final-size bottom breadcrumb is required, grouped assertions share one frame, and the read deadline begins after bounded preparation |
+| Fragmented applicability repaint | Paired and selected-rule rows | A single fresh repaint accumulates chunks until the requested heading, exact peer and closing border exist, bounded by 20 seconds; state/flag/port mismatches are rejected, not polled until they change |
 | Failed build isolation | Full or `--from build-image` run | TUI fails without consulting `.image-cache` or another local k9s image |
 | Uncertainty sequencing | Last two `tui-tests` suites | Known fixtures first; identity and unsupported Cilium each get a unique owned policy and a fresh TUI process; cleanup and normal `--check` run after success/failure |
 | Cleanup safety | `--delete`, `--probe ... --delete` | No implicit cluster bootstrap, no shared CRD deletion; conflicting check/delete flags are rejected before external commands; probes require exact ownership |
 | Verdict accounting | Pure manifest + combined summary | Exactly 70 expected cases: 66 known, 2 identity, 2 unsupported; missing, duplicate, unexpected and failed verdicts fail |
-| Offline harness regression tests | Explicit `go test ./.github/skills/netpol-graph-testing/diffcover` | Tests include shell stubs, fixture JSON/scoping, whole-file/procedure Tcl compilation, fresh row/port parsing, and summary reconciliation without live tools |
+| Offline harness regression tests | Explicit `go test ./.github/skills/netpol-graph-testing/diffcover` | Tests include shell stubs, 18-pod/15-policy inventories/scoping, whole-file/procedure Tcl compilation, fresh headerless rule/applicability parsing, exact CIDR/selected-rule contracts, delayed startup/prompt frames, effective unsupported diagnostics, cleanup after failures/signals, full population reaching its tail, and summary reconciliation without live tools |
 
 ## Live TUI matrix
 
@@ -109,8 +112,8 @@ using another row's `Disallowed` text or ports.
 | `ccnp-egress-deny` | S/ccnp-client → D/ccnp-denied | Target role `egress-denied`; CCNP source deny removes 9091/9092 | Disallowed; no ports |
 | `ccnp-unmatched-source` | O/control → D/ccnp-server | Scenario source namespace label and workload selector do not match | Disallowed; no ports |
 | `ccnp-unmatched-target` | S/ccnp-client → O/control | Scenario destination namespace label and workload selector do not match | Disallowed; no ports |
-| `istio-ports` | S/authz-client → D/authz-server | Native source/destination permit TCP 8080/8081, UDP 5353, SCTP 9000; identity-free destination ALLOW permits TCP 8080/8081 and DENY removes 8081 | Allowed; TCP/8080, UDP/5353, SCTP/9000 |
-| `istio-no-tcp` | S/authz-client → D/authz-no-tcp | Same native permissions; destination ALLOW has empty `rules` | Allowed; UDP/5353, SCTP/9000; explicitly no TCP |
+| `istio-ports` | S/authz-client → D/authz-server | Native source/destination permit TCP 8080/8081, UDP 5353, SCTP 9000; identity-free destination ALLOW permits TCP 8080/8081 and DENY removes 8081 | Allowed; exact text `SCTP/9000, TCP/8080, UDP/5353` |
+| `istio-no-tcp` | S/authz-client → D/authz-no-tcp | Same native permissions; destination ALLOW has empty `rules` | Allowed; exact text `SCTP/9000, UDP/5353`; explicitly no TCP |
 | `istio-empty-allow` | S/authz-client → D/authz-closed | TCP/8080-only destination network allow plus empty AuthorizationPolicy ALLOW | Disallowed; no ports |
 
 ### Empty Cilium allow rules: four required regression cases
@@ -131,15 +134,36 @@ Do not replace them with explicit `ingressDeny`/`egressDeny` fixtures.
 Every case checks one name/full-type/ports row, selected rule action/API version,
 `o` resource opening followed by the selected resource's YAML, return to the
 same graph rule, direct graph `y`, then selected-rule applicability.
+The Rules panel uses **headerless blocks**, with the full type between the name
+and declared ports. Raw declared lists remain separate entries, in canonical
+order; they are not the merged effective permission summary.
 
 | Exact case name | Subject/direction and origin | Rule ports → exact selected applicability ports |
 |---|---|---|
-| `cnp-ingress-rule-navigation` | D/cnp-server, Ingress; D/cnp-target, CiliumNetworkPolicy ALLOW | TCP 8081–8082 → TCP/8081 from S/cnp-client |
-| `cnp-egress-spec-rule-navigation` | S/cnp-client, Egress; S/cnp-source `specs[0]`, CiliumNetworkPolicy ALLOW | TCP 8080–8081 → TCP/8081 to D/cnp-server |
-| `ccnp-ingress-spec-rule-navigation` | D/ccnp-server, Ingress; `${prefix}-edge-ccnp` target spec, CiliumClusterwideNetworkPolicy ALLOW | TCP 9091–9092 → TCP/9092 from S/ccnp-client |
-| `ccnp-egress-spec-rule-navigation` | S/ccnp-client, Egress; same cluster policy's source spec | TCP 9090–9092 → TCP/9092 to D/ccnp-server |
-| `istio-ingress-rule-navigation` | D/authz-server, Ingress; D/authz-ports-allow, AuthorizationPolicy ALLOW | TCP 8080–8081 → TCP/8080 from S/authz-client |
-| `native-egress-istio-opposite-navigation` | S/authz-client, Egress; S/authz-source-network, NetworkPolicy | TCP 8080–8081, UDP 5353, SCTP 9000 → TCP/8080, UDP/5353, SCTP/9000 to D/authz-server |
+| `cnp-ingress-rule-navigation` | D/cnp-server, Ingress; D/cnp-target, CiliumNetworkPolicy ALLOW | `TCP/8081, TCP/8082` → `TCP/8081` from S/cnp-client |
+| `cnp-egress-spec-rule-navigation` | S/cnp-client, Egress; S/cnp-source `specs[0]`, CiliumNetworkPolicy ALLOW | `TCP/8080, TCP/8081` → `TCP/8081` to D/cnp-server |
+| `ccnp-ingress-spec-rule-navigation` | D/ccnp-server, Ingress; `${prefix}-edge-ccnp` target spec, CiliumClusterwideNetworkPolicy ALLOW | `TCP/9091, TCP/9092` → `TCP/9092` from S/ccnp-client |
+| `ccnp-egress-spec-rule-navigation` | S/ccnp-client, Egress; same cluster policy's source spec | `TCP/9090, TCP/9091, TCP/9092` → `TCP/9092` to D/ccnp-server |
+| `istio-ingress-rule-navigation` | D/authz-server, Ingress; D/authz-ports-allow, AuthorizationPolicy ALLOW | `TCP/8080, TCP/8081` → `TCP/8080` from S/authz-client |
+| `native-egress-istio-opposite-navigation` | S/authz-client, Egress; S/authz-source-network, NetworkPolicy | `SCTP/9000, TCP/8080, TCP/8081, UDP/5353` → `SCTP/9000, TCP/8080, UDP/5353` to D/authz-server |
+
+All six positive selected rows require literal Peer `true`, Opposite `true`.
+The following controls run **within** these existing cases, before the case's
+single verdict; they do not add or replace manifest cases:
+
+| Existing case | Additional selected rule / peer | Exact selected row |
+|---|---|---|
+| `cnp-egress-spec-rule-navigation` | Source ALLOW / D/cnp-mismatch (only TCP/9090 ingress) | Peer `true`, Opposite `false`, Disallowed, `no ports` |
+| `cnp-egress-spec-rule-navigation` | Source ALLOW / O/control (unmatched selector) | Peer `false`, Opposite `false`, Disallowed, `no ports` |
+| `cnp-egress-spec-rule-navigation` | Source DENY in `specs[1]` / D/cnp-denied | Peer `true`, Opposite `false`, Disallowed, `no ports` |
+| `ccnp-ingress-spec-rule-navigation` | Target DENY TCP/9091 / S/ccnp-client | Peer `true`, Opposite `false`, Disallowed, `no ports`, despite effective TCP/9092 remaining Allowed |
+
+The first rule index resets independently per spec/direction/action. Therefore
+both the source CNP allow in `specs[0]` and deny in `specs[1]` display the same
+policy reference followed by `#0`. Their distinct model identities are not
+visual spec suffixes. The checks distinguish action/content and reject an
+invented Spec index detail field. Full policy types are required; shorthand
+labels cannot satisfy the row or selected-details assertions.
 
 The selected Istio rule is TCP-only; non-TCP pass-through is asserted separately
 in the **effective** paired cases. No synthetic source-local Istio egress rule
@@ -154,8 +178,12 @@ is created.
   prove its outgoing permissions remain unchanged.
 - `cilium-cidr-narrow-deny`: S/cidr-client allows TCP/443 to
   `203.0.113.0/24` except `203.0.113.64/26` and denies TCP/443 to the narrower
-  `203.0.113.128/25`. The broad CIDR row must not advertise the whole range as
-  Allowed. CIDR handling must not fabricate an opposite pod check.
+  `203.0.113.128/25`. Two fresh effective egress screens must identify that
+  subject and each exact prefix once. The broad `/24` is **Unknown** and the
+  fully denied `/25` is **Disallowed**; both require exact `no ports`, Peer
+  `true` and Opposite `n/a`. Neither screen may report snapshot-wide
+  **Partial Data**. An arbitrary non-Allowed state is insufficient: the broad
+  range is not uniformly Disallowed, and no opposite pod check is fabricated.
 
 ### Snapshot-wide uncertainty: four isolated final cases
 
@@ -168,7 +196,7 @@ unique run ID; only that exact policy may be deleted.
 |---|---|---|
 | identity / `istio-identity-ingress-partial-data` | D/probe-identity-`${id}` selects D/authz-identity; ALLOW source namespace S is certificate-derived | Destination ingress row for S/authz-client is Partial Data; UDP/5353 and SCTP/9000 remain, no ports outside the declared network set; selected policy has an identity/mTLS uncertainty note |
 | identity / `istio-identity-egress-partial-data` | Same policy viewed from S/authz-client egress | Same Partial Data/non-TCP expectations for D/authz-identity; no assertion treats inferred TCP identity as known |
-| unsupported / `unsupported-cilium-rule-details` | S/probe-unsupported-`${id}` selects S/uncertain-client with `toFQDNs` | Full CiliumNetworkPolicy identity/API version, field-specific warning and Partial Data are visible in selected rule details |
+| unsupported / `unsupported-cilium-rule-details` | S/probe-unsupported-`${id}` selects S/uncertain-client with `toFQDNs` | Subject `PARTIAL DATA` badge and applicability `Partial Data` cells, plus the exact snapshot resource `"ciliumnetworkpolicies"`, owned namespace/policy, `egress allow rule 0` and `toFQDNs requires live DNS resolution` diagnostic in **Effective Details**. The details summary itself uses lowercase `partial data`. Disabled raw rules need not be selectable; known navigation cases retain API version/YAML checks and the legacy case name remains unchanged |
 | unsupported / `unsupported-snapshot-egress-partial-data` | Unrelated S/cnp-client → D/cnp-server while that probe is active | Egress row is Partial Data with exact TCP/8081, proving snapshot-wide uncertainty is visible without changing known network permissions |
 
 **Total:** 28 original + 26 paired + 4 empty-rule + 6 navigation + 2 controls =
@@ -187,7 +215,7 @@ EXPECT_CASE_MANIFEST=1 expect .github/skills/netpol-graph-testing/scripts/k9s-tu
 | Primitive kind | CIDR, Pod, Namespace, Deployment, Job | Demo topology + `primitive-kinds-apply-cancel-zero`; resource opening covered for selected primitive, exhaustive kind-by-kind opening manual-only |
 | Projection | Rules, Primitives | `rules-primitives-global-toggle`, Enter/open cases |
 | Direction | Ingress, Egress | Launch, direction toggle/focus, shared mode cases |
-| Access state | Allowed, Disallowed, Partial, Unknown, Partial Data, rule-only `[EMPTY]` | Original topology preserves mixed/ambiguous/zero-pod cases; new exact custom positive/negative rows cover both directions; isolated identity/unsupported probes automate Partial Data without contaminating known fixtures |
+| Access state | Allowed, Disallowed, Partial, Unknown, Partial Data, rule-only `[EMPTY]` | Original topology preserves mixed/ambiguous/zero-pod cases (zero-pair Peer/Opposite/Ports are `n/a`); new exact custom positive/negative rows cover both directions; broad CIDR overlap is Unknown without Partial Data; isolated identity/unsupported probes automate snapshot-wide Partial Data without contaminating known fixtures |
 | Details target | Rule Details text, Applicability table with direction title, Effective Details, Effective Applicability with direction title, Primitive Details text | Enter navigation and Esc cases |
 | Dialogs | Subject picker, Primitive Kinds, Search | Dedicated dialog cases |
 | Resource opening | NetworkPolicy, Pod, Namespace, Deployment, Job; CIDR remains non-openable | Lowercase `o` covers selected native rows from Subject, both Rules direction panels, Applicability, and Primitive Details; exhaustive primitive-kind row selection is manual-only |

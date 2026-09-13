@@ -129,6 +129,142 @@ func TestUnknownEvidenceRetainsProtocolIdentity(t *testing.T) {
 	require.Len(t, evidence, 2)
 }
 
+func TestIntersectUncertainPermissionBounds(t *testing.T) {
+	tcp, udp := corev1.ProtocolTCP, corev1.ProtocolUDP
+	http := intstr.FromString("http")
+	metrics := intstr.FromString("metrics")
+	named := PortPermission{Protocol: tcp, Port: &http, Unknown: true}
+	tests := []struct {
+		name        string
+		left, right PortPermission
+		want        []PortPermission
+		known       bool
+	}{
+		{"disjoint-ports", uncertainRange(tcp, 8080, 8080), rangePermission(tcp, 9090, 9090), nil, true},
+		{"disjoint-ranges", uncertainRange(tcp, 8080, 8085), rangePermission(tcp, 8090, 8100), nil, true},
+		{"overlapping-ranges", uncertainRange(tcp, 8080, 8085), rangePermission(tcp, 8083, 8090),
+			[]PortPermission{uncertainRange(tcp, 8083, 8085)}, false},
+		{"disjoint-uncertain-ranges", uncertainRange(tcp, 8080, 8085), uncertainRange(tcp, 8090, 8100), nil, true},
+		{"overlapping-uncertain-ranges", uncertainRange(tcp, 8080, 8085), uncertainRange(tcp, 8083, 8090),
+			[]PortPermission{uncertainRange(tcp, 8083, 8085)}, false},
+		{"different-protocol", uncertainRange(tcp, 8080, 8085), rangePermission(udp, 8080, 8085), nil, true},
+		{"bounded-by-numeric", named, rangePermission(tcp, 9090, 9090),
+			[]PortPermission{uncertainRange(tcp, 9090, 9090)}, false},
+		{"unbounded-name", named, PortPermission{Protocol: tcp, All: true}, []PortPermission{named}, false},
+		{"same-unresolved-name", named, named, []PortPermission{named}, false},
+		{"different-unresolved-names", named, PortPermission{Protocol: tcp, Port: &metrics, Unknown: true},
+			[]PortPermission{{Protocol: tcp, Unknown: true}}, false},
+		{"unbounded-unknown", PortPermission{Protocol: tcp, Unknown: true}, rangePermission(tcp, 8080, 8085),
+			[]PortPermission{uncertainRange(tcp, 8080, 8085)}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, sides := range [][2]PortPermission{{test.left, test.right}, {test.right, test.left}} {
+				overlap, known := intersectPermissions([]PortPermission{sides[0]}, []PortPermission{sides[1]})
+				require.Equal(t, test.known, known)
+				require.Equal(t, canonicalPermissions(test.want), overlap)
+			}
+		})
+	}
+}
+
+func TestSubtractUncertainPermissionBounds(t *testing.T) {
+	tcp, udp := corev1.ProtocolTCP, corev1.ProtocolUDP
+	http := intstr.FromString("http")
+	named := PortPermission{Protocol: tcp, Port: &http, Unknown: true}
+	tests := []struct {
+		name          string
+		allowed, deny PortPermission
+		want          []PortPermission
+		known         bool
+	}{
+		{"named-deny-retains-allow-bound", rangePermission(tcp, 8080, 8085), named,
+			[]PortPermission{uncertainRange(tcp, 8080, 8085)}, false},
+		{"known-deny-removes-uncertain-bound", uncertainRange(tcp, 8080, 8085), rangePermission(tcp, 8080, 8085), nil, true},
+		{"known-deny-splits-uncertain-bound", uncertainRange(tcp, 8080, 8090), rangePermission(tcp, 8083, 8087),
+			[]PortPermission{uncertainRange(tcp, 8080, 8082), uncertainRange(tcp, 8088, 8090)}, false},
+		{"uncertain-deny-disjoint", rangePermission(tcp, 8080, 8085), uncertainRange(tcp, 8090, 8100),
+			[]PortPermission{rangePermission(tcp, 8080, 8085)}, true},
+		{"uncertain-deny-overlap", rangePermission(tcp, 8080, 8090), uncertainRange(tcp, 8083, 8087),
+			[]PortPermission{rangePermission(tcp, 8080, 8082), uncertainRange(tcp, 8083, 8087), rangePermission(tcp, 8088, 8090)}, false},
+		{"both-uncertain", uncertainRange(tcp, 8080, 8090), uncertainRange(tcp, 8083, 8087),
+			[]PortPermission{uncertainRange(tcp, 8080, 8090)}, false},
+		{"other-protocol-unaffected", rangePermission(udp, 53, 53), named,
+			[]PortPermission{rangePermission(udp, 53, 53)}, true},
+		{"numeric-deny-bounds-unresolved-name", named, rangePermission(tcp, 80, 90),
+			[]PortPermission{uncertainRange(tcp, 1, 79), uncertainRange(tcp, 91, 65535)}, false},
+		{"unbounded-named-deny", PortPermission{Protocol: tcp, All: true}, named,
+			[]PortPermission{{Protocol: tcp, All: true, Unknown: true}}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			remaining, known := subtractPermissions([]PortPermission{test.allowed}, []PortPermission{test.deny})
+			require.Equal(t, test.known, known)
+			require.Equal(t, canonicalPermissions(test.want), remaining)
+		})
+	}
+}
+
+func TestUnknownEvidenceRetainsNumericBounds(t *testing.T) {
+	first, second := uncertainRange(corev1.ProtocolTCP, 8080, 8085), uncertainRange(corev1.ProtocolTCP, 9090, 9095)
+	id := RuleID{PolicyNamespace: "server", PolicyName: "bounded", PolicyType: PolicyTypeCiliumNetworkPolicy}
+	require.NotEqual(t, permissionKey(first), permissionKey(second))
+	require.NotEqual(t, permissionKey(first), permissionKey(uncertainRange(corev1.ProtocolTCP, 8080, 8090)))
+	require.NotEqual(t, permissionKey(first), permissionKey(PortPermission{Protocol: corev1.ProtocolTCP, Unknown: true}))
+	require.NotEqual(t, permissionsKey([]PortPermission{first}), permissionsKey([]PortPermission{second}))
+	require.NotEqual(t, permissionKey(first), permissionKey(rangePermission(corev1.ProtocolTCP, 8080, 8085)))
+	for _, permissions := range [][]PortPermission{{first, second, first}, {second, first, second}} {
+		union := canonicalPermissions(permissions)
+		require.Len(t, union, 2)
+		require.ElementsMatch(t, []PortPermission{first, second}, union)
+		for _, port := range []int32{8080, 9090} {
+			overlap, known := intersectPermissions(union, []PortPermission{rangePermission(corev1.ProtocolTCP, port, port)})
+			require.False(t, known)
+			require.Equal(t, []PortPermission{uncertainRange(corev1.ProtocolTCP, port, port)}, overlap)
+		}
+		gap, known := intersectPermissions(union, []PortPermission{rangePermission(corev1.ProtocolTCP, 8500, 8500)})
+		require.True(t, known)
+		require.Empty(t, gap)
+	}
+	evidence := uniqueEvidence([]PolicyEvidence{
+		{RuleID: id, Ports: []PortPermission{first}},
+		{RuleID: id, Ports: []PortPermission{second}},
+		{RuleID: id, Ports: []PortPermission{first}},
+	})
+	require.Len(t, evidence, 2)
+	require.ElementsMatch(t, []PortPermission{first, second}, evidencePermissions(evidence, &id))
+}
+
+func TestIstioUncertainNetworkBoundsRequireCommonPorts(t *testing.T) {
+	network := Decision{
+		State:       AccessUnknown,
+		Permissions: []PortPermission{uncertainRange(corev1.ProtocolTCP, 8080, 8080)},
+	}
+	for _, port := range []int32{8080, 9090} {
+		value := intstr.FromInt32(port)
+		t.Run(value.String(), func(t *testing.T) {
+			authorization := Decision{
+				State:       AccessAllowed,
+				Permissions: []PortPermission{rangePermission(corev1.ProtocolTCP, port, port)},
+			}
+			decision := combinePolicyLayers(network, authorization)
+			if port == 8080 {
+				require.Equal(t, AccessUnknown, decision.State)
+				require.Equal(t, network.Permissions, decision.Permissions)
+			} else {
+				require.Equal(t, AccessDisallowed, decision.State)
+				require.Empty(t, decision.Permissions)
+			}
+		})
+	}
+}
+
+func uncertainRange(protocol corev1.Protocol, start, end int32) PortPermission {
+	permission := rangePermission(protocol, start, end)
+	permission.Unknown = true
+	return permission
+}
+
 func permissionStrings(permissions []PortPermission) []string {
 	out := make([]string, 0, len(permissions))
 	for _, permission := range permissions {

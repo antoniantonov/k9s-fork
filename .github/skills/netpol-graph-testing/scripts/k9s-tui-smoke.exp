@@ -57,8 +57,8 @@ set edge_pairs [list \
   [list ccnp-egress-deny ccnp-client $ns_edge_src ccnp-denied $ns_edge_dst Disallowed {no ports}] \
   [list ccnp-unmatched-source control $ns_edge_other ccnp-server $ns_edge_dst Disallowed {no ports}] \
   [list ccnp-unmatched-target ccnp-client $ns_edge_src control $ns_edge_other Disallowed {no ports}] \
-  [list istio-ports authz-client $ns_edge_src authz-server $ns_edge_dst Allowed {TCP/8080, UDP/5353, SCTP/9000}] \
-  [list istio-no-tcp authz-client $ns_edge_src authz-no-tcp $ns_edge_dst Allowed {UDP/5353, SCTP/9000}] \
+  [list istio-ports authz-client $ns_edge_src authz-server $ns_edge_dst Allowed {SCTP/9000, TCP/8080, UDP/5353}] \
+  [list istio-no-tcp authz-client $ns_edge_src authz-no-tcp $ns_edge_dst Allowed {SCTP/9000, UDP/5353}] \
   [list istio-empty-allow authz-client $ns_edge_src authz-closed $ns_edge_dst Disallowed {no ports}] \
 ]
 set known_cases {
@@ -160,14 +160,15 @@ proc start_case {name {reset 1}} {
   }
 }
 
-proc drain {{quiet_seconds 1}} {
+proc drain {{quiet_seconds 1} {max_seconds 5}} {
   set old_timeout $::timeout
   set drained 1
-  while {$drained} {
+  set deadline [expr {[clock milliseconds] + $max_seconds * 1000}]
+  while {$drained && [clock milliseconds] < $deadline} {
     set drained 0
     set ::timeout $quiet_seconds
     expect {
-      -re {(.|\r|\n)+} { set drained 1 }
+      -re {(?s).+} { set drained 1 }
       timeout {}
       eof { set ::timeout $old_timeout; return 0 }
     }
@@ -189,18 +190,12 @@ proc repaint {} {
 
 proc wait_stream {pattern {seconds 20}} {
   set pattern [fixture_text $pattern]
-  set old_timeout $::timeout
-  set ::timeout $seconds
-  expect {
-    -re $pattern { set ::timeout $old_timeout; return 1 }
-    timeout { set ::timeout $old_timeout; fail_case "timed out waiting for /$pattern/"; return 0 }
-    eof { set ::timeout $old_timeout; fail_case "process exited while waiting for /$pattern/"; return 0 }
-  }
+  if {[wait_for_frame [list screen_regexp $pattern] $seconds] ne ""} { return 1 }
+  fail_case "timed out waiting for a complete fresh screen matching /$pattern/\n$::last_wait_screen"
+  return 0
 }
 
 proc assert_screen {pattern {seconds 20}} {
-  drain 1
-  repaint
   return [wait_stream $pattern $seconds]
 }
 
@@ -214,33 +209,33 @@ proc assert_reachability_view {{seconds 20}} {
 }
 
 proc assert_all_screen {patterns {seconds 20}} {
-  set ok 1
+  set wanted {}
   foreach pattern $patterns {
-    if {![assert_screen $pattern $seconds]} { set ok 0 }
+    lappend wanted [fixture_text $pattern]
   }
-  return $ok
+  if {[wait_for_frame [list screen_patterns $wanted] $seconds] ne ""} { return 1 }
+  fail_case "timed out waiting for all patterns in one complete fresh screen: $wanted\n$::last_wait_screen"
+  return 0
 }
 
 proc screen_matches {pattern {seconds 5}} {
   set pattern [fixture_text $pattern]
-  drain 1
-  repaint
-  set old_timeout $::timeout
-  set ::timeout $seconds
-  expect {
-    -re $pattern { set ::timeout $old_timeout; return 1 }
-    timeout { set ::timeout $old_timeout; return 0 }
-    eof { set ::timeout $old_timeout; return 0 }
-  }
+  return [expr {[wait_for_frame [list screen_regexp $pattern] $seconds] ne ""}]
 }
 
 proc ensure_rules {} {
-  if {![screen_matches {Ingress · Rules} 5]} { send_key "m" 400 }
+  set screen [wait_for_frame [list screen_regexp {Ingress · (Rules|Primitives)}] 15]
+  if {$screen eq ""} { fail_case "could not determine the current ingress projection"; return 0 }
+  if {[regexp {Ingress · Rules} $screen]} { return 1 }
+  send_key "m" 400
   assert_screen {Ingress · Rules} 15
 }
 
 proc ensure_primitives {} {
-  if {![screen_matches {Ingress · Primitives} 5]} { send_key "m" 400 }
+  set screen [wait_for_frame [list screen_regexp {Ingress · (Rules|Primitives)}] 15]
+  if {$screen eq ""} { fail_case "could not determine the current ingress projection"; return 0 }
+  if {[regexp {Ingress · Primitives} $screen]} { return 1 }
+  send_key "m" 400
   assert_screen {Ingress · Primitives} 15
 }
 
@@ -360,7 +355,16 @@ spawn {*}$docker_args
 match_max 262144
 stty rows 50 columns 200 < $spawn_out(slave,name)
 
-if {$suite eq "known"} {
+set navigation_setup_error ""
+set startup_screen [wait_for_frame [list graph_ready "Deployment $ns_app/api · 3 pods"] 60]
+if {$startup_screen eq ""} {
+  if {[info exists ::last_capture_summary]} { say "Startup capture: $::last_capture_summary" }
+  say "initial NPG never reached the exact ready workload with its command prompt closed\n$::last_wait_screen"
+  foreach name [dict get $case_manifest $suite] {
+    start_case $name 0
+    fail_case "suite startup did not reach the required workload-ready NPG frame"
+  }
+} elseif {$suite eq "known"} {
 start_case "launch-npg-view"
 if {[assert_all_screen {Subject {Deployment netpol-demo-app/api} {3 pods} {Ingress on} {Egress on} {Kinds: CIDR,Pod,Namespace,Deployment,Job} {Auto-refresh off} {Ingress · Rules} {Egress · Rules} {Selection: none} {Effective Details} {Effective Applicability \(Ingress\)} {read-only graph} {</>} Search {<npg>}} 45]} {
   if {[screen_matches {<ctrl-r>} 2]} {
@@ -741,19 +745,15 @@ for {set i 0} {$i < 80} {incr i} {
   send -- "\033\[A\033\[Brm\033\[5~\033\[6~"
   after 40
 }
-# Drain everything already buffered so the probe below can only be satisfied by
-# a fresh repaint rather than by stale output.
-drain 1
-# A live TUI repaints as soon as it is poked; a deadlocked one never answers.
-repaint
 send -- "r"
 after 200
 send -- "\033\[A"
-set timeout 30
-expect {
-  -re {Subject|Ingress|Egress|Details|Primitives|Rules} { pass_case }
-  timeout { fail_case_dump "TUI stopped repainting after the stress loop; sent SIGQUIT to container" }
-  eof { fail_case "process exited during stress" }
+if {[wait_for_frame [list screen_regexp {Subject|Ingress|Egress|Details|Primitives|Rules}] 30] ne ""} {
+  pass_case
+} elseif {$::screen_eof} {
+  fail_case "process exited during stress"
+} else {
+  fail_case_dump "TUI stopped repainting after the stress loop; sent SIGQUIT to container"
 }
 set timeout 10
 
@@ -767,12 +767,16 @@ foreach family {cnp ccnp} {
     verify_effective_edge "$family-empty-rule-[string tolower $direction]" "$family-empty" $ns_edge_src $direction control $ns_edge_other Disallowed {no ports}
   }
 }
-verify_edge_policy cnp-ingress-rule-navigation cnp-server $ns_edge_dst Ingress cnp-target $ns_edge_dst CiliumNetworkPolicy cilium.io/v2 ciliumnetworkpolicies ALLOW {TCP/8081-8082} cnp-client $ns_edge_src {TCP/8081}
-verify_edge_policy cnp-egress-spec-rule-navigation cnp-client $ns_edge_src Egress cnp-source $ns_edge_src CiliumNetworkPolicy cilium.io/v2 ciliumnetworkpolicies ALLOW {TCP/8080-8081} cnp-server $ns_edge_dst {TCP/8081}
-verify_edge_policy ccnp-ingress-spec-rule-navigation ccnp-server $ns_edge_dst Ingress "${prefix}-edge-ccnp" "" CiliumClusterwideNetworkPolicy cilium.io/v2 ciliumclusterwidenetworkpolicies ALLOW {TCP/9091-9092} ccnp-client $ns_edge_src {TCP/9092}
-verify_edge_policy ccnp-egress-spec-rule-navigation ccnp-client $ns_edge_src Egress "${prefix}-edge-ccnp" "" CiliumClusterwideNetworkPolicy cilium.io/v2 ciliumclusterwidenetworkpolicies ALLOW {TCP/9090-9092} ccnp-server $ns_edge_dst {TCP/9092}
-verify_edge_policy istio-ingress-rule-navigation authz-server $ns_edge_dst Ingress authz-ports-allow $ns_edge_dst AuthorizationPolicy security.istio.io/v1 authorizationpolicies ALLOW {TCP/8080-8081} authz-client $ns_edge_src {TCP/8080}
-verify_edge_policy native-egress-istio-opposite-navigation authz-client $ns_edge_src Egress authz-source-network $ns_edge_src NetworkPolicy networking.k8s.io/v1 networkpolicies ALLOW {TCP/8080-8081, UDP/5353, SCTP/9000} authz-server $ns_edge_dst {TCP/8080, UDP/5353, SCTP/9000}
+verify_edge_policy cnp-ingress-rule-navigation cnp-server $ns_edge_dst Ingress cnp-target $ns_edge_dst CiliumNetworkPolicy cilium.io/v2 ciliumnetworkpolicies ALLOW {TCP/8081, TCP/8082} cnp-client $ns_edge_src {TCP/8081}
+verify_edge_policy cnp-egress-spec-rule-navigation cnp-client $ns_edge_src Egress cnp-source $ns_edge_src CiliumNetworkPolicy cilium.io/v2 ciliumnetworkpolicies ALLOW {TCP/8080, TCP/8081} cnp-server $ns_edge_dst {TCP/8081} [list \
+  [list ALLOW {TCP/8080, TCP/8081} cnp-mismatch $ns_edge_dst Disallowed {no ports} true false] \
+  [list ALLOW {TCP/8080, TCP/8081} control $ns_edge_other Disallowed {no ports} false false] \
+  [list DENY {TCP/8081} cnp-denied $ns_edge_dst Disallowed {no ports} true false]]
+verify_edge_policy ccnp-ingress-spec-rule-navigation ccnp-server $ns_edge_dst Ingress "${prefix}-edge-ccnp" "" CiliumClusterwideNetworkPolicy cilium.io/v2 ciliumclusterwidenetworkpolicies ALLOW {TCP/9091, TCP/9092} ccnp-client $ns_edge_src {TCP/9092} [list \
+  [list DENY {TCP/9091} ccnp-client $ns_edge_src Disallowed {no ports} true false]]
+verify_edge_policy ccnp-egress-spec-rule-navigation ccnp-client $ns_edge_src Egress "${prefix}-edge-ccnp" "" CiliumClusterwideNetworkPolicy cilium.io/v2 ciliumclusterwidenetworkpolicies ALLOW {TCP/9090, TCP/9091, TCP/9092} ccnp-server $ns_edge_dst {TCP/9092}
+verify_edge_policy istio-ingress-rule-navigation authz-server $ns_edge_dst Ingress authz-ports-allow $ns_edge_dst AuthorizationPolicy security.istio.io/v1 authorizationpolicies ALLOW {TCP/8080, TCP/8081} authz-client $ns_edge_src {TCP/8080}
+verify_edge_policy native-egress-istio-opposite-navigation authz-client $ns_edge_src Egress authz-source-network $ns_edge_src NetworkPolicy networking.k8s.io/v1 networkpolicies ALLOW {SCTP/9000, TCP/8080, TCP/8081, UDP/5353} authz-server $ns_edge_dst {SCTP/9000, TCP/8080, UDP/5353}
 verify_source_authz_noninterference
 verify_cidr_narrow_deny
 } elseif {$suite eq "identity"} {
@@ -783,7 +787,11 @@ verify_cidr_narrow_deny
   verify_effective_edge unsupported-snapshot-egress-partial-data cnp-client $ns_edge_src Egress cnp-server $ns_edge_dst {Partial Data} {TCP/8081} 1
 }
 
-send_key "q"
+if {$startup_screen eq "" || $navigation_setup_error ne ""} {
+  catch {exec docker kill $container}
+} else {
+  send_key "q"
+}
 expect {
   eof {}
   timeout { catch {exec docker kill $container} }

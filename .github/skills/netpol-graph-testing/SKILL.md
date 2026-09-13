@@ -80,6 +80,10 @@ Logs land under `.github/skills/netpol-graph-testing/runs/<timestamp>/`, with on
 Run directories include the process ID to prevent concurrent invocations from
 overwriting one another. Cached builds fingerprint untracked build sources as
 well as tracked files; fingerprint failures cannot silently reuse an image.
+Finish all source edits before invoking the runner or workload entry point,
+and keep those scripts unchanged until the invocation exits. A shell may read
+later parts of its script while running; a concurrent rewrite can interrupt
+population even when the final file passes `bash -n`.
 
 ## Complete-data and uncertainty suites
 
@@ -89,11 +93,60 @@ New assertions reconstruct a fresh terminal repaint and compare the subject,
 direction, exact peer row, state and complete protocol/port set. Navigation
 checks bind the selected rule to its full policy type, action, API version,
 resource view and YAML identity.
+All snapshot, regex, navigation and command-prompt waits use one shared reader.
+It drains and requests a fresh repaint once, then updates terminal cells
+incrementally, retaining split CSI/OSC sequences across reads. Re-parsing an
+ever-growing ANSI prefix on every short PTY read can starve input before a
+deadline even when complete frames are already waiting in the pipe. The reader
+requires the final-size bottom breadcrumb before accepting a frame; a top-only
+header or short quiet interval is not completion. Grouped assertions inspect
+one complete frame rather than requesting a redraw for each text fragment.
+Read timeouts start after the separately bounded drain/resize preparation;
+otherwise a one-second hint check expires before it starts reading. A missing
+mode frame is a setup failure, never a reason to blindly send the mode-toggle
+key. Failure diagnostics include preparation time, read budget and byte counts.
+Applicability assertions wait up to 20 seconds for the requested heading,
+exact peer row and closing table border. Fragmented terminal chunks accumulate
+within that one fresh repaint and share its deadline; they are not discarded
+by another drain/repaint. Only surface completeness is polled. State, flags and
+ports are then checked exactly, without retrying incorrect semantic values.
+
+Each fresh process first waits for the default NPG subject and its ready
+workload rows. Opening an edge subject then waits for the command prompt to
+appear, sends the command once, and waits for the exact one-pod subject, its
+Running/ready workload row and a closed prompt before mode, direction or search
+keys. Waits are bounded; genuine `Waiting for ...` and `workloads loading...`
+frames are not ready, but expected Partial Data is. A failed setup stops further
+graph input and still produces explicit failed verdicts instead of cascading
+shortcuts into an unfinished prompt.
+
+Rules are headerless three-column blocks, unlike the applicability table.
+Their declared port text is checked exactly, including ordering and separate
+entries such as `TCP/8080, TCP/8081`; it is not merged into a range. Effective
+permissions are checked separately and keep their exact expected port text.
+
+Applicability booleans are literal `true`/`false`, not `Yes`/`No`. Selected
+allowed rows are `true`/`true`; matched but disjoint or denied rows are
+`true`/`false`; unmatched selected rules are `false`/`false`. The selected CCNP
+deny remains Disallowed with `no ports` even when another port survives in the
+effective result. Zero-pair rows use `n/a` for Peer, Opposite and Ports.
+Rule names display the policy reference followed by `#<rule index>`, without a
+spec suffix or a Spec index detail field. The first CNP allow in `specs[0]`
+and first deny in `specs[1]` both display `#0`; action and port content identify
+the selected rule, not an invented visual spec number.
+
+The CIDR control checks **both** rows from `edge-src/cidr-client` egress.
+The partly denied `203.0.113.0/24` is **Unknown**, while the fully denied
+`203.0.113.128/25` is **Disallowed**. Both have exact `no ports`,
+Peer `true` and Opposite `n/a`. A narrower deny is address-overlap uncertainty,
+not snapshot-wide Partial Data and not uniform Disallowed for the broad range.
 
 Istio `source.namespaces` is certificate/mTLS-derived and therefore uncertain
 from Kubernetes objects alone. Known-state fixtures use identity-free port-only
 ALLOW/DENY rules. They also prove that a source-local ingress AuthorizationPolicy
-does not become a source egress policy.
+does not become a source egress policy. Effective port text is compared
+exactly: `SCTP/9000, TCP/8080, UDP/5353` after the TCP deny, and
+`SCTP/9000, UDP/5353` for the empty ALLOW control.
 
 Normalization uncertainty is **snapshot-wide**. The identity and unsupported
 policies are never part of ordinary population. For each final probe suite the
@@ -102,6 +155,14 @@ it, launches a fresh TUI process, and removes only the exact policy carrying
 that run's ownership ID in an EXIT/signal cleanup handler. The normal topology
 is rechecked even after a failing TUI run or failed deletion. A failed cleanup
 fails validation; a subsequent suite cannot populate over an unclean topology.
+The unsupported probe checks the exact snapshot-resource
+`"ciliumnetworkpolicies"` diagnostic, owned namespace/policy name, egress allow
+rule index and `toFQDNs requires live DNS resolution` text in **Effective
+Details**, scrolling that pane when necessary. Partial state is confirmed by
+the subject's `PARTIAL DATA` badge and applicability `Partial Data` cells, not
+an invented mixed-case label in the lowercase details summary. Disabled empty rules
+may be omitted from the Rules panel, so this case does not invent a selectable
+raw rule. The known Cilium navigation cases cover its API version and YAML.
 
 For controlled diagnosis, the demo entry point exposes the same probe flags:
 
@@ -169,11 +230,25 @@ does not invent executable statements. Profile paths are matched within the
 actual module, not by ambiguous basename suffixes. These are Go **statement**
 coverage gates, not independent branch-coverage instrumentation.
 
-The helper's Go tests also exercise shell stubs, fixture contracts, Tcl
-compilation, fresh-screen parsing and verdict accounting without contacting
-Docker or Kubernetes:
+The helper's Go tests also exercise shell stubs, the 18-pod/15-policy fixture
+inventory, Tcl compilation, fresh-screen parsing, both CIDR rows, same-index
+allow/deny identities, headerless declared-rule rows, delayed startup and
+command-prompt closure, fragmented repaint completion, an exact live
+unsupported-policy screen fixture with negative diagnostic controls, and verdict
+accounting without contacting Docker or Kubernetes. A real local PTY stub
+exercises delayed resource/YAML return and command-prompt tails, enforcing one
+repaint per operation and no whole-prefix re-parsing. Probe cleanup is tested
+after success, failed application, failed
+Expect, termination, failed deletion and failed topology restoration, for both
+probe types. A stubbed full population invocation must reach its final summary.
 
 ```bash
+for script in scripts/netpol-demo-workloads.sh \
+  .github/skills/netpol-graph-testing/scripts/*.sh; do
+  bash -n "$script" || exit
+done
+EXPECT_SYNTAX_CHECK=1 expect .github/skills/netpol-graph-testing/scripts/k9s-tui-smoke.exp
+EXPECT_CASE_MANIFEST=1 expect .github/skills/netpol-graph-testing/scripts/k9s-tui-smoke.exp
 mkdir -p .github/skills/netpol-graph-testing/runs/helper-check
 TMPDIR="$PWD/.github/skills/netpol-graph-testing/runs/helper-check" \
 GOTMPDIR="$PWD/.github/skills/netpol-graph-testing/runs/helper-check" \

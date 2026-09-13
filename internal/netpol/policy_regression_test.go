@@ -396,6 +396,418 @@ func TestCiliumUnknownNamedRuleApplicability(t *testing.T) {
 	}
 }
 
+func TestCiliumUncertainDenyCannotWidenAllowedPorts(t *testing.T) {
+	tcp, udp := corev1.ProtocolTCP, corev1.ProtocolUDP
+	udp53 := numericPolicyPort(53, 0)
+	udp53.Protocol = &udp
+	udp8080 := numericPolicyPort(8080, 0)
+	udp8080.Protocol = &udp
+	tests := []struct {
+		name    string
+		egress  []netv1.NetworkPolicyPort
+		ingress string
+		state   AccessState
+		want    []PortPermission
+	}{
+		{"disjoint-single-port", []netv1.NetworkPolicyPort{numericPolicyPort(9090, 0)},
+			`{port: "8080", protocol: TCP}`, AccessDisallowed, nil},
+		{"disjoint-ranges", []netv1.NetworkPolicyPort{numericPolicyPort(8090, 8100)},
+			`{port: "8080", endPort: 8085, protocol: TCP}`, AccessDisallowed, nil},
+		{"overlapping-ranges", []netv1.NetworkPolicyPort{numericPolicyPort(8083, 8090)},
+			`{port: "8080", endPort: 8085, protocol: TCP}`, AccessUnknown, []PortPermission{uncertainRange(tcp, 8083, 8085)}},
+		{"different-protocol", []netv1.NetworkPolicyPort{udp8080},
+			`{port: "8080", protocol: TCP}`, AccessDisallowed, nil},
+		{"overlapping-port", []netv1.NetworkPolicyPort{numericPolicyPort(8080, 0)},
+			`{port: "8080", protocol: TCP}`, AccessUnknown, []PortPermission{uncertainRange(tcp, 8080, 8080)}},
+		{"multiple-bounds-first", []netv1.NetworkPolicyPort{numericPolicyPort(8080, 0)},
+			`{port: "8080", protocol: TCP}, {port: "9090", protocol: TCP}`, AccessUnknown, []PortPermission{uncertainRange(tcp, 8080, 8080)}},
+		{"multiple-bounds-last", []netv1.NetworkPolicyPort{numericPolicyPort(9090, 0)},
+			`{port: "8080", protocol: TCP}, {port: "9090", protocol: TCP}`, AccessUnknown, []PortPermission{uncertainRange(tcp, 9090, 9090)}},
+		{"multiple-bounds-gap", []netv1.NetworkPolicyPort{numericPolicyPort(8500, 0)},
+			`{port: "8080", protocol: TCP}, {port: "9090", protocol: TCP}`, AccessDisallowed, nil},
+		{"other-protocol-unaffected", []netv1.NetworkPolicyPort{udp53},
+			`{port: "8080", protocol: TCP}, {port: "53", protocol: UDP}`, AccessAllowed, []PortPermission{rangePermission(udp, 53, 53)}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := testSnapshot()
+			snapshot.Pods[1].Spec.Containers = []corev1.Container{
+				{Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}},
+				{Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8081}}},
+			}
+			snapshot.NetworkPolicies = []netv1.NetworkPolicy{
+				nativeTransportPolicy(Egress, "client", "client", test.egress),
+			}
+			addCiliumPolicy(&snapshot, PolicyTypeCiliumNetworkPolicy, ciliumTestPolicy(
+				t, PolicyTypeCiliumNetworkPolicy, "bounded-deny", fmt.Sprintf(`
+  endpointSelector: {matchLabels: {role: server}}
+  ingress:
+    - toPorts: [{ports: [%s]}]
+  ingressDeny:
+    - toPorts: [{ports: [{port: "http", protocol: TCP}]}]
+`, test.ingress)))
+			for _, direction := range []Direction{Ingress, Egress} {
+				t.Run(direction.String(), func(t *testing.T) {
+					subject, peer := "server", "client"
+					if direction == Egress {
+						subject, peer = "client", "server"
+					}
+					result, err := NewEvaluator().EvaluateSubject(
+						SubjectRef{Kind: SubjectPod, Namespace: subject, Name: subject}, snapshot, Options{},
+					)
+					require.NoError(t, err)
+					require.Empty(t, result.Warnings)
+					primitive := findPrimitive(t, result.Direction(direction), PrimitivePod, peer, peer)
+					require.Equal(t, test.state, primitive.State)
+					require.Equal(t, canonicalPermissions(test.want), primitive.Permissions)
+					require.Len(t, primitive.PairDecisions, 1)
+					require.Equal(t, test.state, primitive.PairDecisions[0].Decision.State)
+				})
+			}
+		})
+	}
+}
+
+func TestCiliumSelectedRuleUncertaintyUsesOwnPorts(t *testing.T) {
+	for _, withKnownPort := range []bool{false, true} {
+		t.Run(fmt.Sprintf("known-common-port=%t", withKnownPort), func(t *testing.T) {
+			snapshot := testSnapshot()
+			udp := corev1.ProtocolUDP
+			dns := numericPolicyPort(53, 0)
+			dns.Protocol = &udp
+			ports := []netv1.NetworkPolicyPort{dns}
+			snapshot.Pods[1].Spec.Containers = []corev1.Container{
+				{Ports: []corev1.ContainerPort{{Name: "dns", Protocol: udp, ContainerPort: 53}}},
+				{Ports: []corev1.ContainerPort{{Name: "dns", Protocol: udp, ContainerPort: 54}}},
+			}
+			spec := `
+  endpointSelector: {matchLabels: {role: server}}
+  ingress:
+    - toPorts: [{ports: [{port: "80", protocol: TCP}]}]
+    - toPorts: [{ports: [{port: "dns", protocol: UDP}]}]
+`
+			if withKnownPort {
+				known := numericPolicyPort(55, 0)
+				known.Protocol = &udp
+				ports = append(ports, known)
+				spec += `
+    - toPorts: [{ports: [{port: "55", protocol: UDP}]}]
+  ingressDeny:
+    - toPorts: [{ports: [{port: "54", protocol: UDP}]}]
+`
+			}
+			snapshot.NetworkPolicies = []netv1.NetworkPolicy{nativeTransportPolicy(Egress, "client", "client", ports)}
+			addCiliumPolicy(&snapshot, PolicyTypeCiliumNetworkPolicy, ciliumTestPolicy(
+				t, PolicyTypeCiliumNetworkPolicy, "selected-ports", spec,
+			))
+			result := evaluateServer(t, snapshot)
+			require.Empty(t, result.Warnings)
+			primitive := findPrimitive(t, result.Ingress, PrimitivePod, "client", "client")
+			state := AccessUnknown
+			if withKnownPort {
+				state = AccessAllowed
+			}
+			require.Equal(t, state, primitive.State)
+			checked := 0
+			for _, rule := range result.Ingress.Rules {
+				if rule.ID.PolicyName != "selected-ports" {
+					continue
+				}
+				t.Run(fmt.Sprintf("%s/%d", rule.ID.Action, rule.ID.Index), func(t *testing.T) {
+					row := findApplicability(t, NewEvaluator().RuleApplicability(
+						result, Ingress, rule.ID, sets.New(PrimitivePod),
+					))
+					require.True(t, row.PeerMatches)
+					want := AccessDisallowed
+					if rule.ID.Action == PolicyActionAllow {
+						switch rule.ID.Index {
+						case 1:
+							want = AccessUnknown
+						case 2:
+							want = AccessAllowed
+						}
+					}
+					require.Equal(t, want, row.EffectiveState)
+					require.Equal(t, want == AccessAllowed, row.OppositeSideAllows)
+					if want == AccessAllowed {
+						require.Equal(t, []string{"UDP/55"}, permissionStrings(row.Permissions))
+					} else {
+						require.False(t, knownPermissions(row.Permissions))
+					}
+				})
+				checked++
+			}
+			wantRules := 2
+			if withKnownPort {
+				wantRules = 4
+			}
+			require.Equal(t, wantRules, checked)
+		})
+	}
+}
+
+func TestCiliumSelectedRuleUncertaintyUsesOwnPairs(t *testing.T) {
+	snapshot := testSnapshot()
+	other := snapshot.Pods[0].DeepCopy()
+	other.Name, other.UID, other.Labels = "other", "other", map[string]string{"role": "other"}
+	snapshot.Pods = append(snapshot.Pods, *other)
+	udp := corev1.ProtocolUDP
+	dns := numericPolicyPort(53, 0)
+	dns.Protocol = &udp
+	snapshot.NetworkPolicies = []netv1.NetworkPolicy{
+		nativeTransportPolicy(Egress, "client", "client", []netv1.NetworkPolicyPort{dns}),
+		nativeTransportPolicy(Egress, "client", "other", []netv1.NetworkPolicyPort{numericPolicyPort(80, 0)}),
+	}
+	snapshot.NetworkPolicies[1].Name = "other-transport"
+	snapshot.Pods[1].Spec.Containers = []corev1.Container{
+		{Ports: []corev1.ContainerPort{{Name: "dns", Protocol: udp, ContainerPort: 53}}},
+		{Ports: []corev1.ContainerPort{{Name: "dns", Protocol: udp, ContainerPort: 54}}},
+	}
+	addCiliumPolicy(&snapshot, PolicyTypeCiliumNetworkPolicy, ciliumTestPolicy(
+		t, PolicyTypeCiliumNetworkPolicy, "selected-pairs", `
+  endpointSelector: {matchLabels: {role: server}}
+  ingress:
+    - toPorts: [{ports: [{port: "80", protocol: TCP}]}]
+    - toPorts: [{ports: [{port: "dns", protocol: UDP}]}]
+`))
+	result := evaluateServer(t, snapshot)
+	primitive := findPrimitive(t, result.Ingress, PrimitiveNamespace, "", "client")
+	require.Equal(t, AccessPartial, primitive.State)
+	require.Len(t, primitive.PairDecisions, 2)
+	checked := 0
+	for _, rule := range result.Ingress.Rules {
+		if rule.ID.PolicyName != "selected-pairs" {
+			continue
+		}
+		rows := NewEvaluator().RuleApplicability(result, Ingress, rule.ID, sets.New(PrimitiveNamespace))
+		for _, row := range rows {
+			if row.Primitive.Ref.Name != "client" {
+				continue
+			}
+			require.True(t, row.PeerMatches)
+			require.False(t, row.OppositeSideAllows)
+			require.Equal(t, AccessPartial, row.EffectiveState)
+			if rule.ID.Index == 0 {
+				require.Equal(t, []string{"TCP/80"}, permissionStrings(row.Permissions))
+			} else {
+				require.Empty(t, row.Permissions)
+			}
+			checked++
+		}
+	}
+	require.Equal(t, 2, checked)
+}
+
+func TestCiliumSelectedCIDRRuleKeepsWholeRangeGuarantees(t *testing.T) {
+	for _, withKnownPort := range []bool{false, true} {
+		t.Run(fmt.Sprintf("known-common-port=%t", withKnownPort), func(t *testing.T) {
+			snapshot := testSnapshot()
+			spec := `
+  endpointSelector: {matchLabels: {role: server}}
+  egress:
+    - toCIDR: ["203.0.113.0/24"]
+      toPorts: [{ports: [{port: "443", protocol: TCP}]}]
+`
+			if withKnownPort {
+				spec += `
+    - toCIDR: ["203.0.113.0/24"]
+      toPorts: [{ports: [{port: "8443", protocol: TCP}]}]
+`
+			}
+			spec += `
+  egressDeny:
+    - toCIDR: ["203.0.113.128/25"]
+      toPorts: [{ports: [{port: "443", protocol: TCP}]}]
+`
+			addCiliumPolicy(&snapshot, PolicyTypeCiliumNetworkPolicy, ciliumTestPolicy(
+				t, PolicyTypeCiliumNetworkPolicy, "selected-cidr", spec,
+			))
+			result := evaluateServer(t, snapshot)
+			require.Empty(t, result.Warnings)
+			broad := findCIDRPrimitive(t, result.Egress, "203.0.113.0/24", nil)
+			narrow := findCIDRPrimitive(t, result.Egress, "203.0.113.128/25", nil)
+			require.Equal(t, AccessUnknown, broad.State)
+			if withKnownPort {
+				require.Equal(t, []string{"TCP/8443"}, permissionStrings(broad.Permissions))
+				require.Equal(t, AccessAllowed, narrow.State)
+				require.Equal(t, []string{"TCP/8443"}, permissionStrings(narrow.Permissions))
+			} else {
+				require.Empty(t, broad.Permissions)
+				require.Equal(t, AccessDisallowed, narrow.State)
+				require.Empty(t, narrow.Permissions)
+			}
+			checked := 0
+			for _, rule := range result.Egress.Rules {
+				if rule.ID.PolicyName != "selected-cidr" {
+					continue
+				}
+				rows := NewEvaluator().RuleApplicability(result, Egress, rule.ID, sets.New(PrimitiveCIDR))
+				for _, peer := range []PrimitiveResult{broad, narrow} {
+					row := findCIDRApplicability(t, rows, peer.Ref.ID())
+					require.True(t, row.PeerMatches)
+					switch {
+					case rule.ID.Action == PolicyActionDeny:
+						require.Equal(t, AccessDisallowed, row.EffectiveState)
+						require.Empty(t, row.Permissions)
+					case rule.ID.Index == 1:
+						require.Equal(t, AccessAllowed, row.EffectiveState)
+						require.Equal(t, []string{"TCP/8443"}, permissionStrings(row.Permissions))
+					default:
+						want := AccessUnknown
+						if peer.Ref.ID() == narrow.Ref.ID() {
+							want = AccessDisallowed
+						}
+						require.Equal(t, want, row.EffectiveState)
+						require.Empty(t, row.Permissions)
+					}
+				}
+				checked++
+			}
+			wantRules := 2
+			if withKnownPort {
+				wantRules = 3
+			}
+			require.Equal(t, wantRules, checked)
+		})
+	}
+}
+
+func TestCiliumSelectedCIDRRuleExcludesWholeRangeDenies(t *testing.T) {
+	tests := []struct {
+		name       string
+		deniedPeer string
+		wholeDeny  bool
+		knownPort  bool
+	}{
+		{"same-prefix-deny", `CIDR: ["203.0.113.0/24"]`, true, false},
+		{"known-unaffected-port", `CIDR: ["203.0.113.0/24"]`, true, true},
+		{"covering-deny-excludes-outside", `CIDRSet: [{cidr: "203.0.0.0/16", except: ["203.0.114.0/24"]}]`, true, false},
+		{"partial-deny-excludes-inside", `CIDRSet: [{cidr: "203.0.113.0/24", except: ["203.0.113.128/25"]}]`, false, false},
+	}
+	for _, direction := range []Direction{Ingress, Egress} {
+		for _, test := range tests {
+			t.Run(fmt.Sprintf("%s/%s", direction, test.name), func(t *testing.T) {
+				snapshot := testSnapshot()
+				snapshot.Pods[1].Name, snapshot.Pods[1].UID = "a", "a"
+				snapshot.Pods[1].Labels = map[string]string{"role": "server", "instance": "a"}
+				podB := snapshot.Pods[1].DeepCopy()
+				podB.Name, podB.UID = "b", "b"
+				podB.Labels = map[string]string{"role": "server", "instance": "b"}
+				snapshot.Pods = append(snapshot.Pods, *podB)
+				field, peer := strings.ToLower(direction.String()), ciliumPeerPrefix(direction)
+				addCiliumPolicy(&snapshot, PolicyTypeCiliumNetworkPolicy, ciliumTestPolicy(
+					t, PolicyTypeCiliumNetworkPolicy, "shared-80", fmt.Sprintf(`
+  endpointSelector: {matchLabels: {role: server}}
+  %s:
+    - %sCIDR: ["203.0.113.0/24"]
+      toPorts: [{ports: [{port: "80", protocol: TCP}]}]
+  %sDeny:
+    - %s%s
+      toPorts: [{ports: [{port: "80", protocol: TCP}]}]
+`, field, peer, field, peer, test.deniedPeer)))
+				addCiliumPolicy(&snapshot, PolicyTypeCiliumNetworkPolicy, ciliumTestPolicy(
+					t, PolicyTypeCiliumNetworkPolicy, "a-partial-443", fmt.Sprintf(`
+  endpointSelector: {matchLabels: {role: server, instance: a}}
+  %s:
+    - %sCIDR: ["203.0.113.0/24"]
+      toPorts: [{ports: [{port: "443", protocol: TCP}]}]
+  %sDeny:
+    - %sCIDR: ["203.0.113.128/25"]
+      toPorts: [{ports: [{port: "443", protocol: TCP}]}]
+`, field, peer, field, peer)))
+				if test.knownPort {
+					addCiliumPolicy(&snapshot, PolicyTypeCiliumNetworkPolicy, ciliumTestPolicy(
+						t, PolicyTypeCiliumNetworkPolicy, "shared-8443", fmt.Sprintf(`
+  endpointSelector: {matchLabels: {role: server}}
+  %s:
+    - %sCIDR: ["203.0.113.0/24"]
+      toPorts: [{ports: [{port: "8443", protocol: TCP}]}]
+`, field, peer)))
+				}
+				for _, subject := range []struct {
+					name string
+					ref  SubjectRef
+					hasA bool
+				}{
+					{"namespace", SubjectRef{Kind: SubjectNamespace, Name: "server"}, true},
+					{"a", SubjectRef{Kind: SubjectPod, Namespace: "server", Name: "a"}, true},
+					{"b", SubjectRef{Kind: SubjectPod, Namespace: "server", Name: "b"}, false},
+				} {
+					t.Run(subject.name, func(t *testing.T) {
+						result, err := NewEvaluator().EvaluateSubject(subject.ref, snapshot, Options{})
+						require.NoError(t, err)
+						require.Empty(t, result.Warnings)
+						broad := findCIDRPrimitive(t, result.Direction(direction), "203.0.113.0/24", nil)
+						wantPrimitive := AccessUnknown
+						pairs := 1
+						if subject.name == "namespace" {
+							pairs = 2
+							if test.wholeDeny {
+								wantPrimitive = AccessPartial
+							}
+						} else if subject.name == "b" && test.wholeDeny {
+							wantPrimitive = AccessDisallowed
+							if test.knownPort {
+								wantPrimitive = AccessAllowed
+							}
+						}
+						require.Len(t, broad.PairDecisions, pairs)
+						require.Equal(t, wantPrimitive, broad.State)
+						if test.knownPort {
+							require.Equal(t, []string{"TCP/8443"}, permissionStrings(broad.Permissions))
+						} else {
+							require.Empty(t, broad.Permissions)
+						}
+
+						selected := func(name string, action PolicyAction) ApplicabilityRow {
+							rule := findPolicyRuleAction(t, result.Direction(direction), name, action)
+							return findCIDRApplicability(t, NewEvaluator().RuleApplicability(
+								result, direction, rule.ID, sets.New(PrimitiveCIDR),
+							), broad.Ref.ID())
+						}
+						rule := findPolicyRuleAction(t, result.Direction(direction), "shared-80", PolicyActionAllow)
+						require.Equal(t, []string{"TCP/80"}, permissionStrings(rule.Permissions), "keep the original rule's declared ports")
+						row := selected("shared-80", PolicyActionAllow)
+						require.True(t, row.PeerMatches)
+						require.False(t, row.OppositeSideAllows)
+						wantSelected := AccessUnknown
+						if test.wholeDeny {
+							wantSelected = AccessDisallowed
+						}
+						require.Equal(t, wantSelected, row.EffectiveState)
+						require.Empty(t, row.Permissions)
+
+						denyPolicies := []string{"shared-80"}
+						if subject.hasA {
+							partial := selected("a-partial-443", PolicyActionAllow)
+							wantPartial := AccessUnknown
+							if subject.name == "namespace" {
+								wantPartial = AccessPartial
+							}
+							require.Equal(t, wantPartial, partial.EffectiveState)
+							require.Empty(t, partial.Permissions)
+							require.False(t, partial.OppositeSideAllows)
+							denyPolicies = append(denyPolicies, "a-partial-443")
+						}
+						for _, name := range denyPolicies {
+							denied := selected(name, PolicyActionDeny)
+							require.True(t, denied.PeerMatches)
+							require.Equal(t, AccessDisallowed, denied.EffectiveState)
+							require.Empty(t, denied.Permissions)
+						}
+						if test.knownPort {
+							known := selected("shared-8443", PolicyActionAllow)
+							require.Equal(t, AccessAllowed, known.EffectiveState)
+							require.Equal(t, []string{"TCP/8443"}, permissionStrings(known.Permissions))
+							require.True(t, known.OppositeSideAllows)
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
 func TestCustomPolicyConversionFailuresStayPartial(t *testing.T) {
 	for _, policyType := range []PolicyType{
 		PolicyTypeCiliumNetworkPolicy, PolicyTypeCiliumClusterwideNetworkPolicy, PolicyTypeIstioAuthorizationPolicy,
