@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,9 +21,13 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/discovery/cached/memory"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -460,8 +466,9 @@ func (m *NetPolGraph) isCurrent(generation uint64, subject netpol.SubjectRef) bo
 
 func buildNetPolSnapshot(ctx context.Context, factory dao.Factory, subject netpol.SubjectRef) netpol.Snapshot {
 	snapshot := netpol.Snapshot{
-		Incomplete:  make(map[string]error),
-		GeneratedAt: time.Now(),
+		IstioRootNamespace: netpol.DefaultIstioRootNamespace,
+		Incomplete:         make(map[string]error),
+		GeneratedAt:        time.Now(),
 	}
 	list := func(name string, gvr *client.GVR) []runtime.Object {
 		if err := ctx.Err(); err != nil {
@@ -484,8 +491,151 @@ func buildNetPolSnapshot(ctx context.Context, factory dao.Factory, subject netpo
 	snapshot.Deployments = convertSnapshotObjects[appsv1.Deployment]("deployments", list("deployments", client.DpGVR), &snapshot)
 	snapshot.ReplicaSets = convertSnapshotObjects[appsv1.ReplicaSet]("replicasets", list("replicasets", client.RsGVR), &snapshot)
 	snapshot.Jobs = convertSnapshotObjects[batchv1.Job]("jobs", list("jobs", client.JobGVR), &snapshot)
+	loadOptionalPolicyResources(ctx, factory, &snapshot)
 	injectSelectedSubject(ctx, factory, subject, &snapshot)
 	return snapshot
+}
+
+func loadOptionalPolicyResources(ctx context.Context, factory dao.Factory, snapshot *netpol.Snapshot) {
+	type optionalResource struct {
+		name       string
+		namespace  string
+		candidates []*client.GVR
+		assign     func([]unstructured.Unstructured)
+	}
+	resources := []optionalResource{
+		{
+			name: "ciliumnetworkpolicies", namespace: client.BlankNamespace,
+			candidates: []*client.GVR{client.CnpGVR},
+			assign: func(items []unstructured.Unstructured) {
+				snapshot.CiliumNetworkPolicies = items
+			},
+		},
+		{
+			name: "ciliumclusterwidenetworkpolicies", namespace: client.ClusterScope,
+			candidates: []*client.GVR{client.CcnpGVR},
+			assign: func(items []unstructured.Unstructured) {
+				snapshot.CiliumClusterwideNetworkPolicies = items
+			},
+		},
+		{
+			name: "authorizationpolicies", namespace: client.BlankNamespace,
+			candidates: []*client.GVR{client.AuthzGVR, client.AuthzV1BetaGVR},
+			assign: func(items []unstructured.Unstructured) {
+				snapshot.IstioAuthorizationPolicies = items
+			},
+		},
+	}
+	for _, resource := range resources {
+		if err := ctx.Err(); err != nil {
+			snapshot.Incomplete[resource.name] = err
+			continue
+		}
+		gvr, err := discoverOptionalResource(factory, resource.candidates)
+		if err != nil {
+			snapshot.Incomplete[resource.name] = err
+			continue
+		}
+		if gvr == nil {
+			continue
+		}
+		objects, err := factory.List(gvr, resource.namespace, true, labels.Everything())
+		if err != nil {
+			snapshot.Incomplete[resource.name] = err
+			continue
+		}
+		resource.assign(convertSnapshotObjects[unstructured.Unstructured](resource.name, objects, snapshot))
+	}
+	loadIstioRootNamespace(factory, snapshot)
+}
+
+func loadIstioRootNamespace(factory dao.Factory, snapshot *netpol.Snapshot) {
+	if len(snapshot.IstioAuthorizationPolicies) == 0 {
+		return
+	}
+	objects, err := factory.List(client.CmGVR, client.BlankNamespace, true, labels.Everything())
+	if err != nil {
+		snapshot.Incomplete["istio-mesh-config"] = fmt.Errorf("list Istio mesh config: %w", err)
+		return
+	}
+	configMaps := convertSnapshotObjects[corev1.ConfigMap]("istio-mesh-config", objects, snapshot)
+	roots := map[string]struct{}{}
+	for index := range configMaps {
+		configMap := &configMaps[index]
+		if configMap.Name != "istio" && !strings.HasPrefix(configMap.Name, "istio-") {
+			continue
+		}
+		raw, present := configMap.Data["mesh"]
+		if !present {
+			continue
+		}
+		var meshConfig struct {
+			RootNamespace string `yaml:"rootNamespace"`
+		}
+		meshConfig.RootNamespace = netpol.DefaultIstioRootNamespace
+		if err := yaml.Unmarshal([]byte(raw), &meshConfig); err != nil {
+			snapshot.Incomplete["istio-mesh-config"] = errors.Join(
+				snapshot.Incomplete["istio-mesh-config"],
+				fmt.Errorf("parse ConfigMap %s/%s mesh config: %w", configMap.Namespace, configMap.Name, err),
+			)
+			continue
+		}
+		if meshConfig.RootNamespace != "" {
+			roots[meshConfig.RootNamespace] = struct{}{}
+		}
+	}
+	if len(roots) == 0 {
+		return
+	}
+	if len(roots) > 1 {
+		values := make([]string, 0, len(roots))
+		for root := range roots {
+			values = append(values, root)
+		}
+		slices.Sort(values)
+		snapshot.Incomplete["istio-mesh-config"] = errors.Join(
+			snapshot.Incomplete["istio-mesh-config"],
+			fmt.Errorf("multiple Istio root namespaces discovered: %s", strings.Join(values, ", ")),
+		)
+		return
+	}
+	for root := range roots {
+		snapshot.IstioRootNamespace = root
+	}
+}
+
+func discoverOptionalResource(factory dao.Factory, candidates []*client.GVR) (*client.GVR, error) {
+	connection := factory.Client()
+	if connection == nil {
+		return candidates[0], nil
+	}
+	discoveryClient, err := connection.CachedDiscovery()
+	if err != nil {
+		return nil, fmt.Errorf("discover optional policy resource: %w", err)
+	}
+	return selectOptionalResource(discoveryClient, candidates)
+}
+
+type optionalResourceDiscoverer interface {
+	ServerResourcesForGroupVersion(string) (*metav1.APIResourceList, error)
+}
+
+func selectOptionalResource(discoveryClient optionalResourceDiscoverer, candidates []*client.GVR) (*client.GVR, error) {
+	for _, candidate := range candidates {
+		resources, err := discoveryClient.ServerResourcesForGroupVersion(candidate.GV().String())
+		if err != nil {
+			if apierrors.IsNotFound(err) || errors.Is(err, memory.ErrCacheNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("discover %s: %w", candidate, err)
+		}
+		for _, resource := range resources.APIResources {
+			if resource.Name == candidate.R() {
+				return candidate, nil
+			}
+		}
+	}
+	return nil, nil
 }
 
 func injectSelectedSubject(ctx context.Context, factory dao.Factory, subject netpol.SubjectRef, snapshot *netpol.Snapshot) {
@@ -573,6 +723,7 @@ func cloneDirectionResult(result netpol.DirectionResult) netpol.DirectionResult 
 		result.Rules[i].Peers = append([]string(nil), result.Rules[i].Peers...)
 		result.Rules[i].Permissions = clonePermissions(result.Rules[i].Permissions)
 		result.Rules[i].Evidence = cloneEvidence(result.Rules[i].Evidence)
+		result.Rules[i].Notes = append([]string(nil), result.Rules[i].Notes...)
 		result.Rules[i].Warnings = append([]string(nil), result.Rules[i].Warnings...)
 	}
 

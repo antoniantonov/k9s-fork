@@ -14,12 +14,16 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-const DefaultResultLimit = 5_000
+const (
+	DefaultResultLimit        = 5_000
+	DefaultIstioRootNamespace = "istio-system"
+)
 
 type Direction uint8
 
@@ -33,6 +37,55 @@ func (d Direction) String() string {
 		return "Egress"
 	}
 	return "Ingress"
+}
+
+// PolicyType identifies the API resource which supplied a policy rule.
+type PolicyType string
+
+const (
+	PolicyTypeNetworkPolicy                  PolicyType = "np"
+	PolicyTypeCiliumNetworkPolicy            PolicyType = "cnp"
+	PolicyTypeCiliumClusterwideNetworkPolicy PolicyType = "ccnp"
+	PolicyTypeIstioAuthorizationPolicy       PolicyType = "authz"
+	PolicyTypeSynthetic                      PolicyType = "synthetic"
+)
+
+func (t PolicyType) String() string {
+	if t == "" {
+		return string(PolicyTypeNetworkPolicy)
+	}
+	return string(t)
+}
+
+// Kind returns the Kubernetes kind represented by the policy type.
+func (t PolicyType) Kind() string {
+	switch t {
+	case PolicyTypeCiliumNetworkPolicy:
+		return "CiliumNetworkPolicy"
+	case PolicyTypeCiliumClusterwideNetworkPolicy:
+		return "CiliumClusterwideNetworkPolicy"
+	case PolicyTypeIstioAuthorizationPolicy:
+		return "AuthorizationPolicy"
+	case PolicyTypeSynthetic:
+		return "Synthetic"
+	default:
+		return "NetworkPolicy"
+	}
+}
+
+// PolicyAction is the effect of a matching policy rule.
+type PolicyAction string
+
+const (
+	PolicyActionAllow PolicyAction = "allow"
+	PolicyActionDeny  PolicyAction = "deny"
+)
+
+func (a PolicyAction) String() string {
+	if a == "" {
+		return string(PolicyActionAllow)
+	}
+	return string(a)
 }
 
 type SubjectKind uint8
@@ -161,20 +214,46 @@ type RuleID struct {
 	PolicyNamespace string
 	PolicyName      string
 	PolicyUID       types.UID
+	PolicyType      PolicyType
+	PolicyVersion   string
+	PolicySpecIndex int
+	Action          PolicyAction
 	Direction       Direction
 	Index           int
 	SyntheticKind   string
 }
 
 func (r RuleID) String() string {
-	return stableID(
+	parts := []string{
 		r.PolicyNamespace,
 		r.PolicyName,
 		string(r.PolicyUID),
 		r.Direction.String(),
 		fmt.Sprintf("%d", r.Index),
 		r.SyntheticKind,
-	)
+	}
+	// Preserve native NetworkPolicy IDs while making rules from different CRD
+	// kinds, top-level Cilium specs, and actions unambiguous.
+	if r.PolicyType != "" && r.PolicyType != PolicyTypeNetworkPolicy {
+		parts = append(parts,
+			r.PolicyType.String(),
+			r.PolicyVersion,
+			fmt.Sprintf("%d", r.PolicySpecIndex),
+			r.Action.String(),
+		)
+	}
+	return stableID(parts...)
+}
+
+// SourceType returns the rule's effective source policy type.
+func (r RuleID) SourceType() PolicyType {
+	if r.SyntheticKind != "" || r.PolicyName == "" {
+		return PolicyTypeSynthetic
+	}
+	if r.PolicyType == "" {
+		return PolicyTypeNetworkPolicy
+	}
+	return r.PolicyType
 }
 
 type PortPermission struct {
@@ -236,6 +315,7 @@ type RuleResult struct {
 	Permissions       []PortPermission
 	Evidence          []PolicyEvidence
 	Synthetic         bool
+	Notes             []string
 	Warnings          []string
 }
 
@@ -310,14 +390,18 @@ func (r SubjectResult) Direction(direction Direction) DirectionResult {
 }
 
 type Snapshot struct {
-	Pods            []corev1.Pod
-	Namespaces      []corev1.Namespace
-	NetworkPolicies []netv1.NetworkPolicy
-	Deployments     []appsv1.Deployment
-	ReplicaSets     []appsv1.ReplicaSet
-	Jobs            []batchv1.Job
-	Incomplete      map[string]error
-	GeneratedAt     time.Time
+	Pods                             []corev1.Pod
+	Namespaces                       []corev1.Namespace
+	NetworkPolicies                  []netv1.NetworkPolicy
+	CiliumNetworkPolicies            []unstructured.Unstructured
+	CiliumClusterwideNetworkPolicies []unstructured.Unstructured
+	IstioAuthorizationPolicies       []unstructured.Unstructured
+	IstioRootNamespace               string
+	Deployments                      []appsv1.Deployment
+	ReplicaSets                      []appsv1.ReplicaSet
+	Jobs                             []batchv1.Job
+	Incomplete                       map[string]error
+	GeneratedAt                      time.Time
 }
 
 type Options struct {

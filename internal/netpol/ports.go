@@ -77,45 +77,119 @@ func intersectPermissions(a, b []PortPermission) ([]PortPermission, bool) {
 	known := true
 	for _, left := range a {
 		for _, right := range b {
-			if left.Unknown || right.Unknown {
-				if protocolsEqual(left.Protocol, right.Protocol) {
-					out = append(out, PortPermission{Protocol: normalizedProtocol(left.Protocol), Unknown: true})
-					known = false
-				}
-				continue
-			}
 			if !protocolsEqual(left.Protocol, right.Protocol) {
 				continue
 			}
-			if left.All {
-				out = append(out, right)
-				continue
-			}
-			if right.All {
-				out = append(out, left)
-				continue
-			}
-			ls, le := permissionRange(left)
-			rs, re := permissionRange(right)
-			start, end := max32(ls, rs), min32(le, re)
-			if start <= end {
-				v := intstr.FromInt32(start)
-				p := PortPermission{Protocol: normalizedProtocol(left.Protocol), Port: &v}
-				if end != start {
-					p.EndPort = &end
+			ls, le, leftNumeric := permissionBounds(left)
+			rs, re, rightNumeric := permissionBounds(right)
+			var permission PortPermission
+			switch {
+			case left.All || left.Port == nil:
+				permission = right
+			case right.All || right.Port == nil:
+				permission = left
+			case !leftNumeric && !rightNumeric && left.Port.StrVal != right.Port.StrVal:
+				permission = PortPermission{Protocol: left.Protocol}
+			case !leftNumeric:
+				permission = right
+			case !rightNumeric:
+				permission = left
+			default:
+				start, end := max32(ls, rs), min32(le, re)
+				if start > end {
+					continue
 				}
-				out = append(out, p)
+				permission = rangePermission(left.Protocol, start, end)
 			}
+			permission.Unknown = left.Unknown || right.Unknown || !leftNumeric || !rightNumeric
+			known = known && !permission.Unknown
+			out = append(out, permission)
 		}
 	}
 	return canonicalPermissions(out), known
+}
+
+func subtractPermissions(allowed, denied []PortPermission) ([]PortPermission, bool) {
+	out := slices.Clone(allowed)
+	for _, deny := range denied {
+		var next []PortPermission
+		for _, allow := range out {
+			remaining, _ := subtractPermission(allow, deny)
+			next = append(next, remaining...)
+		}
+		out = next
+	}
+	out = canonicalPermissions(out)
+	return out, !slices.ContainsFunc(out, func(permission PortPermission) bool { return permission.Unknown })
+}
+
+func subtractPermission(allowed, denied PortPermission) ([]PortPermission, bool) {
+	if !protocolsEqual(allowed.Protocol, denied.Protocol) {
+		return []PortPermission{allowed}, !allowed.Unknown
+	}
+	denyStart, denyEnd, denyNumeric := permissionBounds(denied)
+	if !denyNumeric {
+		allowed.Unknown = true
+		return []PortPermission{allowed}, false
+	}
+	allowStart, allowEnd, allowNumeric := permissionBounds(allowed)
+	if !allowNumeric {
+		allowStart, allowEnd = 1, 65535
+		allowed.Unknown = true
+	}
+	if denyEnd < allowStart || denyStart > allowEnd {
+		return []PortPermission{allowed}, !allowed.Unknown
+	}
+	if denied.Unknown && (allowed.Unknown || denyStart <= allowStart && denyEnd >= allowEnd) {
+		allowed.Unknown = true
+		return []PortPermission{allowed}, false
+	}
+	var out []PortPermission
+	appendRange := func(start, end int32, unknown bool) {
+		permission := rangePermission(allowed.Protocol, start, end)
+		permission.Unknown = unknown
+		out = append(out, permission)
+	}
+	if denyStart > allowStart {
+		appendRange(allowStart, denyStart-1, allowed.Unknown)
+	}
+	if denied.Unknown {
+		appendRange(max32(allowStart, denyStart), min32(allowEnd, denyEnd), true)
+	}
+	if denyEnd < allowEnd {
+		appendRange(denyEnd+1, allowEnd, allowed.Unknown)
+	}
+	return out, len(out) == 0 || !allowed.Unknown && !denied.Unknown
+}
+
+// Numeric bounds remain upper bounds on possible traffic when Unknown is set.
+// A genuinely unresolved name has no numeric bounds until another constraint
+// limits it; uncertainty must never widen an existing numeric permission.
+func permissionBounds(permission PortPermission) (start, end int32, numeric bool) {
+	if permission.All || permission.Port == nil {
+		return 1, 65535, true
+	}
+	if permission.Port.Type != intstr.Int {
+		return 0, 0, false
+	}
+	start, end = permissionRange(permission)
+	return start, end, true
+}
+
+func rangePermission(protocol corev1.Protocol, start, end int32) PortPermission {
+	port := intstr.FromInt32(start)
+	permission := PortPermission{Protocol: normalizedProtocol(protocol), Port: &port}
+	if end != start {
+		permission.EndPort = &end
+	}
+	return permission
 }
 
 func canonicalPermissions(in []PortPermission) []PortPermission {
 	seen := map[string]PortPermission{}
 	for _, p := range in {
 		p.Protocol = normalizedProtocol(p.Protocol)
-		seen[p.String()] = p
+		seen[permissionKey(p)] = p
 	}
 
 	keys := mapsKeys(seen)
@@ -125,6 +199,14 @@ func canonicalPermissions(in []PortPermission) []PortPermission {
 		out = append(out, seen[k])
 	}
 	return out
+}
+
+func permissionKey(permission PortPermission) string {
+	if permission.Unknown {
+		permission.Unknown = false
+		return string(normalizedProtocol(permission.Protocol)) + "/unknown/" + permission.String()
+	}
+	return permission.String()
 }
 
 func knownPermissions(in []PortPermission) bool {

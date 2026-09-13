@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright Authors of K9s
 #
-# Populates a minimal but complete set of workloads and NetworkPolicies to
+# Populates a minimal but complete set of workloads and network policies to
 # exercise the K9s NetworkPolicy reachability view (:netpolgraph / :npgraph /
 # :npg, or Shift-R from Pod/Deployment/Job/Namespace views).
 #
@@ -17,6 +17,8 @@
 #                 ipBlock with except, empty from/to (allow-all), empty ports,
 #                 named ports, numeric ports, endPort ranges, default deny,
 #                 and unrestricted (no isolating policy)
+#   APIs          NetworkPolicy, CiliumNetworkPolicy,
+#                 CiliumClusterwideNetworkPolicy, Istio AuthorizationPolicy
 #   Owners        Deployment/ReplicaSet, Job, StatefulSet, DaemonSet, bare pod
 #
 # Usage:
@@ -35,7 +37,9 @@
 #   --check, --status    verify the demo topology is already applied and ready; no mutations
 #   --no-wait            do not wait for pods to become ready
 #   --timeout DURATION   readiness wait timeout (default: 180s)
-#   --delete             delete everything this script creates, then exit
+#   --delete             delete this prefix's fixtures, preserving shared CRDs
+#   --probe TYPE         operate only on an opt-in identity or unsupported probe
+#   --probe-id ID        unique owner ID required with --probe (check/apply/delete)
 #   -h, --help           show this help
 # END_USAGE
 
@@ -43,6 +47,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$REPO_ROOT/.github/skills/netpol-graph-testing/scripts/netpol-edge-fixtures.sh"
 
 PREFIX="netpol-demo"
 IMAGE="busybox:1.36"
@@ -56,6 +61,8 @@ TIMEOUT="180s"
 DELETE=0
 DELETE_CLUSTER=0
 CHECK=0
+PROBE=""
+PROBE_ID=""
 
 usage() {
   awk '
@@ -65,6 +72,17 @@ usage() {
       print
     }
   ' "$0"
+}
+
+ensure_demo_crd() {
+  local name="$1"
+  if "${KUBECTL[@]}" get crd "$name" >/dev/null 2>&1; then
+    echo "==> reusing installed CRD $name"
+    return 0
+  fi
+  echo "==> installing graph-only demo CRD $name"
+  "${KUBECTL[@]}" apply -f -
+  "${KUBECTL[@]}" wait --for=condition=Established "crd/$name" --timeout="$TIMEOUT"
 }
 
 build_kubectl() {
@@ -129,6 +147,21 @@ check_resource() {
   return 1
 }
 
+check_resource_absent() {
+  local description="$1" output
+  shift
+  if ! output=$("$@" 2>/dev/null); then
+    printf '  [error] %s\n' "$description"
+    return 1
+  fi
+  if [[ -n "$output" ]]; then
+    printf '  [stale] %s\n' "$description"
+    return 1
+  fi
+  printf '  [ok]   %s\n' "$description"
+  return 0
+}
+
 check_ready_pod_for_selector() {
   local description="$1" namespace="$2" selector="$3" ready
   ready=$("${KUBECTL[@]}" get pods -n "$namespace" -l "$selector" \
@@ -159,9 +192,22 @@ check_topology() {
   check_resource "untrusted deployment" "${KUBECTL[@]}" get deployment -n "$NS_UNTRUSTED" client || failures=$((failures + 1))
   check_resource "open deployment" "${KUBECTL[@]}" get deployment -n "$NS_OPEN" open-app || failures=$((failures + 1))
 
-  check_resource "app network policies" "${KUBECTL[@]}" get networkpolicy -n "$NS_APP" default-deny-all allow-frontend-ingress allow-monitoring-ingress allow-cidr-ingress allow-dns-egress allow-api-egress-db allow-db-ingress-api allow-api-egress-external allow-api-egress-ambiguous allow-ambiguous-ingress-api allow-cache-ingress-all || failures=$((failures + 1))
+  check_resource "app network policies" "${KUBECTL[@]}" get networkpolicy -n "$NS_APP" default-deny-all allow-authz-probe-ingress allow-cidr-ingress allow-dns-egress allow-api-egress-db allow-db-ingress-api allow-api-egress-external allow-api-egress-ambiguous allow-ambiguous-ingress-api allow-cache-ingress-all || failures=$((failures + 1))
+  check_resource_absent "obsolete allow-frontend-ingress is absent" \
+    "${KUBECTL[@]}" get networkpolicy -n "$NS_APP" allow-frontend-ingress --ignore-not-found -o name ||
+    failures=$((failures + 1))
+  check_resource_absent "obsolete allow-monitoring-ingress is absent" \
+    "${KUBECTL[@]}" get networkpolicy -n "$NS_APP" allow-monitoring-ingress --ignore-not-found -o name ||
+    failures=$((failures + 1))
   check_resource "web network policies" "${KUBECTL[@]}" get networkpolicy -n "$NS_WEB" web-default-deny-egress frontend-egress-to-api || failures=$((failures + 1))
   check_resource "untrusted network policy" "${KUBECTL[@]}" get networkpolicy -n "$NS_UNTRUSTED" deny-all-egress || failures=$((failures + 1))
+  check_resource "CiliumNetworkPolicy CRD" "${KUBECTL[@]}" get crd ciliumnetworkpolicies.cilium.io || failures=$((failures + 1))
+  check_resource "CiliumClusterwideNetworkPolicy CRD" "${KUBECTL[@]}" get crd ciliumclusterwidenetworkpolicies.cilium.io || failures=$((failures + 1))
+  check_resource "AuthorizationPolicy CRD" "${KUBECTL[@]}" get crd authorizationpolicies.security.istio.io || failures=$((failures + 1))
+  check_resource "app Cilium network policy" "${KUBECTL[@]}" get ciliumnetworkpolicies.cilium.io -n "$NS_APP" demo-cnp-frontend || failures=$((failures + 1))
+  check_resource "clusterwide Cilium network policy" "${KUBECTL[@]}" get ciliumclusterwidenetworkpolicies.cilium.io "$CCNP_MONITORING" || failures=$((failures + 1))
+  check_resource "app Istio authorization policy" "${KUBECTL[@]}" get authorizationpolicies.security.istio.io -n "$NS_APP" demo-authz-api || failures=$((failures + 1))
+  check_edge_fixtures || failures=$((failures + 1))
 
   for ns in "$NS_APP" "$NS_WEB" "$NS_MON" "$NS_UNTRUSTED" "$NS_OPEN"; do
     check_resource "deployments ready in $ns" "${KUBECTL[@]}" wait --for=condition=Available deployment --all -n "$ns" --timeout=1s || failures=$((failures + 1))
@@ -223,10 +269,38 @@ while [[ $# -gt 0 ]]; do
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --delete) DELETE=1; shift ;;
     --check|--status) CHECK=1; shift ;;
+    --probe) PROBE="$2"; shift 2 ;;
+    --probe-id) PROBE_ID="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
+
+if (( CHECK == 1 && (DELETE == 1 || DELETE_CLUSTER == 1) )); then
+  echo "cannot combine --check/--status with --delete or --delete-cluster" >&2
+  exit 2
+fi
+if (( DELETE == 1 && DELETE_CLUSTER == 1 )); then
+  echo "cannot combine --delete with --delete-cluster" >&2
+  exit 2
+fi
+if [[ ! "$PREFIX" =~ ^[a-z0-9]([a-z0-9-]{0,50}[a-z0-9])?$ ]]; then
+  echo "--prefix must be a 1-52 character DNS label" >&2
+  exit 2
+fi
+if [[ -n "$PROBE" ]]; then
+  if [[ "$PROBE" != identity && "$PROBE" != unsupported ]]; then
+    echo "--probe must be identity or unsupported" >&2
+    exit 2
+  fi
+  if [[ ! "$PROBE_ID" =~ ^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$ ]] || (( DELETE_CLUSTER == 1 )); then
+    echo "--probe requires a unique 2-63 character DNS-label --probe-id and cannot delete a cluster" >&2
+    exit 2
+  fi
+elif [[ -n "$PROBE_ID" ]]; then
+  echo "--probe-id requires --probe" >&2
+  exit 2
+fi
 
 HOST_KUBECONFIG="$REPO_ROOT/.kube/${CLUSTER}.kubeconfig"
 INTERNAL_KUBECONFIG="$REPO_ROOT/.kube/${CLUSTER}.internal.kubeconfig"
@@ -236,7 +310,13 @@ NS_WEB="${PREFIX}-web"
 NS_MON="${PREFIX}-monitoring"
 NS_UNTRUSTED="${PREFIX}-untrusted"
 NS_OPEN="${PREFIX}-open"
-ALL_NS=("$NS_APP" "$NS_WEB" "$NS_MON" "$NS_UNTRUSTED" "$NS_OPEN")
+NS_EDGE_SRC="${PREFIX}-edge-src"
+NS_EDGE_DST="${PREFIX}-edge-dst"
+NS_EDGE_OTHER="${PREFIX}-edge-other"
+EDGE_SCENARIO="${PREFIX}-edges"
+CCNP_MONITORING="${PREFIX}-ccnp-monitoring"
+[[ "$PREFIX" == netpol-demo ]] && CCNP_MONITORING=demo-ccnp-monitoring
+ALL_NS=("$NS_APP" "$NS_WEB" "$NS_MON" "$NS_UNTRUSTED" "$NS_OPEN" "$NS_EDGE_SRC" "$NS_EDGE_DST" "$NS_EDGE_OTHER")
 
 if [[ "$DELETE_CLUSTER" -eq 1 ]]; then
   require_command kind
@@ -251,7 +331,7 @@ fi
 
 require_command kubectl
 
-if [[ "$CHECK" -eq 1 ]]; then
+if [[ "$CHECK" -eq 1 || "$DELETE" -eq 1 || -n "$PROBE" ]]; then
   if [[ "$NO_CLUSTER" -eq 0 && -z "$KUBECONFIG_ARG" ]]; then
     if [[ -f "$HOST_KUBECONFIG" ]]; then
       KUBECONFIG_ARG="$HOST_KUBECONFIG"
@@ -264,8 +344,24 @@ if [[ "$CHECK" -eq 1 ]]; then
     echo "cannot reach the cluster; check --kubeconfig/--context or run without --check to bootstrap" >&2
     exit 1
   }
-  check_topology
-  exit $?
+  if [[ -n "$PROBE" ]]; then
+    EDGE_MODE=apply
+    (( CHECK == 1 )) && EDGE_MODE=check
+    (( DELETE == 1 )) && EDGE_MODE=delete
+    edge_probe_policy
+    exit $?
+  elif [[ "$CHECK" -eq 1 ]]; then
+    check_topology
+    exit $?
+  fi
+  "${KUBECTL[@]}" delete ciliumclusterwidenetworkpolicies.cilium.io "$CCNP_MONITORING" \
+    --ignore-not-found --wait=true 2>/dev/null || true
+  "${KUBECTL[@]}" delete ciliumclusterwidenetworkpolicies.cilium.io \
+    -l "netpol-demo-prefix=$PREFIX,netpol-demo-edge=true" --ignore-not-found --wait=true
+  echo "==> deleting namespaces: ${ALL_NS[*]}"
+  "${KUBECTL[@]}" delete namespace "${ALL_NS[@]}" --ignore-not-found --wait=true
+  echo "==> shared policy CRDs preserved"
+  exit 0
 fi
 
 if [[ "$NO_CLUSTER" -eq 0 ]]; then
@@ -280,13 +376,6 @@ else
   }
 fi
 
-if [[ "$DELETE" -eq 1 ]]; then
-  echo "==> deleting namespaces: ${ALL_NS[*]}"
-  "${KUBECTL[@]}" delete namespace "${ALL_NS[@]}" --ignore-not-found --wait=true
-  echo "==> done"
-  exit 0
-fi
-
 if [[ "$NO_CLUSTER" -eq 0 ]]; then
   echo "==> preloading $IMAGE into kind cluster $CLUSTER"
   docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE"
@@ -296,7 +385,108 @@ fi
 # Long-running command: busybox has no `sleep infinity`, so loop instead.
 IDLE_CMD='while true; do sleep 3600; done'
 
+ensure_demo_crd ciliumnetworkpolicies.cilium.io <<'YAML'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ciliumnetworkpolicies.cilium.io
+  annotations:
+    k9scli.io/netpol-demo-owned: "true"
+spec:
+  group: cilium.io
+  names:
+    kind: CiliumNetworkPolicy
+    listKind: CiliumNetworkPolicyList
+    plural: ciliumnetworkpolicies
+    singular: ciliumnetworkpolicy
+    shortNames: [cnp]
+  scope: Namespaced
+  versions:
+    - name: v2
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+            specs:
+              type: array
+              items:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+YAML
+
+ensure_demo_crd ciliumclusterwidenetworkpolicies.cilium.io <<'YAML'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ciliumclusterwidenetworkpolicies.cilium.io
+  annotations:
+    k9scli.io/netpol-demo-owned: "true"
+spec:
+  group: cilium.io
+  names:
+    kind: CiliumClusterwideNetworkPolicy
+    listKind: CiliumClusterwideNetworkPolicyList
+    plural: ciliumclusterwidenetworkpolicies
+    singular: ciliumclusterwidenetworkpolicy
+    shortNames: [ccnp]
+  scope: Cluster
+  versions:
+    - name: v2
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+            specs:
+              type: array
+              items:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+YAML
+
+ensure_demo_crd authorizationpolicies.security.istio.io <<'YAML'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: authorizationpolicies.security.istio.io
+  annotations:
+    k9scli.io/netpol-demo-owned: "true"
+spec:
+  group: security.istio.io
+  names:
+    kind: AuthorizationPolicy
+    listKind: AuthorizationPolicyList
+    plural: authorizationpolicies
+    singular: authorizationpolicy
+    shortNames: [authz]
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+YAML
+
 echo "==> applying namespaces, workloads and network policies (prefix: $PREFIX)"
+
+"${KUBECTL[@]}" delete networkpolicy -n "$NS_APP" \
+  allow-frontend-ingress allow-monitoring-ingress \
+  --ignore-not-found --wait=true >/dev/null 2>&1 || true
 
 "${KUBECTL[@]}" apply -f - <<YAML
 ################################################################################
@@ -695,12 +885,13 @@ spec:
   podSelector: {}
   policyTypes: [Ingress, Egress]
 ---
-# Single peer with BOTH selectors: intersection of namespace and pod selectors.
-# Named port "http" resolves to 8080 on the api pods.
+# This native allow makes open-app -> api:7070 valid at the network layer. The
+# Istio AuthorizationPolicy below intentionally omits 7070, so the effective
+# graph result proves that the authorization layer denies the TCP path.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: allow-frontend-ingress
+  name: allow-authz-probe-ingress
   namespace: ${NS_APP}
 spec:
   podSelector:
@@ -709,28 +900,11 @@ spec:
   ingress:
     - from:
         - namespaceSelector:
-            matchLabels: {team: web}
+            matchLabels: {team: open}
           podSelector:
-            matchLabels: {app: frontend}
+            matchLabels: {app: open-app}
       ports:
-        - {protocol: TCP, port: http}
----
-# namespaceSelector alone: every pod in matching namespaces.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-monitoring-ingress
-  namespace: ${NS_APP}
-spec:
-  podSelector:
-    matchLabels: {app: api}
-  policyTypes: [Ingress]
-  ingress:
-    - from:
-        - namespaceSelector:
-            matchLabels: {team: observability}
-      ports:
-        - {protocol: TCP, port: 9090}
+        - {protocol: TCP, port: 7070}
 ---
 # ipBlock ingress peer with except -> CIDR primitives in the ingress panel.
 apiVersion: networking.k8s.io/v1
@@ -915,7 +1089,67 @@ metadata:
 spec:
   podSelector: {}
   policyTypes: [Egress]
+---
+################################################################################
+# Optional policy APIs. The Cilium policies are the only network-layer ingress
+# allows for their respective peers, so their applicability rows prove that
+# CNP and CCNP change effective reachability. Istio permits those paths but
+# excludes the native 7070 probe above, proving its independent authorization
+# layer affects the final result.
+################################################################################
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: demo-cnp-frontend
+  namespace: ${NS_APP}
+spec:
+  endpointSelector:
+    matchLabels:
+      k8s:app: api
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:app: frontend
+            k8s:io.kubernetes.pod.namespace: ${NS_WEB}
+      toPorts:
+        - ports:
+            - {port: "8080", protocol: TCP}
+---
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: ${CCNP_MONITORING}
+spec:
+  endpointSelector:
+    matchLabels:
+      k8s:app: api
+      k8s:io.kubernetes.pod.namespace: ${NS_APP}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:app: prometheus
+            k8s:io.kubernetes.pod.namespace: ${NS_MON}
+      toPorts:
+        - ports:
+            - {port: "9090", protocol: TCP}
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: demo-authz-api
+  namespace: ${NS_APP}
+spec:
+  selector:
+    matchLabels:
+      app: api
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            ports: ["8080", "9090"]
 YAML
+
+apply_edge_fixtures
 
 if [[ "$WAIT" -eq 1 ]]; then
   echo "==> waiting for workload pods to be ready (timeout: $TIMEOUT)"
