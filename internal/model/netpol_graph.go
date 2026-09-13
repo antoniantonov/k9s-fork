@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/discovery/cached/memory"
 	"sigs.k8s.io/yaml"
 )
 
@@ -564,13 +565,14 @@ func loadIstioRootNamespace(factory dao.Factory, snapshot *netpol.Snapshot) {
 		if configMap.Name != "istio" && !strings.HasPrefix(configMap.Name, "istio-") {
 			continue
 		}
-		raw := configMap.Data["mesh"]
-		if raw == "" {
+		raw, present := configMap.Data["mesh"]
+		if !present {
 			continue
 		}
 		var meshConfig struct {
 			RootNamespace string `yaml:"rootNamespace"`
 		}
+		meshConfig.RootNamespace = netpol.DefaultIstioRootNamespace
 		if err := yaml.Unmarshal([]byte(raw), &meshConfig); err != nil {
 			snapshot.Incomplete["istio-mesh-config"] = errors.Join(
 				snapshot.Incomplete["istio-mesh-config"],
@@ -622,7 +624,7 @@ func selectOptionalResource(discoveryClient optionalResourceDiscoverer, candidat
 	for _, candidate := range candidates {
 		resources, err := discoveryClient.ServerResourcesForGroupVersion(candidate.GV().String())
 		if err != nil {
-			if apierrors.IsNotFound(err) {
+			if apierrors.IsNotFound(err) || errors.Is(err, memory.ErrCacheNotFound) {
 				continue
 			}
 			return nil, fmt.Errorf("discover %s: %w", candidate, err)
@@ -721,6 +723,7 @@ func cloneDirectionResult(result netpol.DirectionResult) netpol.DirectionResult 
 		result.Rules[i].Peers = append([]string(nil), result.Rules[i].Peers...)
 		result.Rules[i].Permissions = clonePermissions(result.Rules[i].Permissions)
 		result.Rules[i].Evidence = cloneEvidence(result.Rules[i].Evidence)
+		result.Rules[i].Notes = append([]string(nil), result.Rules[i].Notes...)
 		result.Rules[i].Warnings = append([]string(nil), result.Rules[i].Warnings...)
 	}
 

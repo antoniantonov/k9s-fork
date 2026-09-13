@@ -53,6 +53,7 @@ github.com/derailed/k9s/internal/netpol/policy.go:20.1,20.8 7 1
 	if err != nil {
 		t.Fatalf("parse profile: %v", err)
 	}
+	normalizeProfilePaths(blocks, "github.com/derailed/k9s")
 	results := calculateCoverage(changed, blocks)
 	if len(results) != 1 {
 		t.Fatalf("expected one result, got %#v", results)
@@ -99,6 +100,9 @@ func TestParserErrorsAndThresholdValues(t *testing.T) {
 	if err := thresholds.Set("file.go=101"); err == nil {
 		t.Fatal("expected out-of-range percentage error")
 	}
+	if err := thresholds.Set("file.go=NaN"); err == nil {
+		t.Fatal("expected non-finite percentage error")
+	}
 	if thresholds.String() != "internal/netpol/policy.go=80.0" {
 		t.Fatalf("unexpected threshold string: %s", thresholds.String())
 	}
@@ -108,11 +112,17 @@ func TestCoverageHelpers(t *testing.T) {
 	if got := (coverageResult{}).percent(); got != 100 {
 		t.Fatalf("empty coverage should be 100%%, got %.1f", got)
 	}
-	if !profilePathMatches(
+	if profilePathMatches(
 		"github.com/derailed/k9s/internal/netpol/policy.go",
 		"internal/netpol/policy.go",
 	) {
-		t.Fatal("module profile path should match repository path")
+		t.Fatal("profile paths must be normalized before matching")
+	}
+	if !profilePathMatches("internal/netpol/policy.go", "internal/netpol/policy.go") {
+		t.Fatal("normalized profile path should match repository path")
+	}
+	if profilePathMatches("internal/netpol/policy.go", "policy.go") {
+		t.Fatal("a basename suffix must not match a different source file")
 	}
 	if profilePathMatches("internal/netpol/other.go", "internal/netpol/policy.go") {
 		t.Fatal("different paths must not match")
@@ -130,8 +140,9 @@ func TestRunIncludesTrackedAndUntrackedChanges(t *testing.T) {
 	runGit(t, repository, "init", "-b", "master")
 	runGit(t, repository, "config", "user.email", "test@example.com")
 	runGit(t, repository, "config", "user.name", "Diff Cover Test")
+	writeTestFile(t, repository, "go.mod", "module example\n")
 	writeTestFile(t, repository, "covered.go", "package sample\n")
-	runGit(t, repository, "add", "covered.go")
+	runGit(t, repository, "add", "covered.go", "go.mod")
 	runGit(t, repository, "commit", "-m", "base")
 
 	writeTestFile(t, repository, "covered.go", "package sample\n\nfunc covered() int {\n\treturn 1\n}\n")
@@ -172,9 +183,131 @@ example/untracked.go:3.1,5.2 2 1
 	}
 }
 
+func TestRunRejectsMissingProfileFiles(t *testing.T) {
+	for _, tracked := range []bool{false, true} {
+		t.Run(map[bool]string{false: "untracked", true: "tracked"}[tracked], func(t *testing.T) {
+			repository := t.TempDir()
+			runGit(t, repository, "init", "-b", "master")
+			runGit(t, repository, "config", "user.email", "test@example.com")
+			runGit(t, repository, "config", "user.name", "Diff Cover Test")
+			writeTestFile(t, repository, "go.mod", "module example\n")
+			writeTestFile(t, repository, "covered.go", "package sample\n")
+			if tracked {
+				writeTestFile(t, repository, "omitted.go", "package sample\n")
+			}
+			runGit(t, repository, "add", ".")
+			runGit(t, repository, "commit", "-m", "base")
+			writeTestFile(t, repository, "covered.go", "package sample\n\nfunc covered() int {\n\treturn 1\n}\n")
+			writeTestFile(t, repository, "omitted.go", "package sample\n\nfunc omitted() int {\n\treturn 2\n}\n")
+			writeTestFile(t, repository, "coverage.out", "mode: set\nexample/covered.go:3.20,5.2 1 1\n")
+
+			t.Chdir(repository)
+			var stdout, stderr bytes.Buffer
+			err := run([]string{"--base", "master", "--profile", "coverage.out"}, &stdout, &stderr)
+			if err == nil || !strings.Contains(err.Error(), "omitted.go") {
+				t.Fatalf("missing executable source must fail coverage, got %v\n%s", err, stdout.String())
+			}
+		})
+	}
+}
+
 func TestAddUntrackedFilesErrors(t *testing.T) {
 	if err := addUntrackedFiles(map[string]lineSet{}, "missing.go"); err == nil {
 		t.Fatal("expected missing untracked file error")
+	}
+}
+
+func TestValidateChangedFunctions(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		source  string
+		lines   lineSet
+		blocks  []coverBlock
+		wantErr bool
+	}{
+		{
+			name: "covered", source: "package p\nfunc one() int {\n return 1\n}\n",
+			lines:  lineSet{3: {}},
+			blocks: []coverBlock{{path: "source.go", startLine: 2, endLine: 4, statements: 1}},
+		},
+		{
+			name: "missing-other-function", source: "package p\nfunc one() int { return 1 }\nfunc two() int { return 2 }\n",
+			lines:   lineSet{3: {}},
+			blocks:  []coverBlock{{path: "source.go", startLine: 2, endLine: 2, statements: 1}},
+			wantErr: true,
+		},
+		{
+			name: "missing-closure", source: "package p\nvar closure = func() int { return 1 }\n",
+			lines: lineSet{2: {}}, wantErr: true,
+		},
+		{
+			name: "declarations-only", source: "package p\ntype A struct{ Value int }\nfunc assembly()\nfunc empty() {}\n",
+			lines: lineSet{2: {}, 3: {}, 4: {}},
+		},
+		{
+			name: "outside-function", source: "package p\nfunc one() int { return 1 }\n",
+			lines: lineSet{1: {}},
+		},
+		{
+			name: "invalid-source", source: "package p\nfunc (\n",
+			lines: lineSet{2: {}}, wantErr: true,
+		},
+		{
+			name: "suffix-is-not-source", source: "package p\nfunc one() int { return 1 }\n",
+			lines:   lineSet{2: {}},
+			blocks:  []coverBlock{{path: "nested/source.go", startLine: 2, endLine: 2, statements: 1}},
+			wantErr: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			writeTestFile(t, directory, "source.go", test.source)
+			t.Chdir(directory)
+			err := validateChangedFunctions(map[string]lineSet{"source.go": test.lines}, test.blocks)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateChangedFunctions returned %v, want error %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestModuleAndUntrackedPaths(t *testing.T) {
+	directory := t.TempDir()
+	t.Chdir(directory)
+	if _, err := readModulePath("missing.mod"); err == nil {
+		t.Fatal("expected unreadable module error")
+	}
+	writeTestFile(t, directory, "go.mod", "go 1.25.8\n")
+	if _, err := readModulePath("go.mod"); err == nil {
+		t.Fatal("expected missing module directive error")
+	}
+	writeTestFile(t, directory, "go.mod", "// comment\nmodule \"example.org/project\"\n")
+	module, err := readModulePath("go.mod")
+	if err != nil || module != "example.org/project" {
+		t.Fatalf("module path: %q, %v", module, err)
+	}
+	blocks := []coverBlock{{path: "example.org/project/main.go"}, {path: "other.org/main.go"}}
+	normalizeProfilePaths(blocks, module)
+	if blocks[0].path != "main.go" || blocks[1].path != "other.org/main.go" {
+		t.Fatalf("incorrect profile normalization: %#v", blocks)
+	}
+	writeTestFile(t, directory, "file with spaces.go", "package p\n")
+	changed := map[string]lineSet{}
+	if err := addUntrackedFiles(changed, "file with spaces.go\x00"); err != nil {
+		t.Fatal(err)
+	}
+	if len(changed["file with spaces.go"]) != 1 {
+		t.Fatalf("untracked filename was not preserved: %#v", changed)
+	}
+}
+
+func TestRunRejectsInvalidThresholds(t *testing.T) {
+	for _, value := range []string{"NaN", "-1", "101"} {
+		var stdout, stderr bytes.Buffer
+		err := run([]string{"--profile", "unused", "--threshold", value}, &stdout, &stderr)
+		if err == nil || !strings.Contains(err.Error(), "between 0 and 100") {
+			t.Fatalf("invalid threshold %s was not rejected: %v", value, err)
+		}
 	}
 }
 

@@ -112,33 +112,34 @@ func intersectPermissions(a, b []PortPermission) ([]PortPermission, bool) {
 }
 
 func subtractPermissions(allowed, denied []PortPermission) ([]PortPermission, bool) {
-	if len(denied) == 0 {
-		return canonicalPermissions(allowed), true
-	}
 	out := slices.Clone(allowed)
-	known := true
 	for _, deny := range denied {
 		var next []PortPermission
 		for _, allow := range out {
-			remaining, exact := subtractPermission(allow, deny)
-			known = known && exact
+			remaining, _ := subtractPermission(allow, deny)
 			next = append(next, remaining...)
 		}
 		out = next
 	}
-	return canonicalPermissions(out), known
+	out = canonicalPermissions(out)
+	return out, !slices.ContainsFunc(out, func(permission PortPermission) bool { return permission.Unknown })
 }
 
 func subtractPermission(allowed, denied PortPermission) ([]PortPermission, bool) {
 	if !protocolsEqual(allowed.Protocol, denied.Protocol) {
 		return []PortPermission{allowed}, true
 	}
+	denyStart, denyEnd, denyNumeric := permissionBounds(denied)
+	if !denied.Unknown && denyNumeric && denyStart == 1 && denyEnd == 65535 {
+		return nil, true
+	}
 	if allowed.Unknown || denied.Unknown {
+		allowed.Unknown = true
 		return []PortPermission{allowed}, false
 	}
 	allowStart, allowEnd, allowNumeric := permissionBounds(allowed)
-	denyStart, denyEnd, denyNumeric := permissionBounds(denied)
 	if !allowNumeric || !denyNumeric {
+		allowed.Unknown = true
 		return []PortPermission{allowed}, false
 	}
 	if denyEnd < allowStart || denyStart > allowEnd {
@@ -178,7 +179,7 @@ func canonicalPermissions(in []PortPermission) []PortPermission {
 	seen := map[string]PortPermission{}
 	for _, p := range in {
 		p.Protocol = normalizedProtocol(p.Protocol)
-		seen[p.String()] = p
+		seen[permissionKey(p)] = p
 	}
 
 	keys := mapsKeys(seen)
@@ -188,6 +189,13 @@ func canonicalPermissions(in []PortPermission) []PortPermission {
 		out = append(out, seen[k])
 	}
 	return out
+}
+
+func permissionKey(permission PortPermission) string {
+	if permission.Unknown {
+		return string(normalizedProtocol(permission.Protocol)) + "/" + permission.String()
+	}
+	return permission.String()
 }
 
 func knownPermissions(in []PortPermission) bool {

@@ -96,7 +96,37 @@ func TestSubtractPermissions(t *testing.T) {
 		[]PortPermission{{Protocol: corev1.ProtocolTCP, Unknown: true}},
 	)
 	require.False(t, known)
-	require.Equal(t, []string{"TCP/all"}, permissionStrings(allowed))
+	require.Equal(t, []string{"unknown"}, permissionStrings(allowed))
+	require.True(t, allowed[0].Unknown)
+}
+
+func TestSubtractUnknownPermissionsAndProtocolWideDenies(t *testing.T) {
+	unknown := PortPermission{Protocol: corev1.ProtocolTCP, Unknown: true}
+	for _, denyTCP := range []PortPermission{
+		{Protocol: corev1.ProtocolTCP, All: true},
+		rangePermission(corev1.ProtocolTCP, 1, 65535),
+	} {
+		for _, denies := range [][]PortPermission{{unknown, denyTCP}, {denyTCP, unknown}} {
+			remaining, known := subtractPermissions(
+				[]PortPermission{{Protocol: corev1.ProtocolTCP, All: true}, {Protocol: corev1.ProtocolUDP, All: true}},
+				denies,
+			)
+			require.True(t, known)
+			require.Equal(t, []string{"UDP/all"}, permissionStrings(remaining))
+		}
+	}
+	remaining, known := subtractPermissions([]PortPermission{unknown}, nil)
+	require.False(t, known)
+	require.True(t, remaining[0].Unknown)
+}
+
+func TestUnknownEvidenceRetainsProtocolIdentity(t *testing.T) {
+	id := RuleID{PolicyNamespace: "server", PolicyName: "named", PolicyType: PolicyTypeCiliumNetworkPolicy}
+	evidence := uniqueEvidence([]PolicyEvidence{
+		{RuleID: id, Ports: []PortPermission{{Protocol: corev1.ProtocolTCP, Unknown: true}}},
+		{RuleID: id, Ports: []PortPermission{{Protocol: corev1.ProtocolUDP, Unknown: true}}},
+	})
+	require.Len(t, evidence, 2)
 }
 
 func permissionStrings(permissions []PortPermission) []string {

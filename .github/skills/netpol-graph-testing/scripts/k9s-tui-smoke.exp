@@ -12,21 +12,108 @@ set prefix $env(CLUSTER_PREFIX)
 set network $env(DOCKER_NETWORK)
 set log_dir $env(EXPECT_LOG_DIR)
 set ns_app "${prefix}-app"
+set ns_edge_src "${prefix}-edge-src"
+set ns_edge_dst "${prefix}-edge-dst"
+set ns_edge_other "${prefix}-edge-other"
+set suite known
+if {[info exists env(SMOKE_SUITE)]} { set suite $env(SMOKE_SUITE) }
+set probe_id ""
+if {[info exists env(PROBE_ID)]} { set probe_id $env(PROBE_ID) }
+set screen_rows 50
+set screen_columns 200
 set case_name "startup"
 set failures 0
 set case_failed 0
 set case_verdict 1
-set verdicts {}
+set verdicts [dict create]
+set started_cases [dict create]
 set container "k9s-netpol-smoke-[pid]"
-if {[info exists env(EXPECT_SYNTAX_CHECK)] && $env(EXPECT_SYNTAX_CHECK) eq "1"} { exit 0 }
+set helper_file "[file dirname [info script]]/k9s-screen-assertions.exp"
+set syntax_only [expr {[info exists env(EXPECT_SYNTAX_CHECK)] && $env(EXPECT_SYNTAX_CHECK) eq "1"}]
+set initial_procs [info procs]
+if {$syntax_only} {
+  set syntax_sources [dict create]
+  foreach path [list [info script] $helper_file] {
+    set source_file [open $path r]
+    set source_text [read $source_file]
+    close $source_file
+    if {![info complete $source_text]} {
+      puts stderr "incomplete Tcl command in $path"
+      exit 1
+    }
+    dict set syntax_sources $path $source_text
+  }
+}
+source $helper_file
+
+set edge_pairs [list \
+  [list cnp-overlap cnp-client $ns_edge_src cnp-server $ns_edge_dst Allowed {TCP/8081}] \
+  [list cnp-mismatch cnp-client $ns_edge_src cnp-mismatch $ns_edge_dst Disallowed {no ports}] \
+  [list cnp-egress-deny cnp-client $ns_edge_src cnp-denied $ns_edge_dst Disallowed {no ports}] \
+  [list cnp-ingress-deny cnp-blocked $ns_edge_src cnp-server $ns_edge_dst Disallowed {no ports}] \
+  [list cnp-unmatched-source control $ns_edge_other cnp-server $ns_edge_dst Disallowed {no ports}] \
+  [list cnp-unmatched-target cnp-client $ns_edge_src control $ns_edge_other Disallowed {no ports}] \
+  [list ccnp-overlap ccnp-client $ns_edge_src ccnp-server $ns_edge_dst Allowed {TCP/9092}] \
+  [list ccnp-egress-deny ccnp-client $ns_edge_src ccnp-denied $ns_edge_dst Disallowed {no ports}] \
+  [list ccnp-unmatched-source control $ns_edge_other ccnp-server $ns_edge_dst Disallowed {no ports}] \
+  [list ccnp-unmatched-target ccnp-client $ns_edge_src control $ns_edge_other Disallowed {no ports}] \
+  [list istio-ports authz-client $ns_edge_src authz-server $ns_edge_dst Allowed {TCP/8080, UDP/5353, SCTP/9000}] \
+  [list istio-no-tcp authz-client $ns_edge_src authz-no-tcp $ns_edge_dst Allowed {UDP/5353, SCTP/9000}] \
+  [list istio-empty-allow authz-client $ns_edge_src authz-closed $ns_edge_dst Disallowed {no ports}] \
+]
+set known_cases {
+  launch-npg-view subject-picker-kinds direction-toggles-placeholder
+  rules-primitives-global-toggle primitive-kinds-apply-cancel-zero
+  search-apply-clear-cancel tab-and-shift-tab-focus-ring left-right-direction-focus
+  enter-navigation-rule-selected enter-navigation-effective-applicability
+  enter-navigation-primitive-details enter-stays-in-applicability
+  open-primitive-from-subject open-primitive-from-direction-panels
+  open-primitive-from-applicability open-primitive-disabled-in-rule-details yaml-view
+  rule-policy-type-column cilium-network-policy-details-and-yaml
+  cilium-clusterwide-policy-details-and-yaml istio-authorization-policy-details-and-yaml
+  istio-authorization-effective-deny yaml-hidden-without-a-manifest auto-refresh-toggle
+  escape-clears-selection-before-back ctrl-s-set-subject-from-subject-panel
+  ctrl-s-set-subject-from-applicability freeze-hang-stress
+}
+foreach pair $edge_pairs {
+  foreach direction {ingress egress} { lappend known_cases "[lindex $pair 0]-$direction" }
+}
+foreach family {cnp ccnp} {
+  foreach direction {ingress egress} { lappend known_cases "$family-empty-rule-$direction" }
+}
+lappend known_cases \
+  cnp-ingress-rule-navigation cnp-egress-spec-rule-navigation \
+  ccnp-ingress-spec-rule-navigation ccnp-egress-spec-rule-navigation \
+  istio-ingress-rule-navigation native-egress-istio-opposite-navigation \
+  istio-source-ingress-deny-egress-control cilium-cidr-narrow-deny
+set case_manifest [dict create known $known_cases \
+  identity {istio-identity-ingress-partial-data istio-identity-egress-partial-data} \
+  unsupported {unsupported-cilium-rule-details unsupported-snapshot-egress-partial-data}]
+if {!$syntax_only && [info exists env(EXPECT_CASE_MANIFEST)] && $env(EXPECT_CASE_MANIFEST) eq "1"} {
+  foreach group {known identity unsupported} {
+    foreach name [dict get $case_manifest $group] { puts "$group\t$name" }
+  }
+  exit 0
+}
+if {!$syntax_only} {
+  if {![dict exists $case_manifest $suite]} { puts stderr "unknown smoke suite: $suite"; exit 2 }
+  if {$suite ne "known" && $probe_id eq ""} { puts stderr "PROBE_ID is required for uncertainty suites"; exit 2 }
+}
 
 proc say {msg} { puts $msg }
+
+proc fixture_text {value} {
+  global prefix
+  set monitoring demo-ccnp-monitoring
+  if {$prefix ne "netpol-demo"} { set monitoring "${prefix}-ccnp-monitoring" }
+  return [string map [list netpol-demo $prefix demo-ccnp-monitoring $monitoring] $value]
+}
 
 proc fail_case {msg} {
   global case_name failures case_failed case_verdict verdicts
   incr failures
   set case_failed 1
-  if {!$case_verdict} { lappend verdicts [list $case_name FAIL] }
+  dict set verdicts $case_name FAIL
   set case_verdict 1
   puts "FAIL $case_name: $msg"
 }
@@ -41,7 +128,7 @@ proc fail_case_dump {msg} {
 proc pass_case {} {
   global case_name case_failed case_verdict verdicts
   if {$case_failed} { return }
-  if {!$case_verdict} { lappend verdicts [list $case_name PASS] }
+  dict set verdicts $case_name PASS
   set case_verdict 1
   puts "PASS $case_name"
 }
@@ -56,14 +143,18 @@ proc close_case {} {
   }
 }
 
-proc start_case {name} {
-  global case_name case_failed case_verdict ns_app
+proc start_case {name {reset 1}} {
+  global case_name case_failed case_verdict ns_app started_cases case_manifest suite
   close_case
   set case_name $name
   set case_failed 0
   set case_verdict 0
   puts "CASE $case_name"
-  if {$name ne "launch-npg-view"} {
+  if {![expr {$name in [dict get $case_manifest $suite]}] || [dict exists $started_cases $name]} {
+    fail_case "unexpected or duplicate case in suite $suite"
+  }
+  dict set started_cases $name 1
+  if {$reset && $name ne "launch-npg-view"} {
     send -- ":npg deployment api $ns_app\r"
     after 1200
   }
@@ -89,14 +180,15 @@ proc drain {{quiet_seconds 1}} {
 # text would otherwise time out. Nudging the pty size makes tview repaint the
 # whole screen, which puts the current view back on the wire.
 proc repaint {} {
-  global spawn_out
-  catch {exec stty rows 49 columns 200 < $spawn_out(slave,name)}
+  global spawn_out screen_rows screen_columns
+  catch {exec stty rows [expr {$screen_rows - 1}] columns $screen_columns < $spawn_out(slave,name)}
   after 200
-  catch {exec stty rows 50 columns 200 < $spawn_out(slave,name)}
+  catch {exec stty rows $screen_rows columns $screen_columns < $spawn_out(slave,name)}
   after 300
 }
 
 proc wait_stream {pattern {seconds 20}} {
+  set pattern [fixture_text $pattern]
   set old_timeout $::timeout
   set ::timeout $seconds
   expect {
@@ -113,7 +205,7 @@ proc assert_screen {pattern {seconds 20}} {
 }
 
 proc send_key {keys {pause_ms 250}} {
-  send -- $keys
+  send -- [fixture_text $keys]
   after $pause_ms
 }
 
@@ -130,6 +222,7 @@ proc assert_all_screen {patterns {seconds 20}} {
 }
 
 proc screen_matches {pattern {seconds 5}} {
+  set pattern [fixture_text $pattern]
   drain 1
   repaint
   set old_timeout $::timeout
@@ -225,20 +318,49 @@ proc finish_case {} {
   pass_case
 }
 
+if {$syntax_only} {
+  if {[llength [info commands ::tcl::unsupported::disassemble]] == 0} {
+    puts stderr "Tcl bytecode inspection is required for non-executing syntax validation"
+    exit 1
+  }
+  set syntax_opcode {^[[:space:]]*\([0-9]+\) syntax(?:[[:space:]]|$)}
+  dict for {path source_text} $syntax_sources {
+    proc __netpol_syntax_file {} $source_text
+    if {[catch {::tcl::unsupported::disassemble proc __netpol_syntax_file} compiled] ||
+        [regexp -line $syntax_opcode $compiled]} {
+      puts stderr "invalid Tcl syntax in $path"
+      exit 1
+    }
+  }
+  rename __netpol_syntax_file ""
+  foreach name [info procs] {
+    if {$name in $initial_procs} { continue }
+    if {[catch {::tcl::unsupported::disassemble proc $name} compiled] ||
+        [regexp -line $syntax_opcode $compiled]} {
+      puts stderr "invalid Tcl syntax in procedure $name"
+      exit 1
+    }
+  }
+  puts "whole-file Tcl syntax and procedure bodies checked"
+  exit 0
+}
+
 # The kind API server certificate only covers the control-plane container name,
 # so the container joins the kind network and uses the internal kubeconfig.
 set docker_args [list docker run --rm -it --name $container --network $network -e TERM=xterm-256color -e KUBECONFIG=/root/.kube/config -v ${kubeconfig}:/root/.kube/config:ro]
 lappend docker_args $image --readonly -c "npg deployment api $ns_app"
 
 file mkdir $log_dir
-log_file -a "$log_dir/k9s-tui-smoke.session.log"
+log_file -a "$log_dir/k9s-tui-smoke-$suite.session.log"
 # Expect inherits a 0x0 pty when it runs without a controlling terminal, and a
 # zero-sized screen makes the TUI draw nothing at all. Size it explicitly.
 set stty_init "rows 50 cols 200"
 say "spawning: $docker_args"
 spawn {*}$docker_args
+match_max 262144
 stty rows 50 columns 200 < $spawn_out(slave,name)
 
+if {$suite eq "known"} {
 start_case "launch-npg-view"
 if {[assert_all_screen {Subject {Deployment netpol-demo-app/api} {3 pods} {Ingress on} {Egress on} {Kinds: CIDR,Pod,Namespace,Deployment,Job} {Auto-refresh off} {Ingress · Rules} {Egress · Rules} {Selection: none} {Effective Details} {Effective Applicability \(Ingress\)} {read-only graph} {</>} Search {<npg>}} 45]} {
   if {[screen_matches {<ctrl-r>} 2]} {
@@ -635,6 +757,32 @@ expect {
 }
 set timeout 10
 
+foreach pair $edge_pairs {
+  lassign $pair name source source_namespace destination destination_namespace state ports
+  verify_effective_edge "$name-ingress" $destination $destination_namespace Ingress $source $source_namespace $state $ports
+  verify_effective_edge "$name-egress" $source $source_namespace Egress $destination $destination_namespace $state $ports
+}
+foreach family {cnp ccnp} {
+  foreach direction {Ingress Egress} {
+    verify_effective_edge "$family-empty-rule-[string tolower $direction]" "$family-empty" $ns_edge_src $direction control $ns_edge_other Disallowed {no ports}
+  }
+}
+verify_edge_policy cnp-ingress-rule-navigation cnp-server $ns_edge_dst Ingress cnp-target $ns_edge_dst CiliumNetworkPolicy cilium.io/v2 ciliumnetworkpolicies ALLOW {TCP/8081-8082} cnp-client $ns_edge_src {TCP/8081}
+verify_edge_policy cnp-egress-spec-rule-navigation cnp-client $ns_edge_src Egress cnp-source $ns_edge_src CiliumNetworkPolicy cilium.io/v2 ciliumnetworkpolicies ALLOW {TCP/8080-8081} cnp-server $ns_edge_dst {TCP/8081}
+verify_edge_policy ccnp-ingress-spec-rule-navigation ccnp-server $ns_edge_dst Ingress "${prefix}-edge-ccnp" "" CiliumClusterwideNetworkPolicy cilium.io/v2 ciliumclusterwidenetworkpolicies ALLOW {TCP/9091-9092} ccnp-client $ns_edge_src {TCP/9092}
+verify_edge_policy ccnp-egress-spec-rule-navigation ccnp-client $ns_edge_src Egress "${prefix}-edge-ccnp" "" CiliumClusterwideNetworkPolicy cilium.io/v2 ciliumclusterwidenetworkpolicies ALLOW {TCP/9090-9092} ccnp-server $ns_edge_dst {TCP/9092}
+verify_edge_policy istio-ingress-rule-navigation authz-server $ns_edge_dst Ingress authz-ports-allow $ns_edge_dst AuthorizationPolicy security.istio.io/v1 authorizationpolicies ALLOW {TCP/8080-8081} authz-client $ns_edge_src {TCP/8080}
+verify_edge_policy native-egress-istio-opposite-navigation authz-client $ns_edge_src Egress authz-source-network $ns_edge_src NetworkPolicy networking.k8s.io/v1 networkpolicies ALLOW {TCP/8080-8081, UDP/5353, SCTP/9000} authz-server $ns_edge_dst {TCP/8080, UDP/5353, SCTP/9000}
+verify_source_authz_noninterference
+verify_cidr_narrow_deny
+} elseif {$suite eq "identity"} {
+  verify_identity_edge Ingress
+  verify_identity_edge Egress
+} else {
+  verify_unsupported_policy
+  verify_effective_edge unsupported-snapshot-egress-partial-data cnp-client $ns_edge_src Egress cnp-server $ns_edge_dst {Partial Data} {TCP/8081} 1
+}
+
 send_key "q"
 expect {
   eof {}
@@ -642,14 +790,25 @@ expect {
 }
 
 close_case
+foreach name [dict get $case_manifest $suite] {
+  if {![dict exists $verdicts $name]} {
+    dict set verdicts $name FAIL
+    incr failures
+    puts "FAIL $name: expected case never recorded a verdict"
+  }
+}
 
 # Authoritative summary. Mid-run output interleaves with the TUI's own redraw
 # bytes, so per-case lines are unreliable to parse; this block is not.
 puts "=== smoke case summary ==="
-foreach entry $verdicts {
-  puts [format "  %-6s %s" [lindex $entry 1] [lindex $entry 0]]
+puts "suite: $suite"
+set verdict_file [open "$log_dir/smoke-$suite.verdicts" w]
+dict for {name verdict} $verdicts {
+  puts [format "  %-6s %s" $verdict $name]
+  puts $verdict_file "$verdict\t$name"
 }
-puts [format "=== %d case(s), %d failure(s) ===" [llength $verdicts] $failures]
+close $verdict_file
+puts [format "=== %d case(s), %d failure(s) ===" [dict size $verdicts] $failures]
 
 if {$failures > 0} {
   puts "FAILED $failures smoke assertion(s)"

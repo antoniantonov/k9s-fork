@@ -14,6 +14,7 @@ import (
 
 	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/config"
+	"github.com/derailed/k9s/internal/dao"
 	"github.com/derailed/k9s/internal/model"
 	"github.com/derailed/k9s/internal/netpol"
 	"github.com/derailed/k9s/internal/ui"
@@ -2752,12 +2753,14 @@ func TestNetworkPolicyGraphCustomPolicyTargets(t *testing.T) {
 		id   netpol.RuleID
 		gvr  *client.GVR
 		path string
+		kind string
 	}{
 		{
 			name: "network policy",
 			id:   netpol.RuleID{PolicyNamespace: "payments", PolicyName: "native"},
 			gvr:  client.NpGVR,
 			path: "payments/native",
+			kind: "NetworkPolicy",
 		},
 		{
 			name: "Cilium network policy",
@@ -2767,6 +2770,7 @@ func TestNetworkPolicyGraphCustomPolicyTargets(t *testing.T) {
 			},
 			gvr:  client.CnpGVR,
 			path: "payments/cilium",
+			kind: "CiliumNetworkPolicy",
 		},
 		{
 			name: "Cilium clusterwide network policy",
@@ -2775,6 +2779,7 @@ func TestNetworkPolicyGraphCustomPolicyTargets(t *testing.T) {
 			},
 			gvr:  client.CcnpGVR,
 			path: "-/cluster",
+			kind: "CiliumClusterwideNetworkPolicy",
 		},
 		{
 			name: "Istio v1 authorization policy",
@@ -2784,6 +2789,7 @@ func TestNetworkPolicyGraphCustomPolicyTargets(t *testing.T) {
 			},
 			gvr:  client.AuthzGVR,
 			path: "payments/authz",
+			kind: "AuthorizationPolicy",
 		},
 		{
 			name: "Istio v1beta1 authorization policy",
@@ -2793,19 +2799,165 @@ func TestNetworkPolicyGraphCustomPolicyTargets(t *testing.T) {
 			},
 			gvr:  client.AuthzV1BetaGVR,
 			path: "payments/authz",
+			kind: "AuthorizationPolicy",
 		},
 	}
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			gvr, ok := policyGVR(test.id)
-			require.True(t, ok)
-			assert.Equal(t, test.gvr, gvr)
-			assert.Equal(t, test.path, policyPath(test.id))
-		})
+		for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+			if direction == netpol.Egress && test.id.PolicyType == netpol.PolicyTypeIstioAuthorizationPolicy {
+				continue
+			}
+			t.Run(test.name+"/"+direction.String(), func(t *testing.T) {
+				view := newTestNetworkPolicyGraph()
+				result := testSubjectResult()
+				id := test.id
+				id.Direction, id.PolicyVersion, id.PolicySpecIndex = direction, test.gvr.GV().String(), 1
+				rule := netpol.RuleResult{
+					ID: id, SubjectPodCount: 1, SubjectMatchCount: 1, PeerSummary: "selected peer",
+					Permissions: []netpol.PortPermission{{All: true}},
+					Notes:       []string{"selected origin note"},
+				}
+				directionResult := &result.Ingress
+				if direction == netpol.Egress {
+					directionResult = &result.Egress
+				}
+				directionResult.Rules = append(directionResult.Rules, rule)
+				view.applyResult(result)
+				view.focusDirection(direction)
+				selected := selectRule(t, view, result, direction, 1)
+				assert.Equal(t, rule.StableID(), selected)
+				assert.Equal(t, test.kind, view.panels[direction].GetCell(3, 1).Text)
+				detail, ok := view.detailItem.(*ui.RuleDetails)
+				require.True(t, ok)
+				assert.Contains(t, detail.Text.GetText(true), "Policy type: "+test.kind)
+				assert.Contains(t, detail.Text.GetText(true), "Policy API version: "+test.gvr.GV().String())
+				assert.Contains(t, detail.Text.GetText(true), "Direction: "+direction.String())
+				assert.Contains(t, detail.Text.GetText(true), "selected origin note")
+
+				gvr, path, ok := view.yamlTarget()
+				require.True(t, ok)
+				assert.Equal(t, test.gvr, gvr)
+				assert.Equal(t, test.path, path)
+				command, resourcePath, err := view.openPrimitiveTarget()
+				require.NoError(t, err)
+				assert.Equal(t, test.path, resourcePath)
+				router := &Command{alias: dao.NewAlias(nil)}
+				router.alias.Define(test.gvr, test.gvr.String(), test.gvr.R())
+				routed, _, _, err := router.viewMetaFor(cmd.NewInterpreter(command))
+				require.NoError(t, err)
+				assert.Equal(t, test.gvr, routed)
+				assert.True(t, visibleHint(view, "o"))
+				assert.True(t, visibleHint(view, "y"))
+
+				view.applyFocusTarget(focusDetails)
+				gvr, path, ok = view.yamlTarget()
+				require.True(t, ok)
+				assert.Equal(t, test.gvr, gvr)
+				assert.Equal(t, test.path, path)
+				assert.False(t, visibleHint(view, "o"), "rule details are not a primitive selection")
+				view.app = NewApp(config.NewConfig(nil))
+				t.Cleanup(view.app.Content.Clear)
+				require.Nil(t, view.keyboard(tcell.NewEventKey(tcell.KeyRune, 'y', tcell.ModNone)))
+				live, ok := view.app.Content.Top().(*LiveView)
+				require.True(t, ok, "the YAML shortcut must open a live resource view")
+				yamlModel, ok := live.model.(*model.YAML)
+				require.True(t, ok)
+				assert.Equal(t, test.gvr, yamlModel.GVR())
+				assert.Equal(t, test.path, yamlModel.GetPath())
+			})
+		}
 	}
 
 	_, ok := policyGVR(netpol.RuleID{SyntheticKind: "default-deny"})
 	assert.False(t, ok)
+}
+
+func TestNetworkPolicyGraphSyntheticPolicyNavigation(t *testing.T) {
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		for _, kind := range []string{"default-deny", "unrestricted"} {
+			t.Run(direction.String()+"/"+kind, func(t *testing.T) {
+				view := newTestNetworkPolicyGraph()
+				result := testSubjectResult()
+				rule := netpol.RuleResult{
+					ID:        netpol.RuleID{Direction: direction, Index: -1, SyntheticKind: kind},
+					Synthetic: true, SubjectPodCount: 1, SubjectMatchCount: 1, PeerSummary: kind,
+				}
+				if direction == netpol.Ingress {
+					result.Ingress.Rules = []netpol.RuleResult{rule}
+				} else {
+					result.Egress.Rules = []netpol.RuleResult{rule}
+				}
+				view.applyResult(result)
+				view.focusDirection(direction)
+				selectRule(t, view, result, direction, 0)
+				assert.Equal(t, "Synthetic", view.panels[direction].GetCell(0, 1).Text)
+				detail, ok := view.detailItem.(*ui.RuleDetails)
+				require.True(t, ok)
+				assert.Contains(t, detail.Text.GetText(true), "Policy type: Synthetic")
+				_, _, ok = view.yamlTarget()
+				assert.False(t, ok)
+				_, _, err := view.openPrimitiveTarget()
+				assert.ErrorIs(t, err, errNoPrimitiveTarget)
+				assert.False(t, visibleHint(view, "o"))
+				assert.False(t, visibleHint(view, "y"))
+				view.applyFocusTarget(focusDetails)
+				_, _, ok = view.yamlTarget()
+				assert.False(t, ok)
+			})
+		}
+	}
+}
+
+func TestNetworkPolicyGraphPolicyTypeSearchKeepsDirectionsIndependent(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := testSubjectResult()
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		data := &result.Ingress
+		if direction == netpol.Egress {
+			data = &result.Egress
+		}
+		for _, policyType := range []netpol.PolicyType{
+			netpol.PolicyTypeCiliumNetworkPolicy, netpol.PolicyTypeCiliumClusterwideNetworkPolicy,
+		} {
+			data.Rules = append(data.Rules, netpol.RuleResult{
+				ID: netpol.RuleID{
+					PolicyNamespace: "payments", PolicyName: "custom", PolicyType: policyType,
+					PolicyVersion: "cilium.io/v2", Direction: direction,
+				},
+				SubjectPodCount: 1, SubjectMatchCount: 1,
+			})
+		}
+	}
+	view.applyResult(result)
+	down := tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone)
+	for _, test := range []struct {
+		direction netpol.Direction
+		kind      string
+	}{
+		{netpol.Ingress, "CiliumClusterwideNetworkPolicy"},
+		{netpol.Egress, "CiliumNetworkPolicy"},
+	} {
+		view.focusDirection(test.direction)
+		view.applySearch(strings.ToLower(test.kind))
+		panel := view.panels[test.direction]
+		require.Equal(t, 3, panel.GetRowCount())
+		assert.Equal(t, test.kind, panel.GetCell(0, 1).Text)
+		panel.InputHandler()(down, func(tview.Primitive) {})
+		assert.Equal(t, panel.GetCell(0, 1).GetReference(), panel.SelectedID())
+		detail, ok := view.detailItem.(*ui.RuleDetails)
+		require.True(t, ok)
+		assert.Contains(t, detail.Text.GetText(true), "Policy type: "+test.kind)
+		assert.Contains(t, detail.Text.GetText(true), "Direction: "+test.direction.String())
+	}
+	view.focusDirection(netpol.Ingress)
+	view.applySearch("")
+	assert.Equal(t, 9, view.panels[netpol.Ingress].GetRowCount())
+	assert.Equal(t, "ciliumnetworkpolicy", view.panels[netpol.Egress].Filter())
+	assert.Equal(t, 3, view.panels[netpol.Egress].GetRowCount())
+	view.switchMode()
+	view.switchMode()
+	assert.Equal(t, 3, view.panels[netpol.Egress].GetRowCount())
+	assert.Equal(t, "CiliumNetworkPolicy", view.panels[netpol.Egress].GetCell(0, 1).Text)
 }
 
 // The applicability table is what this view exists to show, so a long rule

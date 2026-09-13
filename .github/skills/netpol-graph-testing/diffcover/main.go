@@ -8,7 +8,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,7 +67,7 @@ func (t fileThresholds) Set(value string) error {
 	if err != nil {
 		return fmt.Errorf("parse file threshold %q: %w", value, err)
 	}
-	if threshold < 0 || threshold > 100 {
+	if math.IsNaN(threshold) || threshold < 0 || threshold > 100 {
 		return fmt.Errorf("file threshold must be between 0 and 100: %.1f", threshold)
 	}
 	t[filepath.ToSlash(value[:index])] = threshold
@@ -91,7 +95,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if *profile == "" {
 		return errors.New("--profile is required")
 	}
-	if *threshold < 0 || *threshold > 100 {
+	if math.IsNaN(*threshold) || *threshold < 0 || *threshold > 100 {
 		return fmt.Errorf("--threshold must be between 0 and 100: %.1f", *threshold)
 	}
 
@@ -100,7 +104,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("resolve merge base for %s: %w", *base, err)
 	}
 	diff, err := gitOutput(
-		"diff", "--unified=0", "--no-ext-diff", "--no-renames", mergeBase, "--",
+		"-c", "core.quotePath=false", "diff", "--unified=0", "--no-ext-diff", "--no-renames", mergeBase, "--",
 		":(glob)**/*.go", ":(exclude,glob)**/*_test.go",
 	)
 	if err != nil {
@@ -111,7 +115,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	untracked, err := gitOutput(
-		"ls-files", "--others", "--exclude-standard", "--", "*.go", ":!*_test.go",
+		"ls-files", "--others", "--exclude-standard", "-z", "--",
+		":(glob)**/*.go", ":(exclude,glob)**/*_test.go",
 	)
 	if err != nil {
 		return fmt.Errorf("list untracked Go files: %w", err)
@@ -131,6 +136,14 @@ func run(args []string, stdout, stderr io.Writer) error {
 	defer file.Close()
 	blocks, err := parseCoverProfile(file)
 	if err != nil {
+		return err
+	}
+	modulePath, err := readModulePath("go.mod")
+	if err != nil {
+		return err
+	}
+	normalizeProfilePaths(blocks, modulePath)
+	if err := validateChangedFunctions(changed, blocks); err != nil {
 		return err
 	}
 	results := calculateCoverage(changed, blocks)
@@ -203,8 +216,8 @@ func gitOutput(args ...string) (string, error) {
 }
 
 func addUntrackedFiles(changed map[string]lineSet, output string) error {
-	for _, value := range strings.Split(output, "\n") {
-		path := filepath.ToSlash(strings.TrimSpace(value))
+	for _, value := range strings.Split(output, "\x00") {
+		path := filepath.ToSlash(value)
 		if path == "" {
 			continue
 		}
@@ -231,6 +244,69 @@ func addUntrackedFiles(changed map[string]lineSet, output string) error {
 		}
 	}
 	return nil
+}
+
+func readModulePath(path string) (string, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read module path: %w", err)
+	}
+	for _, line := range strings.Split(string(contents), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "module" {
+			continue
+		}
+		return strings.Trim(fields[1], `"`), nil
+	}
+	return "", fmt.Errorf("%s has no module directive", path)
+}
+
+func normalizeProfilePaths(blocks []coverBlock, modulePath string) {
+	for index := range blocks {
+		blocks[index].path = strings.TrimPrefix(blocks[index].path, modulePath+"/")
+	}
+}
+
+// A profile is not evidence for a changed function that was never instrumented.
+// Reject missing functions instead of silently dropping their statements from
+// the denominator. Declaration-only files need no executable cover blocks.
+func validateChangedFunctions(changed map[string]lineSet, blocks []coverBlock) error {
+	var missing []string
+	for path, lines := range changed {
+		positions := token.NewFileSet()
+		file, err := parser.ParseFile(positions, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return fmt.Errorf("inspect changed Go source %s: %w", path, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			var body *ast.BlockStmt
+			switch value := node.(type) {
+			case *ast.FuncDecl:
+				body = value.Body
+			case *ast.FuncLit:
+				body = value.Body
+			}
+			if body == nil || len(body.List) == 0 {
+				return true
+			}
+			start, end := positions.Position(body.Lbrace).Line, positions.Position(body.Rbrace).Line
+			if !blockOverlapsLines(coverBlock{startLine: start, endLine: end}, lines) {
+				return true
+			}
+			for _, block := range blocks {
+				if block.path == path && block.statements > 0 && block.startLine >= start && block.endLine <= end {
+					return true
+				}
+			}
+			missing = append(missing, fmt.Sprintf("%s:%d", path, start))
+			return true
+		})
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	slices.Sort(missing)
+	return fmt.Errorf("changed executable functions missing from cover profile: %s; include their packages/build constraints in coverage", strings.Join(missing, ", "))
 }
 
 var hunkPattern = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
@@ -349,7 +425,7 @@ func calculateCoverage(changed map[string]lineSet, blocks []coverBlock) []covera
 }
 
 func profilePathMatches(profilePath, changedPath string) bool {
-	return profilePath == changedPath || strings.HasSuffix(profilePath, "/"+changedPath)
+	return profilePath == changedPath
 }
 
 func blockOverlapsLines(block coverBlock, lines lineSet) bool {

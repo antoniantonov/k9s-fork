@@ -4,6 +4,7 @@
 package ui
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -29,86 +30,99 @@ func TestDirectionPanelRendersMultiRowBlocksAndTrailingSeparators(t *testing.T) 
 }
 
 func TestDirectionPanelRulesShowPolicyTypeBetweenNameAndPorts(t *testing.T) {
-	panel := NewDirectionPanel(netpol.Ingress)
-	panel.SetRules(testRules())
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		t.Run(direction.String(), func(t *testing.T) {
+			rules := testRules()
+			for index := range rules {
+				rules[index].ID.Direction = direction
+			}
+			panel := NewDirectionPanel(direction).SetRules(rules)
+			assert.Equal(t, " "+direction.String()+" · Rules ", panel.PanelTitle())
+			assert.Equal(t, formatRuleName(&rules[0]), panel.GetCell(0, 0).Text)
+			assert.Equal(t, "NetworkPolicy", panel.GetCell(0, 1).Text)
+			assert.Equal(t, formatPermissions(rules[0].Permissions), panel.GetCell(0, 2).Text)
+			assert.Equal(t, "subjects 2/2", panel.GetCell(1, 0).Text)
+			assert.Equal(t, "peer app=web", panel.GetCell(1, 2).Text)
+			assert.Equal(t, 3, panel.GetColumnCount(), "rules render name, type, and ports")
 
-	assert.Equal(t, formatRuleName(&testRules()[0]), panel.GetCell(0, 0).Text)
-	assert.Equal(t, "NetworkPolicy", panel.GetCell(0, 1).Text)
-	assert.Equal(t, formatPermissions(testRules()[0].Permissions), panel.GetCell(0, 2).Text)
-	assert.Equal(t, "subjects 2/2", panel.GetCell(1, 0).Text)
-	assert.Equal(t, "peer app=web", panel.GetCell(1, 2).Text)
-	assert.Equal(t, 3, panel.GetColumnCount(), "rules render name, type, and ports")
-
-	// Primitives keep theirs: it is never blank there.
-	panel.SetProjection(PrimitivesProjection).SetPrimitives(testPrimitives())
-	assert.Equal(t, allowedLabel, panel.GetCell(0, 0).Text)
-	assert.Equal(t, 3, panel.GetColumnCount(), "primitives keep the state column")
+			panel.SetProjection(PrimitivesProjection).SetPrimitives(testPrimitives())
+			assert.Equal(t, allowedLabel, panel.GetCell(0, 0).Text)
+			assert.Equal(t, 3, panel.GetColumnCount(), "primitives keep the state column")
+		})
+	}
 }
 
 func TestDirectionPanelRulePolicyTypesAndFiltering(t *testing.T) {
-	rules := testRules()
-	rules[0].ID.PolicyType = netpol.PolicyTypeNetworkPolicy
-	rules[1].ID.PolicyType = netpol.PolicyTypeCiliumNetworkPolicy
-	rules[2].ID.PolicyType = netpol.PolicyTypeCiliumClusterwideNetworkPolicy
-	rules = append(rules, netpol.RuleResult{
-		ID: netpol.RuleID{
-			PolicyNamespace: "ns",
-			PolicyName:      "authorize",
-			PolicyType:      netpol.PolicyTypeIstioAuthorizationPolicy,
-			Direction:       netpol.Ingress,
-			Index:           0,
-		},
-		SubjectPodCount:   2,
-		SubjectMatchCount: 2,
-		PeerSummary:       "all peers",
-	})
-	rules = append(rules, netpol.RuleResult{
-		ID: netpol.RuleID{
-			Direction:     netpol.Ingress,
-			Index:         -1,
-			SyntheticKind: "default-deny",
-		},
-		SubjectPodCount:   2,
-		SubjectMatchCount: 2,
-		PeerSummary:       "default-deny",
-		Synthetic:         true,
-	})
-
-	panel := NewDirectionPanel(netpol.Ingress)
-	panel.SetRules(rules)
-
-	assert.Equal(t, "NetworkPolicy", panel.GetCell(0, 1).Text)
-	assert.Equal(t, "CiliumNetworkPolicy", panel.GetCell(3, 1).Text)
-	assert.Equal(t, "CiliumClusterwideNetworkPolicy", panel.GetCell(6, 1).Text)
-	assert.Equal(t, "AuthorizationPolicy", panel.GetCell(9, 1).Text)
-	assert.Equal(t, "Synthetic", panel.GetCell(12, 1).Text)
-
-	panel.SetFilter("CiliumClusterwideNetworkPolicy")
-	require.Len(t, panel.blocks, 1)
-	assert.Equal(t, "CiliumClusterwideNetworkPolicy", panel.GetCell(0, 1).Text)
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		t.Run(direction.String(), func(t *testing.T) {
+			var rules []netpol.RuleResult
+			for _, policy := range testRulePolicyTypes(direction) {
+				rule := testRules()[0]
+				rule.ID.PolicyType, rule.ID.PolicyVersion, rule.ID.Direction = policy.policyType, policy.version, direction
+				rules = append(rules, rule)
+			}
+			rules = append(rules, netpol.RuleResult{
+				ID:              netpol.RuleID{Direction: direction, Index: -1, SyntheticKind: "default-deny"},
+				SubjectPodCount: 2, SubjectMatchCount: 2, PeerSummary: "default-deny", Synthetic: true,
+			})
+			panel := NewDirectionPanel(direction).SetRules(rules)
+			for index, policy := range testRulePolicyTypes(direction) {
+				assert.Equal(t, policy.kind, panel.GetCell(index*3, 1).Text)
+				assert.Equal(t, rules[index].StableID(), panel.GetCell(index*3, 1).GetReference())
+			}
+			assert.Equal(t, "Synthetic", panel.GetCell((len(rules)-1)*3, 1).Text)
+			for _, policy := range testRulePolicyTypes(direction) {
+				panel.SetFilter(strings.ToLower(policy.kind))
+				wantCount := 1
+				if policy.policyType == netpol.PolicyTypeNetworkPolicy {
+					wantCount = 3
+				}
+				require.Len(t, panel.blocks, wantCount, policy.kind)
+				assert.Equal(t, policy.kind, panel.GetCell(0, 1).Text)
+				assert.Contains(t, panel.PanelTitle(), "filter: "+strings.ToLower(policy.kind))
+			}
+			panel.SetFilter("synthetic")
+			require.Len(t, panel.blocks, 1)
+			assert.Equal(t, rules[len(rules)-1].StableID(), panel.SelectedID())
+			panel.SetFilter("does-not-exist")
+			assert.Empty(t, panel.SelectedID())
+			panel.SetFilter("")
+			assert.Len(t, panel.blocks, len(rules))
+		})
+	}
 }
 
 func TestDirectionPanelRuleTypeAndPortsRemainVisibleWithLongPeer(t *testing.T) {
-	rule := testRules()[0]
-	rule.PeerSummary = strings.Repeat("namespaceSelector=team=payments, podSelector=app=frontend; ", 3)
-	panel := NewDirectionPanel(netpol.Ingress)
-	panel.SetRules([]netpol.RuleResult{rule})
-	panel.SetRect(0, 0, 100, 5)
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		for _, policy := range testRulePolicyTypes(direction) {
+			for _, width := range []int{80, 100} {
+				t.Run(direction.String()+"/"+policy.kind+"/"+strconv.Itoa(width), func(t *testing.T) {
+					rule := testRules()[0]
+					rule.ID.Direction, rule.ID.PolicyType = direction, policy.policyType
+					rule.PeerSummary = strings.Repeat("namespaceSelector=team=payments, podSelector=app=frontend; ", 3)
+					panel := NewDirectionPanel(direction).SetRules([]netpol.RuleResult{rule})
+					panel.SetRect(0, 0, width, 5)
+					screen := tcell.NewSimulationScreen("UTF-8")
+					require.NoError(t, screen.Init())
+					defer screen.Fini()
+					screen.SetSize(width, 5)
+					panel.Draw(screen)
 
-	screen := tcell.NewSimulationScreen("UTF-8")
-	require.NoError(t, screen.Init())
-	defer screen.Fini()
-	screen.SetSize(100, 5)
-	panel.Draw(screen)
-
-	var top strings.Builder
-	for column := 0; column < 100; column++ {
-		main, _, _, _ := screen.GetContent(column, 1)
-		top.WriteRune(main)
+					var top strings.Builder
+					for column := range width {
+						main, _, _, _ := screen.GetContent(column, 1)
+						top.WriteRune(main)
+					}
+					assert.Contains(t, top.String(), "ns/allow-web #0")
+					assert.Contains(t, top.String(), policy.kind)
+					assert.Contains(t, top.String(), "TCP/all")
+					nameAt, typeAt, portsAt := strings.Index(top.String(), "ns/allow-web #0"), strings.Index(top.String(), policy.kind), strings.Index(top.String(), "TCP/all")
+					assert.Less(t, nameAt, typeAt)
+					assert.Less(t, typeAt, portsAt)
+				})
+			}
+		}
 	}
-	assert.Contains(t, top.String(), "ns/allow-web #0")
-	assert.Contains(t, top.String(), "NetworkPolicy")
-	assert.Contains(t, top.String(), "TCP/all")
 }
 
 func TestDirectionPanelASCIISeparators(t *testing.T) {
@@ -536,28 +550,43 @@ func TestPrimitiveAndRuleDetails(t *testing.T) {
 }
 
 func TestRuleDetailsShowsCustomPolicyTypeActionAndNotes(t *testing.T) {
-	tests := []struct {
-		policyType netpol.PolicyType
-		want       string
-	}{
-		{netpol.PolicyTypeNetworkPolicy, "NetworkPolicy"},
-		{netpol.PolicyTypeCiliumNetworkPolicy, "CiliumNetworkPolicy"},
-		{netpol.PolicyTypeCiliumClusterwideNetworkPolicy, "CiliumClusterwideNetworkPolicy"},
-		{netpol.PolicyTypeIstioAuthorizationPolicy, "AuthorizationPolicy"},
-	}
-	for _, test := range tests {
-		t.Run(test.policyType.Kind(), func(t *testing.T) {
-			rule := testRules()[0]
-			rule.ID.PolicyType = test.policyType
-			rule.ID.PolicyVersion = "example.io/v1"
-			rule.ID.Action = netpol.PolicyActionDeny
-			rule.Notes = []string{"conditional request semantics are existential"}
-			text := RuleDetailsText(rule)
-			assert.Contains(t, text, "Policy type: "+test.want)
-			assert.Contains(t, text, "Policy API version: example.io/v1")
-			assert.Contains(t, text, "Action: deny")
-			assert.Contains(t, text, "Notes:\n  - conditional request semantics are existential")
-		})
+	for _, direction := range []netpol.Direction{netpol.Ingress, netpol.Egress} {
+		for _, policy := range testRulePolicyTypes(direction) {
+			t.Run(direction.String()+"/"+policy.kind, func(t *testing.T) {
+				rule := testRules()[0]
+				rule.ID.PolicyType, rule.ID.PolicyVersion, rule.ID.Direction = policy.policyType, policy.version, direction
+				rule.ID.Action = netpol.PolicyActionAllow
+				if policy.policyType != netpol.PolicyTypeNetworkPolicy {
+					rule.ID.Action = netpol.PolicyActionDeny
+				}
+				rule.Notes = []string{"conditional [request] semantics"}
+				rule.Warnings = []string{"unsupported condition"}
+				details := NewRuleDetails(rule, nil)
+				text := details.Text.GetText(true)
+				assert.Contains(t, text, "Policy type: "+policy.kind)
+				assert.Contains(t, text, "Policy API version: "+policy.version)
+				assert.Contains(t, text, "Direction: "+direction.String())
+				assert.Contains(t, text, "Action: "+rule.ID.Action.String())
+				assert.Contains(t, details.Text.GetText(false), "Notes:\n  - "+tview.Escape(rule.Notes[0]))
+				assert.Contains(t, text, "Warnings:\n  - unsupported condition")
+				assert.Contains(t, text, "State: Partial Data")
+				screen := tcell.NewSimulationScreen("UTF-8")
+				require.NoError(t, screen.Init())
+				defer screen.Fini()
+				screen.SetSize(90, 24)
+				details.Text.SetRect(0, 0, 90, 24)
+				details.Text.Draw(screen)
+				var rendered strings.Builder
+				for row := range 24 {
+					for column := range 90 {
+						r, _, _, _ := screen.GetContent(column, row)
+						rendered.WriteRune(r)
+					}
+					rendered.WriteByte('\n')
+				}
+				assert.Contains(t, rendered.String(), rule.Notes[0])
+			})
+		}
 	}
 }
 
@@ -973,6 +1002,26 @@ func TestRuleDetailsTextHeight(t *testing.T) {
 
 	details.Text.SetText("aaaa bbbb cccc dddd")
 	assert.Equal(t, 4, details.TextHeight(11), "the inner width excludes the 2 border columns")
+}
+
+type rulePolicyTypeTest struct {
+	policyType netpol.PolicyType
+	kind       string
+	version    string
+}
+
+func testRulePolicyTypes(direction netpol.Direction) []rulePolicyTypeTest {
+	types := []rulePolicyTypeTest{
+		{netpol.PolicyTypeNetworkPolicy, "NetworkPolicy", "networking.k8s.io/v1"},
+		{netpol.PolicyTypeCiliumNetworkPolicy, "CiliumNetworkPolicy", "cilium.io/v2"},
+		{netpol.PolicyTypeCiliumClusterwideNetworkPolicy, "CiliumClusterwideNetworkPolicy", "cilium.io/v2"},
+	}
+	if direction == netpol.Ingress {
+		types = append(types, rulePolicyTypeTest{
+			netpol.PolicyTypeIstioAuthorizationPolicy, "AuthorizationPolicy", "security.istio.io/v1",
+		})
+	}
+	return types
 }
 
 func testRules() []netpol.RuleResult {

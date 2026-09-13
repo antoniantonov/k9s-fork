@@ -513,8 +513,14 @@ func normalizeCiliumTrafficRule(
 	rule.Notes = append(rule.Notes, notes...)
 	errs = append(errs, portErrs...)
 	rule.Disabled = rule.Disabled || invalid
+	// An empty Cilium traffic rule enables isolation without granting access.
+	// Only a peerless L4 rule implies a wildcard peer.
+	if !rule.Disabled && len(rule.Peers) == 0 && (families > 0 || len(source.ToPorts) == 0) {
+		rule.MatchNone = true
+	}
 	if len(source.Authentication) > 0 && string(source.Authentication) != "null" {
 		rule.Notes = append(rule.Notes, "Cilium authentication requirements are not represented; reachability is existential")
+		errs = append(errs, errors.New("Cilium authentication requirements cannot be evaluated from the policy snapshot"))
 	}
 	rule.PeerStrings = normalizedPeerStrings(rule.Peers, rule.MatchNone)
 	rule.Notes = uniqueStrings(rule.Notes)
@@ -631,7 +637,8 @@ func ciliumIPBlock(cidr string, except []string) (netv1.IPBlock, error) {
 		if parseErr != nil {
 			return netv1.IPBlock{}, fmt.Errorf("invalid excluded CIDR %q: %w", value, parseErr)
 		}
-		if excluded.Addr().BitLen() != prefix.Addr().BitLen() || !prefix.Contains(excluded.Addr()) {
+		if excluded.Addr().BitLen() != prefix.Addr().BitLen() ||
+			excluded.Bits() < prefix.Bits() || !prefix.Contains(excluded.Addr()) {
 			return netv1.IPBlock{}, fmt.Errorf("excluded CIDR %q is not inside %q", value, cidr)
 		}
 		block.Except = append(block.Except, excluded.Masked().String())
@@ -676,26 +683,34 @@ func normalizeCiliumPorts(rules []ciliumPortRule) (
 	var ports []netv1.NetworkPolicyPort
 	var notes []string
 	var errs []error
+	allPorts, invalidPorts := false, false
 	for _, rule := range rules {
 		if len(rule.Rules) > 0 && string(rule.Rules) != "null" {
 			notes = append(notes, "Cilium L7 rules are not rendered; reachability means at least one request can match")
+			errs = append(errs, errors.New("Cilium L7 rules cannot be evaluated from the policy snapshot"))
 		}
 		if len(rule.TerminatingTLS) > 0 || len(rule.OriginatingTLS) > 0 || len(rule.Listener) > 0 || len(rule.ServerNames) > 0 {
 			notes = append(notes, "Cilium TLS, SNI, and listener constraints are not rendered")
+			errs = append(errs, errors.New("Cilium TLS, SNI, and listener constraints cannot be evaluated from the policy snapshot"))
 		}
 		if len(rule.Ports) == 0 {
-			return nil, uniqueStrings(notes), errs, false
+			allPorts = true
+			continue
 		}
 		for _, port := range rule.Ports {
 			converted, err := ciliumPort(port)
 			if err != nil {
 				errs = append(errs, err)
+				invalidPorts = true
 				continue
 			}
 			ports = append(ports, converted...)
 		}
 	}
-	return ports, uniqueStrings(notes), errs, len(errs) > 0 && len(ports) == 0
+	if allPorts {
+		ports = nil
+	}
+	return ports, uniqueStrings(notes), errs, invalidPorts && !allPorts && len(ports) == 0
 }
 
 func ciliumPort(source ciliumPortProtocol) ([]netv1.NetworkPolicyPort, error) {
@@ -1020,6 +1035,7 @@ func normalizeIstioOperations(operations []istioTo) (
 		}
 		if len(operation.Hosts)+len(operation.NotHosts)+len(operation.Methods)+len(operation.NotMethods)+len(operation.Paths)+len(operation.NotPaths) > 0 {
 			notes = append(notes, "Istio L7 operation constraints are not rendered; reachability means at least one request can match")
+			errs = append(errs, errors.New("Istio L7 operation constraints cannot be evaluated from the policy snapshot"))
 		}
 		if len(operation.Ports) == 0 {
 			allPorts = true

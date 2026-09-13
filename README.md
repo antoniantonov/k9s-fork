@@ -279,6 +279,10 @@ Binaries for Linux, Windows and Mac are available as tarballs in the [release pa
   topology covering every result state and primitive kind, a phase-based
   orchestrator, and an `expect` harness that drives the real TUI in Docker.
 
+  Custom-policy CRDs are test fixtures: the suite checks live API discovery,
+  graph evaluation, rendering, and navigation. It does not install Cilium or
+  Istio and does not verify packet enforcement.
+
   ```shell
   # Populate the cluster only when it is not already set up.
   ./.github/skills/netpol-graph-testing/scripts/netpol-demo-workloads.sh --check
@@ -695,6 +699,8 @@ Dynamic Cilium destinations such as FQDNs, Services, CIDR groups, nodes, and
 cloud-provider groups are reported as partial data. Istio `CUSTOM`,
 `targetRefs`, `when`, forwarded-client IPs, JWT identities, and negative
 port/CIDR constraints are also reported as partial rather than guessed.
+Unmodeled Cilium L7, TLS, SNI, and authentication constraints and Istio HTTP
+request conditions also produce partial data.
 Certificate-derived namespace, service-account, principal, and trust-domain
 matching is approximated from workload metadata and assumes `cluster.local`
 because PeerAuthentication/mTLS state is not part of the snapshot. Calico

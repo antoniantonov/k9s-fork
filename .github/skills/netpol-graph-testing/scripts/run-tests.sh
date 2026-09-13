@@ -10,7 +10,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 DEMO_SCRIPT="$SCRIPT_DIR/netpol-demo-workloads.sh"
 EXPECT_SCRIPT="$SCRIPT_DIR/k9s-tui-smoke.exp"
 PHASES=(preflight ensure-cluster ensure-workloads go-tests coverage build-image tui-tests report)
-RUN_ID="$(date +%Y%m%d-%H%M%S)"
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 RUN_DIR="$SKILL_DIR/runs/$RUN_ID"
 CLUSTER="k9s-netpol"
 PREFIX="netpol-demo"
@@ -194,13 +194,13 @@ phase_ensure_workloads() {
 # list is empty, i.e. when fingerprinting silently failed.
 EMPTY_SHA256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-# tree_hash fingerprints exactly the tracked sources the image is built from.
+# tree_hash includes untracked sources copied into the image as well.
 # It must never fail quietly: a constant hash would match the cache on every run
 # and the TUI phase would keep testing a stale binary while reporting success.
 tree_hash() {
   (
     cd "$REPO_ROOT" || exit 1
-    git ls-files -z -- go.mod go.sum Makefile Dockerfile main.go cmd internal \
+    git ls-files --cached --others --exclude-standard -z -- go.mod go.sum Makefile Dockerfile main.go cmd internal \
       | xargs -0 shasum -a 256 \
       | shasum -a 256 \
       | awk '{print $1}'
@@ -230,7 +230,7 @@ phase_build_image() {
     return 0
   fi
 
-  hash="$(tree_hash)"
+  hash="$(tree_hash)" || return 1
   if [[ -z "$hash" || "$hash" == "$EMPTY_SHA256" ]]; then
     echo "could not fingerprint the source tree; refusing to trust the image cache" >&2
     return 1
@@ -370,8 +370,89 @@ kind_network() {
   echo "${net:-kind}"
 }
 
+run_smoke_suite() {
+  local suite="$1" image="$2" kubeconfig="$3" network="$4"
+  K9S_IMAGE="$image" \
+    KUBECONFIG_MOUNT="$kubeconfig" \
+    DOCKER_NETWORK="$network" \
+    CLUSTER_PREFIX="$PREFIX" \
+    EXPECT_LOG_DIR="$RUN_DIR" \
+    SMOKE_SUITE="$suite" \
+    PROBE_ID="$RUN_ID" \
+    "$EXPECT_SCRIPT"
+}
+
+# The model's uncertainty flag is snapshot-wide. Each negative-data suite gets
+# its own process and uniquely owned policy, after the complete-data suites.
+run_probe_smoke() (
+  # Bash 3.2 unwinds function locals before EXIT traps; keep this in the
+  # isolated subshell so cleanup still knows which exact probe it owns.
+  PROBE_MODE="$1"
+  local image="$2" kubeconfig="$3" network="$4" result=0
+  check_workloads || exit 1
+  cleanup_probe() {
+    local status=$?
+    trap - EXIT HUP INT TERM
+    echo "removing only $PROBE_MODE probe owned by run $RUN_ID"
+    "$DEMO_SCRIPT" --cluster "$CLUSTER" --prefix "$PREFIX" --timeout "$TIMEOUT" \
+      --probe "$PROBE_MODE" --probe-id "$RUN_ID" --delete || status=1
+    echo "verifying complete-data topology was restored"
+    check_workloads || status=1
+    exit "$status"
+  }
+  trap cleanup_probe EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if "$DEMO_SCRIPT" --cluster "$CLUSTER" --prefix "$PREFIX" --timeout "$TIMEOUT" \
+    --probe "$PROBE_MODE" --probe-id "$RUN_ID" --check; then
+    echo "reusing checked $PROBE_MODE probe owned by this run"
+  else
+    "$DEMO_SCRIPT" --cluster "$CLUSTER" --prefix "$PREFIX" --timeout "$TIMEOUT" \
+      --probe "$PROBE_MODE" --probe-id "$RUN_ID" || exit 1
+  fi
+  run_smoke_suite "$PROBE_MODE" "$image" "$kubeconfig" "$network" || result=$?
+  exit "$result"
+)
+
+summarize_smoke() {
+  local suite
+  EXPECT_CASE_MANIFEST=1 "$EXPECT_SCRIPT" >"$RUN_DIR/smoke.expected" || return 1
+  for suite in known identity unsupported; do
+    if [[ -f "$RUN_DIR/smoke-$suite.verdicts" ]]; then
+      awk -F '\t' -v suite="$suite" '{print suite "\t" $0}' "$RUN_DIR/smoke-$suite.verdicts"
+    fi
+  done >"$RUN_DIR/smoke.verdicts"
+  awk -F '\t' '
+    NR == FNR { key = $1 FS $2; expected[key] = 1; order[++count] = key; next }
+    {
+      key = $1 FS $3
+      if (!(key in expected) || seen[key]++) {
+        print "FAIL unexpected or duplicate smoke verdict: " $0
+        failures++
+      }
+      verdict[key] = $2
+    }
+    END {
+      print "=== authoritative combined smoke summary ==="
+      for (i = 1; i <= count; i++) {
+        key = order[i]
+        split(key, parts, FS)
+        state = verdict[key]
+        if (state != "PASS") {
+          state = "FAIL"
+          failures++
+        }
+        printf "  %-6s %s/%s\n", state, parts[1], parts[2]
+      }
+      printf "=== %d case(s), %d failure(s) ===\n", count, failures
+      exit failures > 0
+    }
+  ' "$RUN_DIR/smoke.expected" "$RUN_DIR/smoke.verdicts"
+}
+
 phase_tui_tests() {
-  local image kubeconfig network
+  local image kubeconfig network status=0 probe
   resolve_test_image || return 1
   image="$TEST_IMAGE_ID"
   kubeconfig="$(container_kubeconfig)" || return 1
@@ -381,12 +462,13 @@ phase_tui_tests() {
   docker run --rm --network "$network" \
     -e KUBECONFIG=/root/.kube/config -v "$kubeconfig:/root/.kube/config:ro" \
     --entrypoint kubectl "$image" get namespace "$PREFIX-app" || return 1
-  K9S_IMAGE="$image" \
-    KUBECONFIG_MOUNT="$kubeconfig" \
-    DOCKER_NETWORK="$network" \
-    CLUSTER_PREFIX="$PREFIX" \
-    EXPECT_LOG_DIR="$RUN_DIR" \
-    "$EXPECT_SCRIPT"
+  check_workloads || return 1
+  run_smoke_suite known "$image" "$kubeconfig" "$network" || status=1
+  for probe in identity unsupported; do
+    run_probe_smoke "$probe" "$image" "$kubeconfig" "$network" || status=1
+  done
+  summarize_smoke || status=1
+  return "$status"
 }
 
 phase_report() {

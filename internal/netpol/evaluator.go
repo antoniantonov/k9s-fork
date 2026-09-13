@@ -23,6 +23,7 @@ type engine struct{}
 const (
 	syntheticDefaultDeny  = "default-deny"
 	syntheticUnrestricted = "unrestricted"
+	cidrPartialDeny       = "CIDR partially overlaps an explicit deny; listed known permissions apply throughout the range, but other ports may vary by address"
 )
 
 // NewEvaluator returns a stateless NetworkPolicy evaluator.
@@ -93,7 +94,9 @@ func (e *engine) DirectionApplicability(result SubjectResult, direction Directio
 				}
 				continue
 			}
-			if _, found := evidencePermissionsForDirection(pair.Decision.Evidence, opposite(direction)); !found {
+			// Matching allow evidence may have been overridden by a deny or
+			// destination authorization, so require effective permissions too.
+			if _, found := evidencePermissionsForDirection(pair.Decision.Evidence, opposite(direction)); !found || !knownPermissions(pair.Decision.Permissions) {
 				row.OppositeSideAllows = false
 			}
 		}
@@ -134,6 +137,13 @@ func (e *engine) RuleApplicability(result SubjectResult, direction Direction, id
 			effective = effective && knownPermissions(overlap)
 			if !effective {
 				allEffective = false
+				if primitive.Ref.Kind == PrimitiveCIDR && pair.Decision.State == AccessUnknown {
+					for _, permission := range overlap {
+						if !permission.Unknown {
+							permissions = append(permissions, permission)
+						}
+					}
+				}
 			} else {
 				anyEffective = true
 				permissions = append(permissions, overlap...)
@@ -144,6 +154,8 @@ func (e *engine) RuleApplicability(result SubjectResult, direction Direction, id
 		switch {
 		case primitive.State == AccessPartialData:
 			row.EffectiveState = AccessPartialData
+		case primitive.State == AccessUnknown && row.PeerMatches && id.Action != PolicyActionDeny:
+			row.EffectiveState = AccessUnknown
 		case len(primitive.PairDecisions) == 0:
 			// Nothing was evaluated: no concrete pod pairs exist, so the rule's
 			// effect on this peer is unknown rather than denied.
@@ -388,6 +400,7 @@ func (e *engine) evaluateCIDRPrimitive(x *snapshotIndex, subject *Subject, direc
 		}
 		result.Permissions = append(result.Permissions, decision.Permissions...)
 		result.Evidence = append(result.Evidence, decision.Evidence...)
+		result.Warnings = append(result.Warnings, decision.Warnings...)
 		pair := PairDecision{Decision: decision}
 		if direction == Ingress {
 			pair.Destination = podRef(pod)
@@ -402,9 +415,13 @@ func (e *engine) evaluateCIDRPrimitive(x *snapshotIndex, subject *Subject, direc
 		result.Warnings = append(result.Warnings, "pair evaluation truncated by result limit")
 	}
 	result.State, result.Explanation = aggregateState(result.PairDecisions, len(x.incomplete) > 0 || truncated)
-	if len(x.incomplete) > 0 {
-		result.Warnings = slices.Clone(x.incomplete)
+	if slices.Contains(result.Warnings, cidrPartialDeny) {
+		result.Explanation += "; " + cidrPartialDeny
 	}
+	if len(x.incomplete) > 0 {
+		result.Warnings = append(result.Warnings, x.incomplete...)
+	}
+	result.Warnings = uniqueStrings(result.Warnings)
 	return result, truncated
 }
 
@@ -413,15 +430,50 @@ func (e *engine) evaluateCIDRSide(x *snapshotIndex, direction Direction, pod *co
 	if direction == Egress {
 		destination = nil
 	}
-	match := func(_ *normalizedPolicy, rule *normalizedRule) (bool, int) {
+	contains := func(_ *normalizedPolicy, rule *normalizedRule) (bool, int) {
 		return normalizedRuleMatchesCIDR(rule, ref)
 	}
-	network := e.evaluatePolicyLayer(x, policyLayerNetwork, direction, pod, destination, match)
-	if direction == Egress {
-		return network
+	partialDeny := false
+	match := func(policy *normalizedPolicy, rule *normalizedRule) (bool, int) {
+		matched, peerIndex := contains(policy, rule)
+		if matched || rule.Action != PolicyActionDeny || rule.Disabled || rule.MatchNone {
+			return matched, peerIndex
+		}
+		for index := range rule.Peers {
+			peer := &rule.Peers[index]
+			if peer.CIDRMatchUnsupported {
+				continue
+			}
+			for blockIndex := range peer.IPBlocks {
+				if ipBlockIntersects(&peer.IPBlocks[blockIndex], ref) {
+					partialDeny = true
+					return true, index
+				}
+			}
+		}
+		return false, -1
 	}
-	authorization := e.evaluatePolicyLayer(x, policyLayerAuthorization, direction, pod, destination, match)
-	return combinePolicyLayers(network, authorization)
+	evaluate := func(matcher policyRuleMatcher) Decision {
+		network := e.evaluatePolicyLayer(x, policyLayerNetwork, direction, pod, destination, matcher)
+		if direction == Egress {
+			return network
+		}
+		authorization := e.evaluatePolicyLayer(x, policyLayerAuthorization, direction, pod, destination, matcher)
+		return combinePolicyLayers(network, authorization)
+	}
+	decision := evaluate(match)
+	if partialDeny {
+		// Subtract intersecting denies to retain only whole-range guarantees.
+		// A different containment-only result means permissions can vary within
+		// the CIDR, not that every address is uniformly denied.
+		possible := evaluate(contains)
+		if permissionsKey(decision.Permissions) != permissionsKey(possible.Permissions) {
+			decision.State = AccessUnknown
+			decision.Explanation = cidrPartialDeny
+			decision.Warnings = uniqueStrings(append(decision.Warnings, cidrPartialDeny))
+		}
+	}
+	return decision
 }
 
 type policyRuleMatcher func(*normalizedPolicy, *normalizedRule) (bool, int)
@@ -462,7 +514,6 @@ func (_ *engine) evaluatePolicyLayer(
 
 	var denied []PortPermission
 	var warnings []string
-	unknown := false
 	for _, policy := range selected {
 		for index := range policy.direction(direction).Rules {
 			rule := &policy.direction(direction).Rules[index]
@@ -470,8 +521,7 @@ func (_ *engine) evaluatePolicyLayer(
 			if !matches {
 				continue
 			}
-			perms, known := permissionsForNormalizedRule(rule, destination)
-			unknown = unknown || !known
+			perms, _ := permissionsForNormalizedRule(rule, destination)
 			item := policyEvidence(policy, direction, rule, peerIndex, perms)
 			evidence = append(evidence, item)
 			warnings = append(warnings, rule.Warnings...)
@@ -486,7 +536,7 @@ func (_ *engine) evaluatePolicyLayer(
 	permissions = canonicalPermissions(permissions)
 	var subtractionKnown bool
 	permissions, subtractionKnown = subtractPermissions(permissions, canonicalPermissions(denied))
-	unknown = unknown || !subtractionKnown
+	unknown := !subtractionKnown
 	evidence = uniqueEvidence(evidence)
 	warnings = uniqueStrings(warnings)
 
@@ -524,6 +574,9 @@ func (_ *engine) evaluatePolicyLayer(
 }
 
 func permissionsForNormalizedRule(rule *normalizedRule, destination *corev1.Pod) ([]PortPermission, bool) {
+	if rule.MatchNone {
+		return nil, true
+	}
 	if rule.TCPOnly && len(rule.Ports) == 0 {
 		return []PortPermission{{Protocol: corev1.ProtocolTCP, All: true}}, true
 	}
@@ -974,15 +1027,13 @@ func ipBlockIntersects(block *netv1.IPBlock, ref *PrimitiveRef) bool {
 		return false
 	}
 	left, right = left.Masked(), right.Masked()
-	var overlap netip.Prefix
-	switch {
-	case left.Contains(right.Addr()):
-		overlap = right
-	case right.Contains(left.Addr()):
-		overlap = left
-	default:
+	if left.Bits() > right.Bits() {
+		left, right = right, left
+	}
+	if !left.Contains(right.Addr()) {
 		return false
 	}
+	overlap := right
 	exclusions := make([]netip.Prefix, 0, len(block.Except)+len(ref.CIDRExcept))
 	for _, value := range append(slices.Clone(block.Except), ref.CIDRExcept...) {
 		if prefix, parseErr := netip.ParsePrefix(value); parseErr == nil && prefix.Addr().BitLen() == overlap.Addr().BitLen() {
@@ -1087,7 +1138,7 @@ func uniqueEvidence(in []PolicyEvidence) []PolicyEvidence {
 func permissionsKey(permissions []PortPermission) string {
 	var values []string
 	for _, permission := range canonicalPermissions(permissions) {
-		values = append(values, permission.String())
+		values = append(values, permissionKey(permission))
 	}
 	return fmt.Sprint(values)
 }

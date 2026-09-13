@@ -71,9 +71,14 @@ result. Dynamic Cilium destinations such as FQDNs, Services, CIDR groups, nodes,
 and cloud-provider groups, plus Istio external authorization, `targetRefs`,
 `when` conditions, forwarded-client IPs, JWT identities, and negative ports or
 CIDRs, are reported as incomplete rather than guessed.
+Unmodeled Cilium L7, TLS, SNI, and authentication constraints, and Istio
+HTTP request conditions, also produce Partial Data rather than complete
+reachability claims.
 
 Kubernetes and Cilium policies form the network layer. Istio authorization is a
 second destination-ingress layer; both layers must permit a pod-to-pod path.
+Consequently, a destination AuthorizationPolicy can restrict the subject's
+egress results even though AuthorizationPolicy has no egress rules.
 Istio `ALLOW` activates default deny for selected destinations and Istio
 `DENY` overrides matching allows. `AUDIT` and dry-run policies do not enforce
 reachability in the graph. NPG resolves the mesh root namespace from installed
@@ -130,6 +135,11 @@ A **primitive** is a peer-side reachability target or source:
 For aggregate primitives, `Allowed` means every evaluated concrete pod pair is
 allowed. A mix of allowed and non-allowed pairs is `Partial`, not `Allowed`.
 
+CIDR permissions must hold across the entire displayed range. An overlapping
+explicit deny can make a CIDR result `Unknown`. In that case, the graph keeps
+only port permissions guaranteed for the whole range, rather than implying
+that the range is uniformly allowed or denied.
+
 ### Pod pair
 
 A **pod pair** is one concrete source pod and destination pod combination.
@@ -185,7 +195,7 @@ authorization rule. NPG identifies a real rule by:
 Cilium resources with multiple top-level `specs` also include the spec index in
 their stable rule identity.
 
-Rules can match peers with:
+Native Kubernetes NetworkPolicy rules can match peers with:
 
 - `podSelector`;
 - `namespaceSelector`;
@@ -193,14 +203,24 @@ Rules can match peers with:
 - `ipBlock`, including `except` ranges;
 - an omitted peer list, which means all peers.
 
-An omitted port list allows all ports for the protocols represented by the
-evaluation. Named ports are resolved against destination pod container ports
-when possible. Ambiguous named ports are reported as unknown rather than being
-treated as allowed.
+For native NetworkPolicy, an omitted port list allows all ports for the
+protocols represented by the evaluation. Named ports are resolved against
+destination pod container ports when possible. Ambiguous named ports are
+reported as unknown rather than being treated as allowed.
+
+Empty rules are API-specific. A native NetworkPolicy `{}` rule allows all peers
+and ports. For Cilium policies, an omitted or empty direction list has no
+effect, while `ingress: [{}]` or `egress: [{}]` does not itself allow traffic
+and normally isolates that direction; `enableDefaultDeny` controls isolation.
+Use explicit Cilium peers such as `fromEntities: [all]` or `toEntities: [all]`
+for a blanket allow. Istio `ALLOW` also distinguishes absent or empty `rules`
+(no allowed requests) from `rules: [{}]` (all requests, still intersected with
+network permissions).
 
 NPG can also display synthetic rules:
 
-- **unrestricted**: no NetworkPolicy isolates the pod in that direction;
+- **unrestricted**: no policy in the evaluated layer isolates the pod in that
+  direction;
 - **default-deny**: a policy isolates the pod, but no additive allow rule
   permits the evaluated peer and port.
 

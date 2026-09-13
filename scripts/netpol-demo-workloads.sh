@@ -37,7 +37,9 @@
 #   --check, --status    verify the demo topology is already applied and ready; no mutations
 #   --no-wait            do not wait for pods to become ready
 #   --timeout DURATION   readiness wait timeout (default: 180s)
-#   --delete             delete everything this script creates, then exit
+#   --delete             delete this prefix's fixtures, preserving shared CRDs
+#   --probe TYPE         operate only on an opt-in identity or unsupported probe
+#   --probe-id ID        unique owner ID required with --probe (check/apply/delete)
 #   -h, --help           show this help
 # END_USAGE
 
@@ -45,6 +47,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$REPO_ROOT/.github/skills/netpol-graph-testing/scripts/netpol-edge-fixtures.sh"
 
 PREFIX="netpol-demo"
 IMAGE="busybox:1.36"
@@ -58,6 +61,8 @@ TIMEOUT="180s"
 DELETE=0
 DELETE_CLUSTER=0
 CHECK=0
+PROBE=""
+PROBE_ID=""
 
 usage() {
   awk '
@@ -78,14 +83,6 @@ ensure_demo_crd() {
   echo "==> installing graph-only demo CRD $name"
   "${KUBECTL[@]}" apply -f -
   "${KUBECTL[@]}" wait --for=condition=Established "crd/$name" --timeout="$TIMEOUT"
-}
-
-delete_owned_demo_crd() {
-  local name="$1" owned
-  owned=$("${KUBECTL[@]}" get crd "$name" -o jsonpath='{.metadata.annotations.k9scli\.io/netpol-demo-owned}' 2>/dev/null || true)
-  if [[ "$owned" == "true" ]]; then
-    "${KUBECTL[@]}" delete crd "$name" --ignore-not-found --wait=true
-  fi
 }
 
 build_kubectl() {
@@ -208,8 +205,9 @@ check_topology() {
   check_resource "CiliumClusterwideNetworkPolicy CRD" "${KUBECTL[@]}" get crd ciliumclusterwidenetworkpolicies.cilium.io || failures=$((failures + 1))
   check_resource "AuthorizationPolicy CRD" "${KUBECTL[@]}" get crd authorizationpolicies.security.istio.io || failures=$((failures + 1))
   check_resource "app Cilium network policy" "${KUBECTL[@]}" get ciliumnetworkpolicies.cilium.io -n "$NS_APP" demo-cnp-frontend || failures=$((failures + 1))
-  check_resource "clusterwide Cilium network policy" "${KUBECTL[@]}" get ciliumclusterwidenetworkpolicies.cilium.io demo-ccnp-monitoring || failures=$((failures + 1))
+  check_resource "clusterwide Cilium network policy" "${KUBECTL[@]}" get ciliumclusterwidenetworkpolicies.cilium.io "$CCNP_MONITORING" || failures=$((failures + 1))
   check_resource "app Istio authorization policy" "${KUBECTL[@]}" get authorizationpolicies.security.istio.io -n "$NS_APP" demo-authz-api || failures=$((failures + 1))
+  check_edge_fixtures || failures=$((failures + 1))
 
   for ns in "$NS_APP" "$NS_WEB" "$NS_MON" "$NS_UNTRUSTED" "$NS_OPEN"; do
     check_resource "deployments ready in $ns" "${KUBECTL[@]}" wait --for=condition=Available deployment --all -n "$ns" --timeout=1s || failures=$((failures + 1))
@@ -271,10 +269,38 @@ while [[ $# -gt 0 ]]; do
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --delete) DELETE=1; shift ;;
     --check|--status) CHECK=1; shift ;;
+    --probe) PROBE="$2"; shift 2 ;;
+    --probe-id) PROBE_ID="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
+
+if (( CHECK == 1 && (DELETE == 1 || DELETE_CLUSTER == 1) )); then
+  echo "cannot combine --check/--status with --delete or --delete-cluster" >&2
+  exit 2
+fi
+if (( DELETE == 1 && DELETE_CLUSTER == 1 )); then
+  echo "cannot combine --delete with --delete-cluster" >&2
+  exit 2
+fi
+if [[ ! "$PREFIX" =~ ^[a-z0-9]([a-z0-9-]{0,50}[a-z0-9])?$ ]]; then
+  echo "--prefix must be a 1-52 character DNS label" >&2
+  exit 2
+fi
+if [[ -n "$PROBE" ]]; then
+  if [[ "$PROBE" != identity && "$PROBE" != unsupported ]]; then
+    echo "--probe must be identity or unsupported" >&2
+    exit 2
+  fi
+  if [[ ! "$PROBE_ID" =~ ^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$ ]] || (( DELETE_CLUSTER == 1 )); then
+    echo "--probe requires a unique 2-63 character DNS-label --probe-id and cannot delete a cluster" >&2
+    exit 2
+  fi
+elif [[ -n "$PROBE_ID" ]]; then
+  echo "--probe-id requires --probe" >&2
+  exit 2
+fi
 
 HOST_KUBECONFIG="$REPO_ROOT/.kube/${CLUSTER}.kubeconfig"
 INTERNAL_KUBECONFIG="$REPO_ROOT/.kube/${CLUSTER}.internal.kubeconfig"
@@ -284,7 +310,13 @@ NS_WEB="${PREFIX}-web"
 NS_MON="${PREFIX}-monitoring"
 NS_UNTRUSTED="${PREFIX}-untrusted"
 NS_OPEN="${PREFIX}-open"
-ALL_NS=("$NS_APP" "$NS_WEB" "$NS_MON" "$NS_UNTRUSTED" "$NS_OPEN")
+NS_EDGE_SRC="${PREFIX}-edge-src"
+NS_EDGE_DST="${PREFIX}-edge-dst"
+NS_EDGE_OTHER="${PREFIX}-edge-other"
+EDGE_SCENARIO="${PREFIX}-edges"
+CCNP_MONITORING="${PREFIX}-ccnp-monitoring"
+[[ "$PREFIX" == netpol-demo ]] && CCNP_MONITORING=demo-ccnp-monitoring
+ALL_NS=("$NS_APP" "$NS_WEB" "$NS_MON" "$NS_UNTRUSTED" "$NS_OPEN" "$NS_EDGE_SRC" "$NS_EDGE_DST" "$NS_EDGE_OTHER")
 
 if [[ "$DELETE_CLUSTER" -eq 1 ]]; then
   require_command kind
@@ -299,7 +331,7 @@ fi
 
 require_command kubectl
 
-if [[ "$CHECK" -eq 1 ]]; then
+if [[ "$CHECK" -eq 1 || "$DELETE" -eq 1 || -n "$PROBE" ]]; then
   if [[ "$NO_CLUSTER" -eq 0 && -z "$KUBECONFIG_ARG" ]]; then
     if [[ -f "$HOST_KUBECONFIG" ]]; then
       KUBECONFIG_ARG="$HOST_KUBECONFIG"
@@ -312,8 +344,24 @@ if [[ "$CHECK" -eq 1 ]]; then
     echo "cannot reach the cluster; check --kubeconfig/--context or run without --check to bootstrap" >&2
     exit 1
   }
-  check_topology
-  exit $?
+  if [[ -n "$PROBE" ]]; then
+    EDGE_MODE=apply
+    (( CHECK == 1 )) && EDGE_MODE=check
+    (( DELETE == 1 )) && EDGE_MODE=delete
+    edge_probe_policy
+    exit $?
+  elif [[ "$CHECK" -eq 1 ]]; then
+    check_topology
+    exit $?
+  fi
+  "${KUBECTL[@]}" delete ciliumclusterwidenetworkpolicies.cilium.io "$CCNP_MONITORING" \
+    --ignore-not-found --wait=true 2>/dev/null || true
+  "${KUBECTL[@]}" delete ciliumclusterwidenetworkpolicies.cilium.io \
+    -l "netpol-demo-prefix=$PREFIX,netpol-demo-edge=true" --ignore-not-found --wait=true
+  echo "==> deleting namespaces: ${ALL_NS[*]}"
+  "${KUBECTL[@]}" delete namespace "${ALL_NS[@]}" --ignore-not-found --wait=true
+  echo "==> shared policy CRDs preserved"
+  exit 0
 fi
 
 if [[ "$NO_CLUSTER" -eq 0 ]]; then
@@ -326,18 +374,6 @@ else
     echo "cannot reach the cluster; check --kubeconfig/--context" >&2
     exit 1
   }
-fi
-
-if [[ "$DELETE" -eq 1 ]]; then
-  "${KUBECTL[@]}" delete ciliumclusterwidenetworkpolicies.cilium.io demo-ccnp-monitoring \
-    --ignore-not-found --wait=true 2>/dev/null || true
-  echo "==> deleting namespaces: ${ALL_NS[*]}"
-  "${KUBECTL[@]}" delete namespace "${ALL_NS[@]}" --ignore-not-found --wait=true
-  delete_owned_demo_crd ciliumnetworkpolicies.cilium.io
-  delete_owned_demo_crd ciliumclusterwidenetworkpolicies.cilium.io
-  delete_owned_demo_crd authorizationpolicies.security.istio.io
-  echo "==> done"
-  exit 0
 fi
 
 if [[ "$NO_CLUSTER" -eq 0 ]]; then
@@ -1082,7 +1118,7 @@ spec:
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:
-  name: demo-ccnp-monitoring
+  name: ${CCNP_MONITORING}
 spec:
   endpointSelector:
     matchLabels:
@@ -1112,6 +1148,8 @@ spec:
         - operation:
             ports: ["8080", "9090"]
 YAML
+
+apply_edge_fixtures
 
 if [[ "$WAIT" -eq 1 ]]; then
   echo "==> waiting for workload pods to be ready (timeout: $TIMEOUT)"

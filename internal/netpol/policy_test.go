@@ -442,7 +442,8 @@ func TestCiliumSelectorCIDREntityAndPortNormalization(t *testing.T) {
 	require.False(t, invalid)
 	require.Len(t, ports, 1)
 	require.Len(t, notes, 2)
-	require.Empty(t, portErrs)
+	require.ErrorContains(t, errors.Join(portErrs...), "L7 rules")
+	require.ErrorContains(t, errors.Join(portErrs...), "TLS, SNI")
 
 	ports, _, portErrs, invalid = normalizeCiliumPorts([]ciliumPortRule{{
 		Ports: []ciliumPortProtocol{{Port: "invalid", EndPort: 90}},
@@ -503,7 +504,7 @@ func TestCiliumTrafficRuleUnsupportedSemanticsAreExplicit(t *testing.T) {
 		FromEntities:   []string{"cluster"},
 		Authentication: auth,
 	})
-	require.Empty(t, errs)
+	require.ErrorContains(t, errors.Join(errs...), "authentication requirements")
 	require.Contains(t, rule.Notes, "Cilium authentication requirements are not represented; reachability is existential")
 
 	disabled := false
@@ -632,7 +633,7 @@ spec: {action: BLOCK}`,
 	require.False(t, invalid)
 	require.Nil(t, ports)
 	require.NotEmpty(t, notes)
-	require.Empty(t, operationErrs)
+	require.ErrorContains(t, errors.Join(operationErrs...), "L7 operation")
 
 	ports, _, operationErrs, invalid = normalizeIstioOperations([]istioTo{
 		{Operation: istioOperation{NotPorts: []string{"8080"}}},
