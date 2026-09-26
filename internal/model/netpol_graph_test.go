@@ -37,7 +37,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/discovery/cached/disk"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestNetPolGraphRefreshBuildsClusterSnapshot(t *testing.T) {
@@ -180,87 +183,176 @@ func TestSelectOptionalResourceIgnoresMissingAPIGroups(t *testing.T) {
 	}
 }
 
-func TestLoadIstioRootNamespace(t *testing.T) {
-	newSnapshot := func() netpol.Snapshot {
-		return netpol.Snapshot{
-			IstioAuthorizationPolicies: []unstructured.Unstructured{*customPolicy(
-				"security.istio.io/v1", "AuthorizationPolicy", "payments", "authz",
-			)},
-			IstioRootNamespace: netpol.DefaultIstioRootNamespace,
-			Incomplete:         map[string]error{},
+func istiodDeployment(namespace, revision string) appsv1.Deployment {
+	deploymentLabels := map[string]string{"app": "istiod"}
+	if revision != "" {
+		deploymentLabels["istio.io/rev"] = revision
+	}
+	return appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "istiod-" + revision, Namespace: namespace, Labels: deploymentLabels}}
+}
+
+func meshConfigMap(namespace, name, mesh string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Data:       map[string]string{"mesh": mesh},
+	}
+}
+
+func istioRootSnapshot(deployments ...appsv1.Deployment) netpol.Snapshot {
+	return netpol.Snapshot{
+		IstioAuthorizationPolicies: []unstructured.Unstructured{*customPolicy(
+			"security.istio.io/v1", "AuthorizationPolicy", "payments", "authz",
+		)},
+		IstioRootNamespace: netpol.DefaultIstioRootNamespace,
+		Deployments:        deployments,
+		Incomplete:         map[string]error{},
+	}
+}
+
+func istioRootFactory(objects ...runtime.Object) (*netPolGraphFactory, *fake.Clientset) {
+	clientset := fake.NewClientset(objects...)
+	factory := newNetPolGraphFactory()
+	factory.connection = &netPolGraphConnection{clientset: clientset}
+	return factory, clientset
+}
+
+func configMapGets(clientset *fake.Clientset) []string {
+	var gets []string
+	for _, action := range clientset.Actions() {
+		if get, ok := action.(k8stesting.GetAction); ok && action.GetResource().Resource == "configmaps" {
+			gets = append(gets, get.GetNamespace()+"/"+get.GetName())
 		}
 	}
+	return gets
+}
 
-	t.Run("resolved from revision config", func(t *testing.T) {
-		factory := newNetPolGraphFactory()
-		factory.add(client.CmGVR, &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: "default"},
-			Data:       map[string]string{"mesh": "rootNamespace: ignored"},
-		})
-		factory.add(client.CmGVR, &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "istio-canary", Namespace: "istio-system"},
-			Data:       map[string]string{"mesh": "rootNamespace: mesh-root\n"},
-		})
-		snapshot := newSnapshot()
-		loadIstioRootNamespace(factory, &snapshot)
-		if snapshot.IstioRootNamespace != "mesh-root" {
-			t.Fatalf("expected resolved root namespace, got %q", snapshot.IstioRootNamespace)
+func TestLoadIstioRootNamespace(t *testing.T) {
+	t.Run("resolved from the istiod revision config", func(t *testing.T) {
+		factory, clientset := istioRootFactory(
+			meshConfigMap("default", "istio", "rootNamespace: ignored"),
+			meshConfigMap("istio-control", "istio-canary", "rootNamespace: mesh-root\n"),
+		)
+		snapshot := istioRootSnapshot(istiodDeployment("istio-control", "canary"))
+		loadIstioRootNamespace(context.Background(), factory, &snapshot)
+		assert.Equal(t, "mesh-root", snapshot.IstioRootNamespace)
+		assert.Empty(t, snapshot.IstioRootNamespaceCandidates)
+		assert.Empty(t, snapshot.Notes)
+		assert.Empty(t, snapshot.Incomplete)
+		assert.Equal(t, []string{"istio-control/istio-canary"}, configMapGets(clientset))
+		for _, action := range clientset.Actions() {
+			assert.Equal(t, "get", action.GetVerb(), "the mesh config is read without list or watch")
 		}
-		if len(snapshot.Incomplete) != 0 {
-			t.Fatalf("unexpected root namespace errors: %v", snapshot.Incomplete)
-		}
+		assert.Empty(t, factory.listNamespaces(client.CmGVR), "no cluster-wide ConfigMap informer is created")
 	})
 
-	t.Run("ambiguous revisions are partial", func(t *testing.T) {
-		factory := newNetPolGraphFactory()
-		for name, root := range map[string]string{"istio": "root-a", "istio-canary": "root-b"} {
-			factory.add(client.CmGVR, &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "istio-system"},
-				Data:       map[string]string{"mesh": "rootNamespace: " + root},
-			})
-		}
-		snapshot := newSnapshot()
-		loadIstioRootNamespace(factory, &snapshot)
-		if snapshot.IstioRootNamespace != netpol.DefaultIstioRootNamespace {
-			t.Fatalf("ambiguous roots must retain the default, got %q", snapshot.IstioRootNamespace)
-		}
-		if err := snapshot.Incomplete["istio-mesh-config"]; err == nil ||
-			!strings.Contains(err.Error(), "multiple Istio root namespaces") {
-			t.Fatalf("expected ambiguity error, got %v", err)
-		}
+	t.Run("default location without istiod deployments", func(t *testing.T) {
+		factory, clientset := istioRootFactory(meshConfigMap(netpol.DefaultIstioRootNamespace, "istio", "rootNamespace: mesh-root"))
+		snapshot := istioRootSnapshot()
+		loadIstioRootNamespace(context.Background(), factory, &snapshot)
+		assert.Equal(t, "mesh-root", snapshot.IstioRootNamespace)
+		assert.Equal(t, []string{"istio-system/istio"}, configMapGets(clientset))
 	})
 
-	t.Run("list and parse failures are partial", func(t *testing.T) {
-		factory := newNetPolGraphFactory()
-		factory.errs[client.CmGVR.String()] = errors.New("configmaps forbidden")
-		snapshot := newSnapshot()
-		loadIstioRootNamespace(factory, &snapshot)
-		if err := snapshot.Incomplete["istio-mesh-config"]; err == nil ||
-			!errors.Is(err, factory.errs[client.CmGVR.String()]) {
-			t.Fatalf("expected wrapped list error, got %v", err)
-		}
+	t.Run("default revision labels", func(t *testing.T) {
+		factory, clientset := istioRootFactory(meshConfigMap("istio-system", "istio", "{}"))
+		deployment := istiodDeployment("istio-system", "default")
+		deployment.Labels = nil
+		deployment.Spec.Template.Labels = map[string]string{"app": "istiod", "istio.io/rev": "default"}
+		snapshot := istioRootSnapshot(deployment)
+		loadIstioRootNamespace(context.Background(), factory, &snapshot)
+		assert.Equal(t, netpol.DefaultIstioRootNamespace, snapshot.IstioRootNamespace)
+		assert.Equal(t, []string{"istio-system/istio"}, configMapGets(clientset))
+		assert.Empty(t, snapshot.Notes)
+	})
 
-		factory = newNetPolGraphFactory()
-		factory.add(client.CmGVR, &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "istio", Namespace: "istio-system"},
-			Data:       map[string]string{"mesh": "rootNamespace: ["},
+	t.Run("revisions that disagree", func(t *testing.T) {
+		factory, _ := istioRootFactory(
+			meshConfigMap("istio-system", "istio", "rootNamespace: root-b"),
+			meshConfigMap("istio-system", "istio-canary", "rootNamespace: root-a"),
+		)
+		snapshot := istioRootSnapshot(istiodDeployment("istio-system", ""), istiodDeployment("istio-system", "canary"))
+		loadIstioRootNamespace(context.Background(), factory, &snapshot)
+		assert.Equal(t, "root-b", snapshot.IstioRootNamespace, "the default revision's root is preferred")
+		assert.Equal(t, []string{"root-a", "root-b"}, snapshot.IstioRootNamespaceCandidates)
+		require.Len(t, snapshot.Notes, 1)
+		assert.Contains(t, snapshot.Notes[0], "different root namespaces (root-a, root-b)")
+		assert.Empty(t, snapshot.Incomplete, "conflicts are scoped to root-namespace policies, not snapshot-wide")
+	})
+
+	t.Run("failures fall back to the default root with a note", func(t *testing.T) {
+		factory, clientset := istioRootFactory()
+		clientset.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, "istio", errors.New("denied"))
 		})
-		snapshot = newSnapshot()
-		loadIstioRootNamespace(factory, &snapshot)
-		if err := snapshot.Incomplete["istio-mesh-config"]; err == nil ||
-			!strings.Contains(err.Error(), "parse ConfigMap") {
-			t.Fatalf("expected parse error, got %v", err)
-		}
+		snapshot := istioRootSnapshot()
+		loadIstioRootNamespace(context.Background(), factory, &snapshot)
+		assert.Equal(t, netpol.DefaultIstioRootNamespace, snapshot.IstioRootNamespace)
+		assert.Empty(t, snapshot.Incomplete)
+		require.Len(t, snapshot.Notes, 1)
+		assert.Contains(t, snapshot.Notes[0], "could not be read")
+		assert.Contains(t, snapshot.Notes[0], "forbidden")
+		assert.Contains(t, snapshot.Notes[0], "using the default root namespace istio-system")
+	})
+
+	t.Run("partial failures keep the resolved root", func(t *testing.T) {
+		factory, clientset := istioRootFactory(meshConfigMap("istio-system", "istio", "rootNamespace: mesh-root"))
+		clientset.PrependReactor("get", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if get, ok := action.(k8stesting.GetAction); ok && get.GetName() == "istio-canary" {
+				return true, nil, errors.New("timeout")
+			}
+			return false, nil, nil
+		})
+		snapshot := istioRootSnapshot(istiodDeployment("istio-system", ""), istiodDeployment("istio-system", "canary"))
+		loadIstioRootNamespace(context.Background(), factory, &snapshot)
+		assert.Equal(t, "mesh-root", snapshot.IstioRootNamespace)
+		require.Len(t, snapshot.Notes, 1)
+		assert.Contains(t, snapshot.Notes[0], "some Istio mesh config could not be read: get ConfigMap istio-system/istio-canary: timeout")
+	})
+
+	t.Run("parse failures and missing config are notes", func(t *testing.T) {
+		factory, _ := istioRootFactory(meshConfigMap("istio-system", "istio", "rootNamespace: ["))
+		snapshot := istioRootSnapshot()
+		loadIstioRootNamespace(context.Background(), factory, &snapshot)
+		require.Len(t, snapshot.Notes, 1)
+		assert.Contains(t, snapshot.Notes[0], "parse ConfigMap istio-system/istio mesh config")
+
+		factory, _ = istioRootFactory()
+		snapshot = istioRootSnapshot()
+		loadIstioRootNamespace(context.Background(), factory, &snapshot)
+		require.Len(t, snapshot.Notes, 1)
+		assert.Contains(t, snapshot.Notes[0], "was not found in ConfigMap istio-system/istio")
+	})
+
+	t.Run("no connection or dial failure", func(t *testing.T) {
+		snapshot := istioRootSnapshot()
+		loadIstioRootNamespace(context.Background(), newNetPolGraphFactory(), &snapshot)
+		require.Len(t, snapshot.Notes, 1)
+		assert.Contains(t, snapshot.Notes[0], "no API connection")
+
+		factory := newNetPolGraphFactory()
+		factory.connection = &netPolGraphConnection{dialErr: errors.New("dial failed")}
+		snapshot = istioRootSnapshot()
+		loadIstioRootNamespace(context.Background(), factory, &snapshot)
+		require.Len(t, snapshot.Notes, 1)
+		assert.Contains(t, snapshot.Notes[0], "dial failed")
+	})
+
+	t.Run("no authorization policies", func(t *testing.T) {
+		factory, clientset := istioRootFactory()
+		snapshot := netpol.Snapshot{IstioRootNamespace: netpol.DefaultIstioRootNamespace}
+		loadIstioRootNamespace(context.Background(), factory, &snapshot)
+		assert.Empty(t, clientset.Actions())
+		assert.Empty(t, snapshot.Notes)
 	})
 }
 
 func TestLoadIstioRootNamespaceDefaultConfigurations(t *testing.T) {
 	tests := []struct {
-		name      string
-		data      map[string]string
-		otherRoot string
-		wantRoot  string
-		ambiguous bool
+		name       string
+		data       map[string]string
+		otherRoot  string
+		wantRoot   string
+		candidates []string
 	}{
 		{
 			name: "missing mesh key is not a configuration", data: map[string]string{"other": "value"},
@@ -268,15 +360,13 @@ func TestLoadIstioRootNamespaceDefaultConfigurations(t *testing.T) {
 		},
 		{
 			name: "empty mesh document conflicts with a custom root", data: map[string]string{"mesh": ""},
-			otherRoot: "mesh-root", wantRoot: netpol.DefaultIstioRootNamespace, ambiguous: true,
-		},
-		{
-			name: "empty mapping conflicts with a custom root", data: map[string]string{"mesh": "{}"},
-			otherRoot: "mesh-root", wantRoot: netpol.DefaultIstioRootNamespace, ambiguous: true,
+			otherRoot: "mesh-root", wantRoot: netpol.DefaultIstioRootNamespace,
+			candidates: []string{netpol.DefaultIstioRootNamespace, "mesh-root"},
 		},
 		{
 			name: "omitted root conflicts with a custom root", data: map[string]string{"mesh": "enableTracing: true"},
-			otherRoot: "mesh-root", wantRoot: netpol.DefaultIstioRootNamespace, ambiguous: true,
+			otherRoot: "mesh-root", wantRoot: netpol.DefaultIstioRootNamespace,
+			candidates: []string{netpol.DefaultIstioRootNamespace, "mesh-root"},
 		},
 		{
 			name: "empty document uses default", data: map[string]string{"mesh": ""},
@@ -293,37 +383,21 @@ func TestLoadIstioRootNamespaceDefaultConfigurations(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			factory := newNetPolGraphFactory()
-			factory.add(client.CmGVR, &corev1.ConfigMap{
+			objects := []runtime.Object{&corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{Name: "istio", Namespace: "istio-system"},
 				Data:       test.data,
-			})
+			}}
+			deployments := []appsv1.Deployment{istiodDeployment("istio-system", "")}
 			if test.otherRoot != "" {
-				factory.add(client.CmGVR, &corev1.ConfigMap{
-					ObjectMeta: metav1.ObjectMeta{Name: "istio-canary", Namespace: "istio-system"},
-					Data:       map[string]string{"mesh": "rootNamespace: " + test.otherRoot},
-				})
+				objects = append(objects, meshConfigMap("istio-system", "istio-canary", "rootNamespace: "+test.otherRoot))
+				deployments = append(deployments, istiodDeployment("istio-system", "canary"))
 			}
-			snapshot := netpol.Snapshot{
-				IstioAuthorizationPolicies: []unstructured.Unstructured{*customPolicy(
-					"security.istio.io/v1", "AuthorizationPolicy", "payments", "authz",
-				)},
-				IstioRootNamespace: netpol.DefaultIstioRootNamespace,
-				Incomplete:         map[string]error{},
-			}
-			loadIstioRootNamespace(factory, &snapshot)
-			if snapshot.IstioRootNamespace != test.wantRoot {
-				t.Errorf("root namespace = %q, want %q", snapshot.IstioRootNamespace, test.wantRoot)
-			}
-			err := snapshot.Incomplete["istio-mesh-config"]
-			if test.ambiguous {
-				want := "multiple Istio root namespaces discovered: istio-system, mesh-root"
-				if err == nil || err.Error() != want {
-					t.Errorf("mesh configuration error = %v, want %q", err, want)
-				}
-			} else if err != nil {
-				t.Errorf("unexpected mesh configuration error: %v", err)
-			}
+			factory, _ := istioRootFactory(objects...)
+			snapshot := istioRootSnapshot(deployments...)
+			loadIstioRootNamespace(context.Background(), factory, &snapshot)
+			assert.Equal(t, test.wantRoot, snapshot.IstioRootNamespace)
+			assert.Equal(t, test.candidates, snapshot.IstioRootNamespaceCandidates)
+			assert.Empty(t, snapshot.Incomplete)
 		})
 	}
 }
@@ -462,13 +536,18 @@ func TestNetPolGraphRefreshOptionalResourceDiscovery(t *testing.T) {
 			if slices.Contains(test.wantGVRs, client.AuthzV1BetaGVR) {
 				authzGVR = client.AuthzV1BetaGVR
 			}
+			// The mesh config is read with targeted GETs, never a
+			// cluster-wide ConfigMap list.
+			assert.Empty(t, factory.listNamespaces(client.CmGVR))
 			if slices.Contains(test.wantGVRs, authzGVR) {
 				require.Len(t, snapshot.IstioAuthorizationPolicies, 1)
 				assert.Equal(t, authzGVR.GV().String(), snapshot.IstioAuthorizationPolicies[0].GetAPIVersion())
-				assert.Equal(t, []string{client.BlankNamespace}, factory.listNamespaces(client.CmGVR))
+				assert.Equal(t, []string{
+					"Istio mesh config was not found in ConfigMap istio-system/istio; using the default root namespace istio-system",
+				}, snapshot.Notes)
 			} else {
 				assert.Empty(t, snapshot.IstioAuthorizationPolicies)
-				assert.Empty(t, factory.listNamespaces(client.CmGVR))
+				assert.Empty(t, snapshot.Notes)
 			}
 		})
 	}
@@ -519,7 +598,7 @@ func TestNetPolGraphRefreshOptionalPolicyConversionFailures(t *testing.T) {
 			var incomplete *IncompleteSnapshotError
 			require.ErrorAs(t, model.Refresh(netPolGraphContext(factory)), &incomplete)
 			require.Len(t, incomplete.Incomplete, 1)
-			assert.ErrorContains(t, incomplete.Incomplete[gvr.R()], "item 0")
+			require.ErrorContains(t, incomplete.Incomplete[gvr.R()], "item 0")
 			snapshot := evaluator.lastSnapshot()
 			var policies []unstructured.Unstructured
 			switch gvr {
@@ -619,10 +698,10 @@ func TestNetPolGraphRefreshOptionalResourceFailures(t *testing.T) {
 			assert.Equal(t, incomplete.Incomplete, model.LastRefresh().Incomplete)
 			assert.Equal(t, incomplete.Incomplete, evaluator.lastSnapshot().Incomplete)
 			if test.connectionErr != nil {
-				assert.ErrorIs(t, err, test.connectionErr)
+				require.ErrorIs(t, err, test.connectionErr)
 			}
 			if test.listErr != nil {
-				assert.ErrorIs(t, err, test.listErr)
+				require.ErrorIs(t, err, test.listErr)
 			}
 			for gv, failure := range test.discoveryFailures {
 				resource := client.AuthzGVR.R()
@@ -667,7 +746,9 @@ func TestNetPolGraphRefreshIstioVersionProvenance(t *testing.T) {
 				gvr.GV().String(): {{Name: gvr.R(), Namespaced: true}},
 			}, nil)
 			factory.add(client.PodGVR, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "ns"}})
-			factory.add(client.NsGVR, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns"}})
+			factory.add(client.NsGVR, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+				Name: "ns", Labels: map[string]string{"istio.io/dataplane-mode": "ambient"},
+			}})
 			policy := customPolicy(gvr.GV().String(), "AuthorizationPolicy", "ns", "authorize")
 			policy.Object["spec"] = map[string]any{
 				"action": "ALLOW",
@@ -784,75 +865,92 @@ func TestNetPolGraphNestedResultCopiesAreIsolated(t *testing.T) {
 	assert.Equal(t, want, delivered, "previous listener deliveries must stay isolated")
 }
 
-func TestNetPolGraphRefreshMeshConfigFailuresRemainPartial(t *testing.T) {
-	configMap := func(name, mesh string) runtime.Object {
-		return &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "istio-system"},
-			Data:       map[string]string{"mesh": mesh},
-		}
-	}
+func TestNetPolGraphRefreshMeshConfigFailuresAreNotes(t *testing.T) {
 	for _, test := range []struct {
-		name    string
-		objects []runtime.Object
-		listErr error
-		want    string
-		root    string
+		name        string
+		objects     []runtime.Object
+		getErr      error
+		deployments []appsv1.Deployment
+		want        string
+		root        string
+		candidates  []string
 	}{
-		{name: "forbidden", listErr: errors.New("configmaps forbidden"), want: "list Istio mesh config", root: netpol.DefaultIstioRootNamespace},
 		{
-			name: "parse error with usable revision", objects: []runtime.Object{
-				configMap("istio", "rootNamespace: ["), configMap("istio-canary", "rootNamespace: mesh-root"),
-			},
-			want: "parse ConfigMap istio-system/istio", root: "mesh-root",
+			name: "forbidden", getErr: errors.New("configmaps forbidden"),
+			want: "Istio mesh config could not be read (get ConfigMap istio-system/istio: configmaps forbidden)", root: netpol.DefaultIstioRootNamespace,
 		},
 		{
-			name: "conflicting default revision", objects: []runtime.Object{
-				configMap("istio", ""), configMap("istio-canary", "rootNamespace: mesh-root"),
+			name: "parse error with usable revision",
+			objects: []runtime.Object{
+				meshConfigMap("istio-system", "istio", "rootNamespace: ["), meshConfigMap("istio-system", "istio-canary", "rootNamespace: mesh-root"),
 			},
-			want: "multiple Istio root namespaces discovered: istio-system, mesh-root", root: netpol.DefaultIstioRootNamespace,
+			deployments: []appsv1.Deployment{istiodDeployment("istio-system", ""), istiodDeployment("istio-system", "canary")},
+			want:        "parse ConfigMap istio-system/istio", root: "mesh-root",
 		},
 		{
-			name: "conversion error with usable revision", objects: []runtime.Object{
-				&unstructured.Unstructured{Object: map[string]any{
-					"apiVersion": "v1", "kind": "ConfigMap", "data": []any{"invalid"},
-				}},
-				configMap("istio-canary", "rootNamespace: mesh-root"),
+			name: "conflicting default revision",
+			objects: []runtime.Object{
+				meshConfigMap("istio-system", "istio", ""), meshConfigMap("istio-system", "istio-canary", "rootNamespace: mesh-root"),
 			},
-			want: "item 0", root: "mesh-root",
+			deployments: []appsv1.Deployment{istiodDeployment("istio-system", ""), istiodDeployment("istio-system", "canary")},
+			want:        "different root namespaces (istio-system, mesh-root)", root: netpol.DefaultIstioRootNamespace,
+			candidates: []string{netpol.DefaultIstioRootNamespace, "mesh-root"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			factory := newNetPolGraphFactory()
-			factory.add(client.AuthzGVR, customPolicy("security.istio.io/v1", "AuthorizationPolicy", "ns", "authorize"))
-			for _, object := range test.objects {
-				factory.add(client.CmGVR, object)
+			connection, ok := newNetPolGraphDiscovery(t, map[string][]metav1.APIResource{
+				client.AuthzGVR.GV().String(): {{Name: client.AuthzGVR.R(), Namespaced: true}},
+			}, nil).(*netPolGraphConnection)
+			require.True(t, ok)
+			clientset := fake.NewClientset(test.objects...)
+			if test.getErr != nil {
+				clientset.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, test.getErr
+				})
 			}
-			factory.errs[client.CmGVR.String()] = test.listErr
+			connection.clientset = clientset
+			factory.connection = connection
+			factory.add(client.AuthzGVR, customPolicy("security.istio.io/v1", "AuthorizationPolicy", "ns", "authorize"))
+			for index := range test.deployments {
+				factory.add(client.DpGVR, &test.deployments[index])
+			}
 			evaluator := &netPolGraphEvaluator{}
 			model := NewNetPolGraph(evaluator)
 			model.SetSubject(netpol.SubjectRef{Kind: netpol.SubjectPod, Namespace: "ns", Name: "pod"})
 			listener := newNetPolGraphListener()
 			model.AddListener(listener)
-			err := model.Refresh(netPolGraphContext(factory))
-			var incomplete *IncompleteSnapshotError
-			require.ErrorAs(t, err, &incomplete)
-			require.Len(t, incomplete.Incomplete, 1)
-			require.ErrorContains(t, incomplete.Incomplete["istio-mesh-config"], test.want)
-			if test.listErr != nil {
-				assert.ErrorIs(t, err, test.listErr)
-			}
+			require.NoError(t, model.Refresh(netPolGraphContext(factory)), "mesh config problems are notes, not snapshot failures")
 			snapshot := evaluator.lastSnapshot()
 			assert.Equal(t, test.root, snapshot.IstioRootNamespace)
+			assert.Equal(t, test.candidates, snapshot.IstioRootNamespaceCandidates)
+			assert.Contains(t, strings.Join(snapshot.Notes, "\n"), test.want)
+			assert.Empty(t, snapshot.Incomplete)
+			assert.Empty(t, model.LastRefresh().Incomplete)
 			assert.Len(t, snapshot.IstioAuthorizationPolicies, 1)
 			assert.Equal(t, 1, listener.changedCount())
-			assert.Equal(t, 1, listener.failedCount())
-			metadata := model.LastRefresh()
-			delete(metadata.Incomplete, "istio-mesh-config")
-			delete(incomplete.Incomplete, "istio-mesh-config")
-			assert.Contains(t, model.LastRefresh().Incomplete, "istio-mesh-config")
-			assert.Contains(t, snapshot.Incomplete, "istio-mesh-config")
+			assert.Zero(t, listener.failedCount())
 		})
 	}
+}
+
+func TestNetPolGraphResultCarriesSnapshotNotes(t *testing.T) {
+	factory := newNetPolGraphFactory()
+	factory.add(client.PodGVR, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "ns"}})
+	factory.add(client.NsGVR, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns"}})
+	factory.add(client.AuthzGVR, customPolicy("security.istio.io/v1", "AuthorizationPolicy", "ns", "authorize"))
+	model := NewNetPolGraph(netpol.NewEvaluator())
+	model.SetSubject(netpol.SubjectRef{Kind: netpol.SubjectPod, Namespace: "ns", Name: "pod"})
+	require.NoError(t, model.Refresh(netPolGraphContext(factory)))
+	result, ok := model.Peek()
+	require.True(t, ok)
+	require.Equal(t, []string{
+		"Istio mesh config could not be read (no API connection); using the default root namespace istio-system",
+	}, result.Notes)
+	result.Notes[0] = "changed"
+	again, ok := model.Peek()
+	require.True(t, ok)
+	require.NotEqual(t, "changed", again.Notes[0], "notes are copied with the result")
 }
 
 func TestNetPolGraphRefreshOptionalPolicyFailuresReachResults(t *testing.T) {
@@ -1120,6 +1218,18 @@ type netPolGraphConnection struct {
 	client.Connection
 	discovery *disk.CachedDiscoveryClient
 	err       error
+	clientset kubernetes.Interface
+	dialErr   error
+}
+
+func (c *netPolGraphConnection) Dial() (kubernetes.Interface, error) {
+	if c.dialErr != nil {
+		return nil, c.dialErr
+	}
+	if c.clientset == nil {
+		return fake.NewClientset(), nil
+	}
+	return c.clientset, nil
 }
 
 func (c *netPolGraphConnection) CachedDiscovery() (*disk.CachedDiscoveryClient, error) {
@@ -1356,6 +1466,8 @@ type netPolGraphListener struct {
 }
 
 func newNetPolGraphListener() *netPolGraphListener { return &netPolGraphListener{} }
+
+//nolint:gocritic // SubjectResult is passed by value by the NetPolGraphListener contract.
 func (l *netPolGraphListener) NetPolGraphChanged(result netpol.SubjectResult) {
 	l.mu.Lock()
 	l.changed++

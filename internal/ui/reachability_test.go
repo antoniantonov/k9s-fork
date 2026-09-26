@@ -1180,3 +1180,58 @@ func TestHighlightedStateLineRendersInColor(t *testing.T) {
 	assert.Contains(t, direction, "Direction: Ingress")
 	assert.Contains(t, ports, "ports: []", "square brackets survive the dynamic-color pass")
 }
+
+func TestFormatRuleNameDisambiguatesSpecsAndActions(t *testing.T) {
+	tests := []struct {
+		name string
+		rule netpol.RuleResult
+		want string
+	}{
+		{"native", netpol.RuleResult{ID: netpol.RuleID{PolicyNamespace: "ns", PolicyName: "np", Index: 1}}, "ns/np #1"},
+		{
+			"single spec allow",
+			netpol.RuleResult{ID: netpol.RuleID{PolicyNamespace: "ns", PolicyName: "cnp", Action: netpol.PolicyActionAllow}, PolicySpec: "spec", PolicySpecCount: 1},
+			"ns/cnp #0",
+		},
+		{
+			"deny at the same index",
+			netpol.RuleResult{ID: netpol.RuleID{PolicyNamespace: "ns", PolicyName: "cnp", Action: netpol.PolicyActionDeny}, PolicySpec: "spec", PolicySpecCount: 1},
+			"ns/cnp deny #0",
+		},
+		{
+			"multi spec deny",
+			netpol.RuleResult{
+				ID:         netpol.RuleID{PolicyName: "ccnp", PolicySpecIndex: 2, Action: netpol.PolicyActionDeny},
+				PolicySpec: "specs[1]", PolicySpecCount: 3,
+			},
+			"ccnp specs[1] deny #0",
+		},
+		{"custom action", netpol.RuleResult{ID: netpol.RuleID{PolicyNamespace: "ns", PolicyName: "ext", Action: netpol.PolicyActionCustom}}, "ns/ext custom #0"},
+		{"network default deny", netpol.RuleResult{ID: netpol.RuleID{Index: -1, SyntheticKind: netpol.SyntheticDefaultDeny}, Synthetic: true}, "default-deny #-1"},
+		{
+			"authorization default deny",
+			netpol.RuleResult{ID: netpol.RuleID{Index: -1, SyntheticKind: netpol.SyntheticAuthorizationDefaultDeny}, Synthetic: true},
+			"authorization default-deny (TCP) #-1",
+		},
+		{"unnamed", netpol.RuleResult{ID: netpol.RuleID{Index: -1}}, "— #-1"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, formatRuleName(&test.rule))
+		})
+	}
+}
+
+func TestRuleDetailsShowsCiliumSpecEntry(t *testing.T) {
+	rule := testRules()[0]
+	rule.ID.PolicyType, rule.ID.PolicySpecIndex, rule.ID.Action = netpol.PolicyTypeCiliumNetworkPolicy, 1, netpol.PolicyActionDeny
+	rule.PolicySpec, rule.PolicySpecCount = "specs[0]", 2
+	text := RuleDetailsText(rule)
+	assert.Contains(t, text, "Policy API version: ")
+	assert.Contains(t, text, "Action: deny\nRule index: 0 in specs[0] (spec index 1)\nState: ")
+
+	native := testRules()[0]
+	assert.Contains(t, RuleDetailsText(native), "Rule index: 0\nState: ")
+	assert.Equal(t, strings.Count(RuleDetailsText(native), "\n"), strings.Count(text, "\n"),
+		"the spec entry does not add a line to the short detail pane")
+}

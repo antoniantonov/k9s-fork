@@ -84,7 +84,7 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("diffcover", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	base := flags.String("base", envOrDefault("DIFF_COVER_BASE", "master"), "base ref used to find the merge base")
+	base := flags.String("base", envOrDefault("DIFF_COVER_BASE", defaultBase()), "base ref used to find the merge base")
 	profile := flags.String("profile", "", "Go cover profile to evaluate")
 	threshold := flags.Float64("threshold", 80, "minimum aggregate changed-statement coverage")
 	required := fileThresholds{}
@@ -197,6 +197,15 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintln(stdout, ".")
 	return nil
+}
+
+// defaultBase prefers the upstream origin/master: a local master branch is
+// often stale and would attribute upstream merges to the branch under test.
+func defaultBase() string {
+	if _, err := gitOutput("rev-parse", "--verify", "--quiet", "origin/master"); err == nil {
+		return "origin/master"
+	}
+	return "master"
 }
 
 func envOrDefault(name, fallback string) string {

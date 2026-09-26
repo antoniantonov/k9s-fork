@@ -23,6 +23,7 @@ func TestEdgeFixturePolicyContracts(t *testing.T) {
 PREFIX=stub-demo
 NS_EDGE_SRC=stub-demo-edge-src
 NS_EDGE_DST=stub-demo-edge-dst
+NS_EDGE_OTHER=stub-demo-edge-other
 EDGE_SCENARIO=stub-demo-edges
 edge_policy() { printf '%s\000%s\000%s\000' "$2" "$5" "{$6}"; }
 edge_policies`
@@ -31,11 +32,13 @@ edge_policies`
 		t.Fatalf("render edge policies: %v\n%s", err, output)
 	}
 	fields := strings.Split(strings.TrimSuffix(string(output), "\x00"), "\x00")
-	if len(fields) != 15*3 {
-		t.Fatalf("expected 15 policy fixtures, got %d fields", len(fields))
+	if len(fields) != 18*3 {
+		t.Fatalf("expected 18 policy fixtures, got %d fields", len(fields))
 	}
+	names := map[string]bool{}
 	for index := 0; index < len(fields); index += 3 {
 		kind, name := fields[index], fields[index+1]
+		names[name] = true
 		var policy map[string]any
 		if err := json.Unmarshal([]byte(fields[index+2]), &policy); err != nil {
 			t.Fatalf("%s %s has invalid JSON: %v", kind, name, err)
@@ -56,6 +59,13 @@ edge_policies`
 		if kind == "AuthorizationPolicy" && strings.Contains(fields[index+2], `"from"`) {
 			t.Fatalf("known-state fixture %s contains identity constraints", name)
 		}
+		if name == "cnp-l7" {
+			rule := policy["spec"].(map[string]any)["ingress"].([]any)[0].(map[string]any)
+			peer := rule["fromEndpoints"].([]any)[0].(map[string]any)["matchLabels"].(map[string]any)
+			if peer["k8s:io.kubernetes.pod.namespace"] != "stub-demo-edge-other" || !strings.Contains(fields[index+2], `"http"`) {
+				t.Fatalf("scoped L7 fixture must only match the control pod: %v", rule)
+			}
+		}
 		if name == "cnp-empty" || name == "stub-demo-edge-ccnp-empty" {
 			spec := policy["spec"].(map[string]any)
 			for _, direction := range []string{"ingress", "egress"} {
@@ -64,6 +74,11 @@ edge_policies`
 					t.Fatalf("%s does not exercise %s: [{}]", name, direction)
 				}
 			}
+		}
+	}
+	for _, name := range []string{"authz-unenrolled", "authz-unknown", "cnp-l7"} {
+		if !names[name] {
+			t.Fatalf("mesh enrollment or scoped uncertainty fixture %s disappeared", name)
 		}
 	}
 }
@@ -79,18 +94,29 @@ edge_pods`, "LIB="+edgeLibrary(t))
 	}
 	counts := map[string]int{}
 	seen := map[string]bool{}
+	meshes := map[string]string{}
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) != 4 || seen[fields[0]+"/"+fields[1]] {
+		if len(fields) != 5 || seen[fields[0]+"/"+fields[1]] {
 			t.Fatalf("invalid or duplicate pod fixture %q", line)
 		}
 		seen[fields[0]+"/"+fields[1]] = true
 		counts[fields[0]]++
+		meshes[fields[1]] = fields[4]
 	}
-	if len(seen) != 18 || counts["stub-demo-edge-src"] != 8 ||
-		counts["stub-demo-edge-dst"] != 9 || counts["stub-demo-edge-other"] != 1 ||
+	if len(seen) != 21 || counts["stub-demo-edge-src"] != 8 ||
+		counts["stub-demo-edge-dst"] != 12 || counts["stub-demo-edge-other"] != 1 ||
 		!seen["stub-demo-edge-other/control"] {
 		t.Fatalf("isolated pod inventory changed: %#v", counts)
+	}
+	if meshes["authz-unenrolled"] != "opt-out" || meshes["authz-unknown"] != "stale-sidecar" || meshes["authz-server"] != "-" {
+		t.Fatalf("mesh enrollment fixtures changed: %#v", meshes)
+	}
+	mesh, err := bashScript(t, `source "$LIB"
+printf '%s,' "$(edge_namespace_mesh source)" "$(edge_namespace_mesh destination)" "$(edge_namespace_mesh other)"
+printf '%s,' "$(edge_pod_mesh opt-out)" "$(edge_pod_mesh stale-sidecar)" "$(edge_pod_mesh -)"`, "LIB="+edgeLibrary(t))
+	if err != nil || string(mesh) != `ambient,ambient,,none|,|{"containers":["istio-proxy"]},|,` {
+		t.Fatalf("mesh fixture labels changed: %v %q", err, mesh)
 	}
 }
 
@@ -698,53 +724,199 @@ func TestSelectedRuleIdentityAndDenyContracts(t *testing.T) {
 	script := `
 	proc fail_case {message} { error "ASSERTION: $message" }
 	set columns "%-40s %-35s %s"
-	set rules "┌ Egress · Rules ┐\n│[format $columns {scenario/cnp-source #0} CiliumNetworkPolicy {TCP/8080, TCP/8081}]│\n│subjects 1/1                       peer podSelector=app=cnp-server│\n│────────────                      ────────────│\n│[format $columns {scenario/cnp-source #0} CiliumNetworkPolicy TCP/8081]│\n└"
-	foreach {action ports} {ALLOW {TCP/8080, TCP/8081} DENY TCP/8081} {
-	  set screen "$rules\nRule Details\nPolicy: scenario/cnp-source\nPolicy type: CiliumNetworkPolicy\nPolicy API version: cilium.io/v2\nAction: [string tolower $action]\nRule index: 0\nApplicability (Egress)"
-	  if {![assert_selected_edge_rule $screen Egress scenario/cnp-source CiliumNetworkPolicy cilium.io/v2 $action $ports]} {
-	    error "valid $action #0 rule was rejected"
+	set rules "┌ Egress · Rules ┐\n│[format $columns {scenario/cnp-source specs[0] #0} CiliumNetworkPolicy {TCP/8080, TCP/8081}]│\n│subjects 1/1                       peer podSelector=app=cnp-server│\n│────────────                      ────────────│\n│[format $columns {scenario/cnp-source specs[1] deny #0} CiliumNetworkPolicy TCP/8081]│\n└"
+	foreach {action ports spec index} {ALLOW {TCP/8080, TCP/8081} specs[0] 0 DENY TCP/8081 specs[1] 1} {
+	  set screen "$rules\nRule Details\nPolicy: scenario/cnp-source\nPolicy type: CiliumNetworkPolicy\nPolicy API version: cilium.io/v2\nAction: [string tolower $action]\nRule index: 0 in $spec (spec index $index)\nApplicability (Egress)"
+	  if {![assert_selected_edge_rule $screen Egress scenario/cnp-source CiliumNetworkPolicy cilium.io/v2 $action $ports $spec 1]} {
+	    error "valid $action $spec rule was rejected"
 	  }
-	  foreach {from to} {
-	    {Policy: scenario/cnp-source} {Policy: scenario/cnp-source-other}
-	    {Policy type: CiliumNetworkPolicy} {Policy type: CNP}
-	    {API version: cilium.io/v2} {API version: cilium.io/v1}
-	    {#0} {[spec 1] #0}
-	    {Rule index: 0} {Rule index: 1}
-	  } {
+	  set label [expected_rule_label scenario/cnp-source $action $spec 1]
+	  foreach {from to} [list \
+	    {Policy: scenario/cnp-source} {Policy: scenario/cnp-source-other} \
+	    {Policy type: CiliumNetworkPolicy} {Policy type: CNP} \
+	    {API version: cilium.io/v2} {API version: cilium.io/v1} \
+	    $label [string map {{ #0} { #1}} $label] \
+	    "in $spec (spec" "in specs\[9\] (spec" \
+	    {Rule index: 0} {Rule index: 1} \
+	  ] {
 	    set changed [string map [list $from $to] $screen]
-	    if {![catch {assert_selected_edge_rule $changed Egress scenario/cnp-source CiliumNetworkPolicy cilium.io/v2 $action $ports}]} {
+	    if {![catch {assert_selected_edge_rule $changed Egress scenario/cnp-source CiliumNetworkPolicy cilium.io/v2 $action $ports $spec 1}]} {
 	      error "incorrect selected origin passed: $from => $to"
 	    }
 	  }
-	  if {![catch {assert_selected_edge_rule "$screen\nSpec index: 1" Egress scenario/cnp-source CiliumNetworkPolicy cilium.io/v2 $action $ports}]} {
+	  if {![catch {assert_selected_edge_rule "$screen\nSpec index: 1" Egress scenario/cnp-source CiliumNetworkPolicy cilium.io/v2 $action $ports $spec 1}]} {
 	    error "invented spec-index detail label passed"
+	  }
+	  if {![catch {assert_selected_edge_rule $screen Egress scenario/cnp-source CiliumNetworkPolicy cilium.io/v2 $action $ports $spec 0}]} {
+	    error "a single-spec label matched a multi-spec rule row"
 	  }
 	  set other_action DENY
 	  if {$action eq "DENY"} { set other_action ALLOW }
-	  if {![catch {assert_selected_edge_rule $screen Egress scenario/cnp-source CiliumNetworkPolicy cilium.io/v2 $other_action $ports}]} {
-	    error "same visible #0 label hid the wrong action"
+	  if {![catch {assert_selected_edge_rule $screen Egress scenario/cnp-source CiliumNetworkPolicy cilium.io/v2 $other_action $ports $spec 1}]} {
+	    error "the action suffix did not distinguish allow from deny"
 	  }
 	}
-	set screen "┌ Ingress · Rules ┐\n│[format $columns {scenario-edge-ccnp #0} CiliumClusterwideNetworkPolicy {TCP/9091, TCP/9092}]│\n└\nRule Details\nPolicy: —/scenario-edge-ccnp\nPolicy type: CiliumClusterwideNetworkPolicy\nPolicy API version: cilium.io/v2\nAction: allow\nRule index: 0\nApplicability (Ingress)"
-	if {![assert_selected_edge_rule $screen Ingress scenario-edge-ccnp CiliumClusterwideNetworkPolicy cilium.io/v2 ALLOW {TCP/9091, TCP/9092}]} {
+	foreach {reference action spec multi label} {
+	  scenario/np ALLOW {} 0 {scenario/np #0}
+	  scenario/cnp DENY spec 0 {scenario/cnp deny #0}
+	  scenario-ccnp ALLOW specs[1] 1 {scenario-ccnp specs[1] #0}
+	  scenario-ccnp DENY specs[1] 1 {scenario-ccnp specs[1] deny #0}
+	} {
+	  if {[expected_rule_label $reference $action $spec $multi] ne $label} { error "wrong expected label for $reference $action $spec" }
+	}
+	if {[rule_spec any Egress ALLOW] ne {{} 0}} { error "helper rule_spec must default to non-Cilium rules" }
+	set screen "┌ Ingress · Rules ┐\n│[format $columns {scenario-edge-ccnp specs[1] #0} CiliumClusterwideNetworkPolicy {TCP/9091, TCP/9092}]│\n└\nRule Details\nPolicy: —/scenario-edge-ccnp\nPolicy type: CiliumClusterwideNetworkPolicy\nPolicy API version: cilium.io/v2\nAction: allow\nRule index: 0 in specs\[1\] (spec index 1)\nApplicability (Ingress)"
+	set screen [string map {\\ {}} $screen]
+	if {![assert_selected_edge_rule $screen Ingress scenario-edge-ccnp CiliumClusterwideNetworkPolicy cilium.io/v2 ALLOW {TCP/9091, TCP/9092} specs\[1\] 1]} {
 	  error "cluster-scoped policy details did not match their namespace-free rule row"
 	}
-	if {![catch {assert_selected_edge_rule $screen Ingress scenario-edge-ccnp CiliumClusterwideNetworkPolicy cilium.io/v2 ALLOW TCP/9091-9092}]} {
+	if {![catch {assert_selected_edge_rule $screen Ingress scenario-edge-ccnp CiliumClusterwideNetworkPolicy cilium.io/v2 ALLOW TCP/9091-9092 specs\[1\] 1}]} {
 	  error "raw declared ports were incorrectly accepted as a merged range"
 	}
-	set native [format "┌ Egress · Rules ┐\n│%-50s %-30s %s│\n└\n" {scenario/authz-source-network #0} NetworkPolicy {SCTP/9000, TCP/8080, TCP/8081, UDP/5353}]
+	set native [format "┌ Egress · Rules ┐\n│%-50s %-30s %s│\n└\nRule Details\nPolicy: scenario/authz-source-network\nPolicy type: NetworkPolicy\nPolicy API version: networking.k8s.io/v1\nAction: allow\nRule index: 0\n" {scenario/authz-source-network #0} NetworkPolicy {SCTP/9000, TCP/8080, TCP/8081, UDP/5353}]
 	set rows [rule_rows $native "Egress · Rules"]
 	if {[llength $rows] != 1 || [dict get [lindex $rows 0] Name] ne "scenario/authz-source-network #0" ||
 	    [dict get [lindex $rows 0] Type] ne "NetworkPolicy" ||
 	    [dict get [lindex $rows 0] Ports] ne "SCTP/9000, TCP/8080, TCP/8081, UDP/5353"} {
 	  error "headerless native row lost its exact name/type/declared ports: $rows"
 	}
+	if {![assert_selected_edge_rule $native Egress scenario/authz-source-network NetworkPolicy networking.k8s.io/v1 ALLOW {SCTP/9000, TCP/8080, TCP/8081, UDP/5353}]} {
+	  error "native rule without a spec entry was rejected"
+	}
+	if {![catch {assert_selected_edge_rule [string map {{Rule index: 0} {Rule index: 0 in spec (spec index 0)}} $native] Egress scenario/authz-source-network NetworkPolicy networking.k8s.io/v1 ALLOW {SCTP/9000, TCP/8080, TCP/8081, UDP/5353}]}]} {
+	  error "a native rule accepted a Cilium spec entry"
+	}
 	if {[llength [rule_rows $native "Ingress · Rules"]] != 0} { error "rules came from the opposite direction" }
-	puts "same-index allow/deny rule identities and full origin checks passed"
+	set synthetic [format "┌ Ingress · Rules ┐\n│%-50s %-30s %s│\n└\n" {authorization default-deny (TCP) #-1} Synthetic {no ports}]
+	set rows [rule_rows $synthetic "Ingress · Rules"]
+	if {[llength $rows] != 1 || [dict get [lindex $rows 0] Name] ne "authorization default-deny (TCP) #-1" || [dict get [lindex $rows 0] Type] ne "Synthetic"} {
+	  error "authorization default-deny row was not parsed: $rows"
+	}
+	puts "spec entries, action suffixes and full origin checks passed"
 	`
 	output, err := expectScript(t, script)
 	if err != nil {
 		t.Fatalf("selected rule identity contract: %v\n%s", err, output)
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
+func TestIdentityNoteScanScrollsRuleDetails(t *testing.T) {
+	script := `
+	proc fail_case {message} { lappend ::failed $message }
+	proc send_key {key args} {
+	  lappend ::keys $key
+	  if {$key eq "\033\[B"} { incr ::offset }
+	  if {$key eq "\033\[H"} { set ::offset 0 }
+	}
+	proc capture_screen {} {
+	  set visible [lrange $::details $::offset [expr {$::offset + 2}]]
+	  return "┌ Rule Details ┐\n│[join $visible "│\n│"]│\n└"
+	}
+	foreach {mutation details want} {
+	  none {{Policy: d/probe} {State: Allowed (Allowed)} {Peers:} {Rule YAML:} {Notes:} {  - ... mesh mTLS ...}} 1
+	  partial {{Policy: d/probe} {State: Partial Data (Partial Data)} {Notes:} {  - ... mesh mTLS ...}} 0
+	  warning {{Policy: d/probe} {State: Allowed (Allowed)} {Warnings:} {  - uncertain} {  - ... mesh mTLS ...}} 0
+	  missing {{Policy: d/probe} {State: Allowed (Allowed)} {Peers:} {Rule YAML:}} 0
+	} {
+	  set failed {}
+	  set keys {}
+	  set offset 0
+	  set got [scan_rule_details {{State: Allowed (Allowed)} {mesh mTLS}} {{Partial Data} Warnings:}]
+	  if {$got != $want || ($want == 1 && [llength $failed] != 0) || ($want == 0 && [llength $failed] == 0)} {
+	    error "rule details scan mutation $mutation returned $got: $failed"
+	  }
+	  if {[lindex $keys 0] ne "\t" || [lindex $keys 1] ne "\033\[H"} { error "scan did not focus and rewind the details" }
+	}
+	puts "rule details are scanned from the top for required notes and forbidden partial state"
+	`
+	output, err := expectScript(t, script)
+	if err != nil {
+		t.Fatalf("rule details scan contract: %v\n%s", err, output)
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
+func TestAuthorizationDefaultDenyRowContract(t *testing.T) {
+	script := `
+	set ns_edge_dst scenario
+	proc start_case {name args} { if {$name ne "istio-authorization-default-deny-row"} { error "unexpected case $name" } }
+	proc pass_case {} { incr ::passed }
+	proc fail_case {message} { lappend ::failed $message }
+	proc open_edge_subject {args} { return 1 }
+	proc capture_screen {} {
+	  set columns "%-50s %-30s %s"
+	  set screen "┌ Ingress · Rules ┐\n"
+	  foreach {name type ports} $::rows { append screen "│[format $columns $name $type $ports]│\n" }
+	  return "$screen└"
+	}
+	foreach {mutation rows} {
+	  none {{authorization default-deny (TCP) #-1} Synthetic {no ports} {default-deny #-1} Synthetic {no ports}}
+	  missing-authz {{default-deny #-1} Synthetic {no ports}}
+	  missing-network {{authorization default-deny (TCP) #-1} Synthetic {no ports}}
+	  unrestricted {{authorization default-deny (TCP) #-1} Synthetic {no ports} {default-deny #-1} Synthetic {no ports} {unrestricted #-1} Synthetic {SCTP/all, TCP/all, UDP/all}}
+	  wrong-type {{authorization default-deny (TCP) #-1} AuthorizationPolicy {no ports} {default-deny #-1} Synthetic {no ports}}
+	} {
+	  set passed 0
+	  set failed {}
+	  verify_authorization_default_deny_row authz-no-tcp scenario
+	  if {$mutation eq "none"} {
+	    if {$passed != 1 || [llength $failed] != 0} { error "valid synthetic rows were rejected: $failed" }
+	  } elseif {$passed != 0 || [llength $failed] == 0} {
+	    error "synthetic row mutation escaped the assertions: $mutation"
+	  }
+	}
+	puts "per-layer synthetic rows are asserted exactly"
+	`
+	output, err := expectScript(t, script)
+	if err != nil {
+		t.Fatalf("authorization default-deny row contract: %v\n%s", err, output)
+	}
+	t.Log(strings.TrimSpace(string(output)))
+}
+
+func TestHostNetworkPeerContract(t *testing.T) {
+	script := `
+	proc start_case {name args} { set ::case $name }
+	proc pass_case {} { incr ::passed }
+	proc fail_case {message} { lappend ::failed $message }
+	proc open_edge_subject {args} { return 1 }
+	proc send_key {args} {}
+	proc filter_to {value} { set ::filter $value; return 1 }
+	proc wait_for_frame {predicate args} {
+	  set screen [screen_for_mutation]
+	  if {[{*}$predicate $screen]} { return $screen }
+	  set ::last_wait_screen $screen
+	  return ""
+	}
+	proc screen_for_mutation {} {
+	  set columns "%-60s %-8s %-10s %-14s %s"
+	  set heading "Pod scenario/cnp-server · 1 pod\nIngress · Rules\nSelection: none\nEffective Details"
+	  set state {Partial Data}
+	  set name kube-proxy-x7k2p
+	  switch -- $::mutation {
+	    wrong-state { set state Disallowed }
+	    other-pod { set name kindnet-abcde }
+	  }
+	  set rows [format $columns "Pod kube-system/$name" false true $state {no ports}]
+	  if {$::mutation eq "two-rows"} { append rows "\n" [format $columns "Pod kube-system/kube-proxy-other" false true $state {no ports}] }
+	  return "$heading\nEffective Applicability (Ingress)\n[format $columns Primitive Peer Opposite State Ports]\n$rows\n└"
+	}
+	foreach mutation {none wrong-state other-pod two-rows} {
+	  set passed 0
+	  set failed {}
+	  verify_hostnetwork_peer cilium-hostnetwork-peer-partial-data cnp-server scenario Ingress {Partial Data} {no ports} 1
+	  if {$mutation eq "none"} {
+	    if {$passed != 1 || [llength $failed] != 0 || $filter ne "Pod kube-system/kube-proxy-"} { error "valid hostNetwork row rejected: $failed" }
+	  } elseif {$passed != 0 || [llength $failed] == 0} {
+	    error "hostNetwork mutation escaped the assertions: $mutation"
+	  }
+	}
+	puts "hostNetwork peer rows are matched by DaemonSet prefix exactly once"
+	`
+	output, err := expectScript(t, script)
+	if err != nil {
+		t.Fatalf("hostNetwork peer contract: %v\n%s", err, output)
 	}
 	t.Log(strings.TrimSpace(string(output)))
 }
@@ -1036,7 +1208,7 @@ func TestUnsupportedProbeUsesEffectiveDiagnostics(t *testing.T) {
 	set diagnostic [read $file]
 	close $file
 	set top $diagnostic
-	set warning "Warning: snapshot resource \"ciliumnetworkpolicies\" could not be fully evaluated: $reference: egress allow rule 0: toFQDNs requires live DNS resolution"
+	set warning "Warning: CiliumNetworkPolicy $reference: egress allow rule 0: toFQDNs requires live DNS resolution"
 	proc fail_case {message} { error "ASSERTION: $message" }
 	proc start_case {name args} {
 	  if {$name ne "unsupported-cilium-rule-details"} { error "manifest case changed" }
@@ -1057,17 +1229,17 @@ func TestUnsupportedProbeUsesEffectiveDiagnostics(t *testing.T) {
 	  error "fixture invented a mixed-case Partial Data label inside Effective Details"
 	}
 	verify_unsupported_policy
-	if {$passed != 1 || $keys ne [list "\t" "\033\[F"]} {
-	  error "probe did not inspect effective diagnostics exactly once: $passed / $keys"
+	if {$passed != 1 || $keys ne [list "\t" "\033\[H"]} {
+	  error "probe did not inspect effective diagnostics exactly once from the top: $passed / $keys"
 	}
 	foreach {from to} {
-	  {"ciliumnetworkpolicies"} {"networkpolicies"}
+	  {CiliumNetworkPolicy netpol} {CiliumClusterwideNetworkPolicy netpol}
 	  {probe-unsupported-20260912-200409-79177:} {probe-unsupported-another-run:}
 	  {egress allow rule 0} {ingress allow rule 0}
 	  {toFQDNs} {toEndpoints}
 	  {Effective Details} {Rule Details}
 	  {uncertain-client · 1 pod} {other-client · 1 pod}
-	  {PARTIAL DATA (1 warning(s))} {}
+	  {PARTIAL DATA (7 warning(s))} {}
 	  {Partial Data} {Allowed}
 	} {
 	  if {[unsupported_diagnostics $reference [string map [list $from $to] $diagnostic]]} {
@@ -1079,7 +1251,7 @@ func TestUnsupportedProbeUsesEffectiveDiagnostics(t *testing.T) {
 	    [unsupported_diagnostics $reference "$missing\n$warning"]} {
 	  error "partial header or warning outside Effective Details hid a missing diagnostic"
 	}
-	puts "exact live snapshot-resource diagnostic and partial-state surfaces replayed with negative controls"
+	puts "exact per-rule policy diagnostic and partial-state surfaces replayed with negative controls"
 	`
 	output, err := expectScript(t, script)
 	if err != nil {
@@ -1106,13 +1278,21 @@ func TestSmokeManifestInventory(t *testing.T) {
 		seen[fields[1]] = true
 		counts[fields[0]]++
 	}
-	if counts["known"] != 66 || counts["identity"] != 2 || counts["unsupported"] != 2 || len(seen) != 70 {
+	if counts["known"] != 77 || counts["identity"] != 2 || counts["unsupported"] != 2 || len(seen) != 81 {
 		t.Fatalf("smoke inventory changed without updating its contract: %#v", counts)
 	}
 	for _, name := range []string{
 		"cnp-empty-rule-ingress", "cnp-empty-rule-egress",
 		"ccnp-empty-rule-ingress", "ccnp-empty-rule-egress",
 		"cilium-cidr-narrow-deny", "istio-source-ingress-deny-egress-control",
+		"istio-unenrolled-ingress", "istio-unenrolled-egress",
+		"istio-enrollment-unknown-ingress", "istio-enrollment-unknown-egress",
+		"cilium-l7-scoped-ingress", "cilium-l7-scoped-egress",
+		"cilium-l7-unmatched-peer-ingress", "cilium-l7-unmatched-peer-egress",
+		"cilium-hostnetwork-peer-partial-data", "hostnetwork-peer-native-control",
+		"istio-authorization-default-deny-row",
+		"istio-identity-ingress-note", "istio-identity-egress-note",
+		"unsupported-cilium-rule-details", "unsupported-scoped-egress-control",
 	} {
 		if !seen[name] {
 			t.Fatalf("required regression case %s disappeared", name)

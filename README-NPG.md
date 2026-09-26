@@ -65,15 +65,56 @@ NPG evaluates reachability once when opened. Automatic refresh is disabled by
 default. It can be enabled at a five-second interval with `r`.
 
 NPG models the supported declarative policy fields, not guaranteed packet
-delivery. CNI behavior, NAT, `hostNetwork`, node-local traffic, sidecar
-enrollment, cloud firewalls, and other networking layers may change the real
-result. Dynamic Cilium destinations such as FQDNs, Services, CIDR groups, nodes,
-and cloud-provider groups, plus Istio external authorization, `targetRefs`,
-`when` conditions, forwarded-client IPs, JWT identities, and negative ports or
-CIDRs, are reported as incomplete rather than guessed.
-Unmodeled Cilium L7, TLS, SNI, and authentication constraints, and Istio
-HTTP request conditions, also produce Partial Data rather than complete
-reachability claims.
+delivery. CNI behavior, NAT, node-local traffic, cloud firewalls, and other
+networking layers may change the real result.
+
+#### Partial Data is scoped to the pairs it can affect
+
+When NPG cannot evaluate part of a policy, it marks only the pod pairs that part
+could change as `Partial Data`, and names the policy and rule in the pair's
+warnings. Other results stay definitive, even in clusters that use Istio or
+Cilium L7 features elsewhere:
+
+- A **rule** NPG cannot model degrades a pair only when its policy selects the
+  pair's source (egress) or destination (ingress) and the rule could match the
+  peer. This covers Cilium L7, TLS, SNI, listener, and authentication
+  constraints, Istio HTTP request conditions, `when` conditions, JWT request
+  identities, forwarded-client IPs, and negative ports or CIDRs.
+- A rule with **dynamic peers** could match any peer, so it degrades every pair
+  of the pods its policy selects in that direction. This covers Cilium FQDNs,
+  Services, CIDR groups, cloud-provider groups, `fromRequires`/`toRequires`,
+  and endpoint selectors that use unsupported label sources.
+- A policy whose **effect** is unknown degrades every pair of the pods it
+  selects in its directions: Cilium policies that Cilium's own validation
+  rejects (for example `toCIDR` combined with `toCIDRSet`, or an unknown entity)
+  and Istio policies with an unsupported action. Istio `CUSTOM` rules degrade
+  the requests they match, because an external provider may deny them.
+- A policy whose **selection** is unknown, such as an undecodable resource, an
+  unsupported `endpointSelector`, or Istio `targetRefs`, degrades every pair in
+  its namespace, or in every namespace for a cluster-wide or mesh-root policy.
+- Only failures to list a whole resource type (for example missing RBAC for
+  pods or CiliumNetworkPolicies) make the entire snapshot partial.
+
+Cilium host policies (`nodeSelector`) apply to nodes and are outside the pod
+graph; NPG ignores them. Pods using `hostNetwork` get Cilium's host or
+remote-node identity instead of a pod endpoint identity, so pairs between a
+`hostNetwork` pod and a pod whose direction is governed by Cilium policies, and
+all pairs of `hostNetwork` pods when host policies exist, are `Partial Data`.
+Native NetworkPolicy behavior for `hostNetwork` pods is implementation defined
+and is evaluated as written.
+
+NPG follows Cilium's validation: a rule may use only one peer family, ICMP
+blocks cannot be combined with `toPorts`, port `0` means every port of the
+protocol, named ports are matched case-insensitively (Cilium lower-cases IANA
+service names), `world-ipv4` and `world-ipv6` map to `0.0.0.0/0` and `::/0`,
+and ICMP-only rules grant no TCP, UDP, or SCTP port. `enableDefaultDeny` only
+affects a direction that has rules, as in Cilium. NPG assumes Cilium 1.16 or
+later: peers selected only by `io.cilium.k8s.namespace.labels.*` are not limited
+to the policy namespace. Cilium 1.15 and earlier limit them to the policy
+namespace, so on those versions such rules may allow fewer peers than shown;
+affected rules carry a note.
+
+#### Istio authorization
 
 Kubernetes and Cilium policies form the network layer. Istio authorization is a
 second destination-ingress layer; both layers must permit a pod-to-pod path.
@@ -81,15 +122,43 @@ Consequently, a destination AuthorizationPolicy can restrict the subject's
 egress results even though AuthorizationPolicy has no egress rules.
 Istio `ALLOW` activates default deny for selected destinations and Istio
 `DENY` overrides matching allows. `AUDIT` and dry-run policies do not enforce
-reachability in the graph. NPG resolves the mesh root namespace from installed
-Istio mesh ConfigMaps and otherwise uses Istio's `istio-system` default.
-Unavailable, invalid, or conflicting mesh configuration is reported as partial
-data. Certificate-derived source namespace, service-account, principal, and
-trust-domain constraints require mTLS state that is not present in the graph
-snapshot. NPG approximates them from workload metadata using the default
-`cluster.local` trust domain and labels the result partial data.
-AuthorizationPolicy is TCP/HTTP-scoped, so network-layer UDP and SCTP
-permissions pass through unchanged.
+reachability in the graph. AuthorizationPolicy is TCP/HTTP-scoped, so
+network-layer UDP and SCTP permissions pass through unchanged.
+
+AuthorizationPolicy only applies to workloads in the mesh. NPG treats a pod as
+enrolled when it has an `istio-proxy` container (or native sidecar), the
+`istio.io/dataplane-mode=ambient` label on the pod or its namespace, or the
+`ambient.istio.io/redirection=enabled` annotation. `hostNetwork` pods,
+`istio.io/dataplane-mode=none`, and `sidecar.istio.io/inject=false` opt out,
+and pods without any enrollment signal are outside the mesh; authorization is
+not applied to them. When the signals conflict, for example a
+`sidecar.istio.io/status` annotation without an `istio-proxy` container, or a
+namespace with sidecar injection enabled but a pod without a sidecar, enrollment
+is unknown and the affected pairs are `Partial Data`.
+
+Certificate-derived source namespace, service-account, principal, and
+trust-domain constraints are evaluated from workload metadata: enrolled sources
+present `cluster.local/ns/<namespace>/sa/<service account>`, and sources
+outside the mesh present no identity, so positive constraints never match them
+and negative constraints never exclude them. The result is definitive, and the
+rule carries a note that the approximation assumes mesh mTLS and the default
+`cluster.local` trust domain. In sidecar mode, proxies only use mTLS for
+destinations they know as mesh endpoints: requests addressed to a bare pod IP
+that no Service selects are sent in plaintext and carry no identity, so
+identity-based rules deny them even when the graph shows them allowed. Values follow Istio's matchers: exact, prefix
+(`abc*`), suffix (`*abc`), and presence (`*`); a leading `*` always means a
+suffix match, so `*abc*` matches only values ending in the literal `abc*`.
+Only `namespaces` expand `*` anywhere, trust domains accept one `*` at any
+position, and `serviceAccounts` do not support wildcards.
+
+NPG resolves the mesh root namespace by reading only the istiod mesh
+ConfigMaps (`istio`, or `istio-<revision>` for revisioned istiod Deployments)
+with targeted GET requests, which needs `get` access to those ConfigMaps and no
+cluster-wide ConfigMap list or watch. If the ConfigMaps cannot be read or
+parsed, NPG uses Istio's `istio-system` default and shows a note instead of
+marking the snapshot partial. If revisions report different root namespaces,
+policies in those namespaces are `Partial Data`, because the proxies they
+govern cannot be determined from Kubernetes objects.
 
 ## 2. Terminology
 
@@ -188,12 +257,14 @@ authorization rule. NPG identifies a real rule by:
 - policy type (`NetworkPolicy`, `CiliumNetworkPolicy`,
   `CiliumClusterwideNetworkPolicy`, or `AuthorizationPolicy`);
 - policy namespace and name;
-- allow or deny action;
+- allow, deny, or custom action;
 - direction;
 - zero-based rule index.
 
-Cilium resources with multiple top-level `specs` also include the spec index in
-their stable rule identity.
+Cilium resources also include the spec entry in their stable rule identity.
+Rule labels name the entry, for example `specs[1]`, when the resource has more
+than one `spec`/`specs` entry, and name the action for deny and custom rules,
+so an allow and a deny at the same index never share a label.
 
 Native Kubernetes NetworkPolicy rules can match peers with:
 
@@ -202,6 +273,13 @@ Native Kubernetes NetworkPolicy rules can match peers with:
 - both selectors, which form an intersection;
 - `ipBlock`, including `except` ranges;
 - an omitted peer list, which means all peers.
+
+A `namespaceSelector` is matched against the namespace labels plus the
+immutable `kubernetes.io/metadata.name` label. NPG adds that label itself, so
+selectors on the namespace name also match namespaces whose Namespace object is
+missing from the snapshot (for example because of RBAC), and an empty
+`namespaceSelector: {}` matches such namespaces too. Earlier versions required
+the Namespace object and never matched a missing one.
 
 For native NetworkPolicy, an omitted port list allows all ports for the
 protocols represented by the evaluation. Named ports are resolved against
@@ -219,10 +297,13 @@ network permissions).
 
 NPG can also display synthetic rules:
 
-- **unrestricted**: no policy in the evaluated layer isolates the pod in that
+- **unrestricted**: no Kubernetes or Cilium policy isolates the pod in that
   direction;
-- **default-deny**: a policy isolates the pod, but no additive allow rule
-  permits the evaluated peer and port.
+- **default-deny**: a Kubernetes or Cilium policy isolates the pod, but no
+  additive allow rule permits the evaluated peer and port;
+- **authorization default-deny (TCP)**: an Istio `ALLOW` policy isolates TCP
+  ingress to a mesh pod, but no authorization rule permits the request. UDP and
+  SCTP are not affected, so this row can appear next to an `unrestricted` row.
 
 Synthetic rules explain evaluated behavior but do not correspond to a
 Kubernetes object.
@@ -348,7 +429,7 @@ Rules are rendered as two-line blocks without a header.
 
 | Displayed field | Meaning | Possible values |
 |---|---|---|
-| Rule identity | Policy namespace/name and zero-based rule index. Synthetic rows use their synthetic name and index `-1`. | `payments/allow-api #0`, `default-deny #-1`, `unrestricted #-1`. |
+| Rule identity | Policy namespace/name, the Cilium spec entry for multi-spec resources, the action for deny and custom rules, and the zero-based rule index. Synthetic rows use their synthetic name and index `-1`. | `payments/allow-api #0`, `payments/cnp specs[1] deny #0`, `default-deny #-1`, `authorization default-deny (TCP) #-1`, `unrestricted #-1`. |
 | Type | API policy type supplying the rule. | `NetworkPolicy`, `CiliumNetworkPolicy`, `CiliumClusterwideNetworkPolicy`, `AuthorizationPolicy`, or `Synthetic`. |
 | Ports | Permissions contributed by the rule. | Protocol/all, numeric ports, ranges, named or unknown ports, or `no ports`. |
 | `subjects matched/selected` | Number of subject pods for which the rule contributed evidence divided by the subject pods selected by the policy for that direction. Ingress subjects are destinations; egress subjects are sources. | For example, `subjects 2/3`. |
@@ -361,7 +442,7 @@ state, and the full state is shown in Rule Details.
 |---|---|
 | `Allowed` | The rule matched all subject pods selected by that rule. |
 | `Partial` | The rule matched some, but not all, selected subject pods. |
-| `Partial Data` | Warnings indicate that the result was built from incomplete data. |
+| `Partial Data` | The rule carries warnings: part of it could not be evaluated, so the pairs it can affect are Partial Data. |
 | `[EMPTY]` | No subject pod was available or no selected subject pod matched the rule. Non-synthetic empty rules are hidden; synthetic explanation rows remain visible. |
 
 Synthetic rows use the normal foreground color instead of an allow/deny color
@@ -369,7 +450,11 @@ because they are explanations, not real policy rules.
 
 When a real rule is selected and the direction panel has focus:
 
-- `o` opens the Kubernetes, Cilium, or Istio policy resource;
+- `o` opens the Kubernetes, Cilium, or Istio policy resource; custom resources
+  are opened by their fully qualified name, such as
+  `authorizationpolicies.security.istio.io`, so another CRD with the same
+  plural (for example Linkerd's `authorizationpolicies.policy.linkerd.io`)
+  cannot be opened by mistake;
 - `y` opens its YAML.
 
 These actions are unavailable for synthetic rules.
@@ -394,7 +479,7 @@ Primitive states mean:
 | `Disallowed` | Every concrete pair is disallowed. |
 | `Partial` | The result is mixed; at least one pair is allowed and at least one is not definitely allowed. |
 | `Unknown` | No definitive allow/deny result can be produced. This commonly occurs when there are no current pods to form a pair, or every pair depends on unresolved semantics such as an ambiguous named port. |
-| `Partial Data` | The cluster snapshot or pair evaluation is incomplete, so the displayed observations must not be treated as a complete result. |
+| `Partial Data` | At least one evaluated pair depends on policy data NPG cannot evaluate, or the snapshot itself is incomplete, so the displayed observations must not be treated as a complete result. The warnings name the policies and rules involved. |
 
 Press `Enter` to move from the direction panel to Primitive Details. Press `o`
 from the direction panel or Primitive Details to open the selected Pod,
@@ -411,8 +496,10 @@ The Details panel follows the active direction and current selection.
 When a rule is selected in Rules mode, Rule Details contains:
 
 - direction and subject identity;
-- policy type, namespace, name, API version, UID, and allow/deny action;
-- zero-based rule index;
+- policy type, namespace, name, API version, UID, and allow/deny/custom
+  action;
+- zero-based rule index, followed for Cilium rules by the spec entry and its
+  index, for example `Rule index: 0 in specs[1] (spec index 1)`;
 - rule state;
 - policy pod selector;
 - matched/selected subject counts;
@@ -484,8 +571,9 @@ For a selected rule, State is derived conservatively:
   rule;
 - `Unknown`: no concrete pod pair exists, so the rule's effect cannot be
   evaluated;
-- `Partial Data`: the primitive was evaluated from incomplete or truncated
-  data.
+- `Partial Data`: at least one of the primitive's pairs depends on policy
+  data NPG cannot evaluate, or the primitive was evaluated from incomplete or
+  truncated data.
 
 For Effective Applicability, State is the primitive's final aggregate state
 after all current-direction and opposite-direction rules are combined.
@@ -504,9 +592,13 @@ Ports: n/a
 
 Effective applicability can also be `Unknown` when concrete pairs exist but
 all of their decisions are unknown, such as when a named destination port is
-ambiguous. `Partial Data` is different: it means the evaluator knows the
-snapshot is incomplete, for example because of missing RBAC access, a failed
-resource list/watch, or result truncation.
+ambiguous. `Partial Data` is different: it means the evaluator knows its input
+is incomplete for that row, for example because a policy that selects one of the
+pods has a rule NPG cannot evaluate, Istio mesh enrollment is unknown, missing
+RBAC access or a failed resource list/watch, or result truncation. Effective
+Details lists the warnings that affected the subject; assumptions that do not
+make results partial, such as a mesh-config fallback, appear as `Note:` lines
+and do not count toward the `PARTIAL DATA` badge.
 
 The panel uses the globally enabled primitive kinds. Pressing `p` can therefore
 add or remove rows from both the direction panels and applicability tables.

@@ -19,6 +19,9 @@
 #                 and unrestricted (no isolating policy)
 #   APIs          NetworkPolicy, CiliumNetworkPolicy,
 #                 CiliumClusterwideNetworkPolicy, Istio AuthorizationPolicy
+#   Mesh          Namespaces with Istio-protected pods are labeled
+#                 istio.io/dataplane-mode=ambient, because AuthorizationPolicy
+#                 only applies to mesh workloads
 #   Owners        Deployment/ReplicaSet, Job, StatefulSet, DaemonSet, bare pod
 #
 # Usage:
@@ -191,6 +194,9 @@ check_topology() {
   check_resource "monitoring deployment" "${KUBECTL[@]}" get deployment -n "$NS_MON" prometheus || failures=$((failures + 1))
   check_resource "untrusted deployment" "${KUBECTL[@]}" get deployment -n "$NS_UNTRUSTED" client || failures=$((failures + 1))
   check_resource "open deployment" "${KUBECTL[@]}" get deployment -n "$NS_OPEN" open-app || failures=$((failures + 1))
+  check_resource_value "app namespace Istio mesh enrollment" "ambient" \
+    "${KUBECTL[@]}" get namespace "$NS_APP" -o jsonpath='{.metadata.labels.istio\.io/dataplane-mode}' ||
+    failures=$((failures + 1))
 
   check_resource "app network policies" "${KUBECTL[@]}" get networkpolicy -n "$NS_APP" default-deny-all allow-authz-probe-ingress allow-cidr-ingress allow-dns-egress allow-api-egress-db allow-db-ingress-api allow-api-egress-external allow-api-egress-ambiguous allow-ambiguous-ingress-api allow-cache-ingress-all || failures=$((failures + 1))
   check_resource_absent "obsolete allow-frontend-ingress is absent" \
@@ -496,7 +502,9 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: ${NS_APP}
-  labels: {netpol-demo: "true", team: app, tier: backend}
+  # The api pods are protected by an Istio AuthorizationPolicy, which only
+  # applies to mesh workloads.
+  labels: {netpol-demo: "true", team: app, tier: backend, istio.io/dataplane-mode: ambient}
 ---
 apiVersion: v1
 kind: Namespace

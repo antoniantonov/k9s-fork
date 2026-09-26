@@ -236,18 +236,18 @@ func TestUnknownEvidenceRetainsNumericBounds(t *testing.T) {
 }
 
 func TestIstioUncertainNetworkBoundsRequireCommonPorts(t *testing.T) {
-	network := Decision{
+	network := layerDecision{Decision: Decision{
 		State:       AccessUnknown,
 		Permissions: []PortPermission{uncertainRange(corev1.ProtocolTCP, 8080, 8080)},
-	}
+	}}
 	for _, port := range []int32{8080, 9090} {
 		value := intstr.FromInt32(port)
 		t.Run(value.String(), func(t *testing.T) {
-			authorization := Decision{
+			authorization := layerDecision{Decision: Decision{
 				State:       AccessAllowed,
 				Permissions: []PortPermission{rangePermission(corev1.ProtocolTCP, port, port)},
-			}
-			decision := combinePolicyLayers(network, authorization)
+			}}
+			decision := combinePolicyLayers(&network, &authorization)
 			if port == 8080 {
 				require.Equal(t, AccessUnknown, decision.State)
 				require.Equal(t, network.Permissions, decision.Permissions)
@@ -271,4 +271,88 @@ func permissionStrings(permissions []PortPermission) []string {
 		out = append(out, permission.String())
 	}
 	return out
+}
+
+func TestCanonicalPermissionsMergesCoveredRanges(t *testing.T) {
+	named := intstr.FromString("http")
+	tests := []struct {
+		name string
+		in   []PortPermission
+		want []string
+	}{
+		{
+			name: "all covers a single port",
+			in:   []PortPermission{rangePermission(corev1.ProtocolTCP, 8080, 8080), {Protocol: corev1.ProtocolTCP, All: true}},
+			want: []string{"TCP/all"},
+		},
+		{
+			name: "overlapping ranges merge",
+			in:   []PortPermission{rangePermission(corev1.ProtocolTCP, 8000, 8080), rangePermission(corev1.ProtocolTCP, 8050, 8100)},
+			want: []string{"TCP/8000-8100"},
+		},
+		{
+			name: "contained range is dropped",
+			in:   []PortPermission{rangePermission(corev1.ProtocolTCP, 8000, 8100), rangePermission(corev1.ProtocolTCP, 8080, 8080)},
+			want: []string{"TCP/8000-8100"},
+		},
+		{
+			name: "adjacent declared ports stay separate",
+			in:   []PortPermission{rangePermission(corev1.ProtocolTCP, 8080, 8080), rangePermission(corev1.ProtocolTCP, 8081, 8081)},
+			want: []string{"TCP/8080", "TCP/8081"},
+		},
+		{
+			name: "adjacent ranges covering every port become all",
+			in: []PortPermission{
+				rangePermission(corev1.ProtocolTCP, 1, 8079),
+				rangePermission(corev1.ProtocolTCP, 8080, 8080),
+				rangePermission(corev1.ProtocolTCP, 8081, 65535),
+			},
+			want: []string{"TCP/all"},
+		},
+		{
+			name: "full numeric range is all",
+			in:   []PortPermission{rangePermission(corev1.ProtocolUDP, 1, 65535)},
+			want: []string{"UDP/all"},
+		},
+		{
+			name: "protocols do not merge",
+			in:   []PortPermission{{Protocol: corev1.ProtocolUDP, All: true}, rangePermission(corev1.ProtocolTCP, 53, 53)},
+			want: []string{"TCP/53", "UDP/all"},
+		},
+		{
+			name: "known all covers unknown named port",
+			in:   []PortPermission{{Protocol: corev1.ProtocolTCP, All: true}, {Protocol: corev1.ProtocolTCP, Port: &named, Unknown: true}},
+			want: []string{"TCP/all"},
+		},
+		{
+			name: "known range covers unknown numeric range",
+			in:   []PortPermission{rangePermission(corev1.ProtocolUDP, 8000, 9000), uncertainRange(corev1.ProtocolUDP, 8080, 8081)},
+			want: []string{"UDP/8000-9000"},
+		},
+		{
+			name: "partially covered unknown range is kept",
+			in:   []PortPermission{rangePermission(corev1.ProtocolTCP, 8000, 8080), uncertainRange(corev1.ProtocolTCP, 8080, 8090)},
+			want: []string{"TCP/8000-8080", "unknown"},
+		},
+		{
+			name: "unknown named port without a covering range is kept",
+			in:   []PortPermission{rangePermission(corev1.ProtocolTCP, 8000, 8080), {Protocol: corev1.ProtocolTCP, Port: &named, Unknown: true}},
+			want: []string{"TCP/8000-8080", "unknown"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want, permissionStrings(canonicalPermissions(test.in)))
+		})
+	}
+	require.Empty(t, canonicalPermissions(nil))
+	require.Equal(t, []string{"TCP/80"}, permissionStrings(canonicalPermissions([]PortPermission{
+		rangePermission("", 80, 80), rangePermission(corev1.ProtocolTCP, 80, 80),
+	})), "duplicates and the default protocol collapse without merging")
+	custom := corev1.Protocol("QUIC")
+	require.Equal(t, []string{"QUIC/1-20"}, permissionStrings(canonicalPermissions([]PortPermission{
+		rangePermission(custom, 1, 10), rangePermission(custom, 5, 20),
+	})), "unusual protocols still merge overlapping ranges")
+	require.Equal(t, 3, protocolSlot(corev1.ProtocolSCTP)+1)
+	require.False(t, isFullNumericRange(PortPermission{Protocol: corev1.ProtocolTCP, All: true}))
 }

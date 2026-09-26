@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,6 +16,7 @@ import (
 	netv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/yaml"
@@ -201,14 +203,16 @@ spec:
 	)
 	require.NoError(t, err)
 	allowed := findPrimitive(t, result.Ingress, PrimitivePod, "client", "client")
-	require.Equal(t, AccessPartialData, allowed.State)
+	require.Equal(t, AccessAllowed, allowed.State, "identity matching is a lower-confidence note, not partial data")
 	require.Equal(t, []string{"SCTP/all", "TCP/8080", "UDP/all"}, permissionStrings(allowed.Permissions))
 	other := findPrimitive(t, result.Ingress, PrimitivePod, "client", "other")
-	require.Equal(t, AccessPartialData, other.State)
+	require.Equal(t, AccessAllowed, other.State)
 	require.Equal(t, []string{"SCTP/all", "UDP/all"}, permissionStrings(other.Permissions))
-	require.Contains(t, strings.Join(result.Warnings, "\n"), "mTLS identity")
+	require.Empty(t, result.Warnings)
 
 	rule := findPolicyRule(t, result.Ingress, "server-authz")
+	require.Empty(t, rule.Warnings)
+	require.Contains(t, strings.Join(rule.Notes, "\n"), "mesh mTLS")
 	require.Equal(t, PolicyTypeIstioAuthorizationPolicy, rule.ID.SourceType())
 	require.Equal(t, PolicyActionAllow, rule.ID.Action)
 	require.Equal(t, "security.istio.io/v1", rule.ID.PolicyVersion)
@@ -351,12 +355,14 @@ spec:
 `)
 	policies, errs := normalizeCiliumPolicy(&object, PolicyTypeCiliumClusterwideNetworkPolicy)
 	require.Len(t, policies, 1)
-	require.True(t, policies[0].Disabled)
+	require.Equal(t, policySelectionUnknown, policies[0].State)
+	require.True(t, policies[0].ClusterScoped)
 	require.ErrorContains(t, errors.Join(errs...), "local cluster name")
+	require.Contains(t, policies[0].reasons[0], "CiliumClusterwideNetworkPolicy remote-cluster: endpointSelector cannot be evaluated")
 }
 
 func TestCiliumSelectorCIDREntityAndPortNormalization(t *testing.T) {
-	selector, errs := normalizeCiliumSelector(&ciliumEndpointSelector{
+	selector, unsupported, invalid, labelsOnly := normalizeCiliumSelector(&ciliumEndpointSelector{
 		MatchLabels: map[string]string{
 			"k8s:app":                                 "api",
 			"io.kubernetes.pod.namespace":             "payments",
@@ -368,14 +374,31 @@ func TestCiliumSelectorCIDREntityAndPortNormalization(t *testing.T) {
 			Key: "k8s:track", Operator: metav1.LabelSelectorOpIn, Values: []string{"stable"},
 		}},
 	}, "payments", false, true)
-	require.Empty(t, errs)
+	require.Empty(t, unsupported)
+	require.Empty(t, invalid)
+	require.False(t, labelsOnly)
 	require.Equal(t, "api", selector.Pod.MatchLabels["app"])
 	require.Equal(t, "critical", selector.Pod.MatchLabels["example.com/workload-classification"])
 	require.Equal(t, "payments", selector.Namespace.MatchLabels["kubernetes.io/metadata.name"])
 	require.Equal(t, "backend", selector.Namespace.MatchLabels["team"])
 	require.Equal(t, "api", selector.ServiceAccount.MatchLabels["name"])
 
-	_, errs = normalizeCiliumSelector(&ciliumEndpointSelector{
+	conflicting, _, _, _ := normalizeCiliumSelector(&ciliumEndpointSelector{
+		MatchLabels: map[string]string{"io.kubernetes.pod.namespace": "other"},
+	}, "payments", false, true)
+	conflicting.compile()
+	require.False(t, conflicting.namespace.Matches(labels.Set{"kubernetes.io/metadata.name": "other"}),
+		"a namespaced policy never selects subjects outside its namespace")
+	require.False(t, conflicting.namespace.Matches(labels.Set{"kubernetes.io/metadata.name": "payments"}))
+
+	labelScoped, _, _, labelsOnly := normalizeCiliumSelector(&ciliumEndpointSelector{
+		MatchLabels: map[string]string{"k8s:io.cilium.k8s.namespace.labels.team": "backend"},
+	}, "payments", false, false)
+	require.True(t, labelsOnly)
+	require.NotContains(t, labelScoped.Namespace.MatchLabels, "kubernetes.io/metadata.name",
+		"Cilium 1.16+ does not scope namespace-label peers to the policy namespace")
+
+	_, unsupported, invalid, _ = normalizeCiliumSelector(&ciliumEndpointSelector{
 		MatchLabels: map[string]string{
 			"io.cilium.k8s.policy.cluster": "remote",
 			"reserved:host":                "",
@@ -385,10 +408,10 @@ func TestCiliumSelectorCIDREntityAndPortNormalization(t *testing.T) {
 			Key: "app", Operator: "Invalid",
 		}},
 	}, "payments", true, false)
-	require.ErrorContains(t, errors.Join(errs...), "local cluster name")
-	require.ErrorContains(t, errors.Join(errs...), "reserved Cilium selector")
-	require.ErrorContains(t, errors.Join(errs...), "label source")
-	require.ErrorContains(t, errors.Join(errs...), "invalid endpoint pod selector")
+	require.ErrorContains(t, errors.Join(unsupported...), "local cluster name")
+	require.ErrorContains(t, errors.Join(unsupported...), "reserved Cilium selector")
+	require.ErrorContains(t, errors.Join(unsupported...), "label source")
+	require.ErrorContains(t, errors.Join(invalid...), "invalid endpoint pod selector")
 
 	block, err := ciliumIPBlock("10.2.3.4/24", []string{"10.2.3.128/25"})
 	require.NoError(t, err)
@@ -401,56 +424,139 @@ func TestCiliumSelectorCIDREntityAndPortNormalization(t *testing.T) {
 	_, err = ciliumIPBlock("10.0.0.0/24", []string{"invalid"})
 	require.ErrorContains(t, err, "invalid excluded CIDR")
 
-	peers, notes := normalizeCiliumEntities([]string{"cluster", "cluster-mesh", "world", "all", "none", "host"})
+	peers, notes, entityErrs := normalizeCiliumEntities([]string{"cluster", "cluster-mesh", "world", "all", "none", "host"})
 	require.Len(t, peers, 7)
+	require.Empty(t, entityErrs)
 	require.Contains(t, notes, `Cilium entity "host" is outside the pod/CIDR graph`)
 	require.Equal(t, "0.0.0.0/0", worldPeers()[0].IPBlocks[0].CIDR)
+	peers, _, entityErrs = normalizeCiliumEntities([]string{"world-ipv4", "world-ipv6", "World"})
+	require.Len(t, peers, 2)
+	require.Equal(t, "0.0.0.0/0", peers[0].IPBlocks[0].CIDR)
+	require.Equal(t, "::/0", peers[1].IPBlocks[0].CIDR)
+	require.ErrorContains(t, errors.Join(entityErrs...), "unsupported entity: World", "entity names are case-sensitive")
 
 	tests := []struct {
-		name      string
-		source    ciliumPortProtocol
-		wantCount int
-		wantErr   string
+		name        string
+		source      ciliumPortProtocol
+		wantPorts   []string
+		wantNote    string
+		wantWarning string
+		wantErr     string
 	}{
-		{name: "any protocol", source: ciliumPortProtocol{Port: "53", Protocol: "ANY"}, wantCount: 3},
-		{name: "numeric range", source: ciliumPortProtocol{Port: "8000", EndPort: 8010, Protocol: "TCP"}, wantCount: 1},
-		{name: "named", source: ciliumPortProtocol{Port: "http", Protocol: "TCP"}, wantCount: 1},
-		{name: "empty", source: ciliumPortProtocol{}, wantErr: "must not be empty"},
-		{name: "numeric below range", source: ciliumPortProtocol{Port: "0"}, wantErr: "outside 1-65535"},
-		{name: "named range", source: ciliumPortProtocol{Port: "http", EndPort: 8080}, wantErr: "cannot have endPort"},
-		{name: "end before start", source: ciliumPortProtocol{Port: "9000", EndPort: 8000}, wantErr: "outside the port range"},
-		{name: "unsupported protocol", source: ciliumPortProtocol{Port: "80", Protocol: "ICMP"}, wantErr: "not supported"},
+		{name: "any protocol", source: ciliumPortProtocol{Port: "53", Protocol: "ANY"}, wantPorts: []string{"TCP/53", "UDP/53", "SCTP/53"}},
+		{name: "numeric range", source: ciliumPortProtocol{Port: "8000", EndPort: 8010, Protocol: "TCP"}, wantPorts: []string{"TCP/8000-8010"}},
+		{name: "named lower-cased", source: ciliumPortProtocol{Port: "HTTP", Protocol: "TCP"}, wantPorts: []string{"TCP/http"}},
+		{name: "zero is a wildcard", source: ciliumPortProtocol{Port: "0", Protocol: "TCP"}, wantPorts: []string{"TCP/all"}},
+		{name: "hex literal is a service name", source: ciliumPortProtocol{Port: "0x50", Protocol: "UDP"}, wantPorts: []string{"UDP/0x50"}},
+		{name: "octal literal", source: ciliumPortProtocol{Port: "017", Protocol: "TCP"}, wantPorts: []string{"TCP/15"}},
+		{name: "end before start is one port", source: ciliumPortProtocol{Port: "9000", EndPort: 8000}, wantPorts: []string{"TCP/9000", "UDP/9000", "SCTP/9000"}},
+		{name: "icmp outside transport model", source: ciliumPortProtocol{Port: "0", Protocol: "ICMP"}, wantNote: "ICMP is outside"},
+		{name: "extended protocol", source: ciliumPortProtocol{Protocol: "VRRP"}, wantNote: "VRRP is outside"},
+		{name: "named range", source: ciliumPortProtocol{Port: "http", EndPort: 8080}, wantPorts: []string{"TCP/http", "UDP/http", "SCTP/http"}, wantWarning: "endPort"},
+		{name: "empty", source: ciliumPortProtocol{}, wantErr: "port must be specified"},
+		{name: "unparseable", source: ciliumPortProtocol{Port: "70000"}, wantErr: "unable to parse port"},
+		{name: "not a service name", source: ciliumPortProtocol{Port: "http_1"}, wantErr: "unable to parse port"},
+		{name: "extended protocol port", source: ciliumPortProtocol{Port: "80", Protocol: "GRE"}, wantErr: "port must be empty or 0"},
+		{name: "end port too large", source: ciliumPortProtocol{Port: "80", EndPort: 70000}, wantErr: "outside 0-65535"},
+		{name: "unknown protocol", source: ciliumPortProtocol{Port: "80", Protocol: "QUIC"}, wantErr: "invalid protocol"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ports, err := ciliumPort(test.source)
+			ports, note, warning, portErr := ciliumPort(test.source, false)
 			if test.wantErr != "" {
-				require.ErrorContains(t, err, test.wantErr)
+				require.ErrorContains(t, portErr, test.wantErr)
 				return
 			}
-			require.NoError(t, err)
-			require.Len(t, ports, test.wantCount)
+			require.NoError(t, portErr)
+			if test.wantNote != "" {
+				require.Contains(t, note, test.wantNote)
+				require.Empty(t, ports)
+				return
+			}
+			require.Empty(t, note)
+			if test.wantWarning != "" {
+				require.Contains(t, warning, test.wantWarning)
+			} else {
+				require.Empty(t, warning)
+			}
+			permissions := make([]string, 0, len(ports))
+			for _, port := range ports {
+				value := "all"
+				if port.Port != nil {
+					value = port.Port.String()
+				}
+				if port.EndPort != nil {
+					value += "-" + strconv.Itoa(int(*port.EndPort))
+				}
+				permissions = append(permissions, string(*port.Protocol)+"/"+value)
+			}
+			require.Equal(t, test.wantPorts, permissions)
 		})
 	}
+	_, _, _, dnsErr := ciliumPort(ciliumPortProtocol{Port: "53", EndPort: 60, Protocol: "UDP"}, true)
+	require.ErrorContains(t, dnsErr, "DNS rules do not support port ranges")
 
-	ports, notes, portErrs, invalid := normalizeCiliumPorts([]ciliumPortRule{{
+	result := normalizeCiliumPorts([]ciliumPortRule{{
 		Ports:          []ciliumPortProtocol{{Port: "443", Protocol: "TCP"}},
 		Rules:          json.RawMessage(`{"http":[{"method":"GET"}]}`),
 		TerminatingTLS: json.RawMessage(`{"secret":{"name":"tls"}}`),
 		ServerNames:    []string{"example.com"},
-	}})
-	require.False(t, invalid)
-	require.Len(t, ports, 1)
-	require.Len(t, notes, 2)
-	require.ErrorContains(t, errors.Join(portErrs...), "L7 rules")
-	require.ErrorContains(t, errors.Join(portErrs...), "TLS, SNI")
+	}}, Ingress)
+	require.Empty(t, result.invalid)
+	require.Len(t, result.ports, 1)
+	require.Len(t, result.notes, 2)
+	require.Contains(t, strings.Join(result.warnings, "\n"), "L7 rules")
+	require.Contains(t, strings.Join(result.warnings, "\n"), "TLS, SNI")
 
-	ports, _, portErrs, invalid = normalizeCiliumPorts([]ciliumPortRule{{
-		Ports: []ciliumPortProtocol{{Port: "invalid", EndPort: 90}},
-	}})
-	require.True(t, invalid)
-	require.Empty(t, ports)
-	require.NotEmpty(t, portErrs)
+	result = normalizeCiliumPorts([]ciliumPortRule{{
+		Ports: []ciliumPortProtocol{{Port: "70000"}, {Port: "http_1"}},
+	}}, Egress)
+	require.Len(t, result.invalid, 2)
+	require.Empty(t, result.ports)
+
+	result = normalizeCiliumPorts([]ciliumPortRule{{Ports: []ciliumPortProtocol{{Protocol: "ICMPV6", Port: "0"}}}}, Egress)
+	require.True(t, result.noPorts, "a rule with only non-transport protocols grants no TCP/UDP/SCTP ports")
+	result = normalizeCiliumPorts([]ciliumPortRule{
+		{Ports: []ciliumPortProtocol{{Protocol: "ICMP", Port: "0"}}},
+		{},
+	}, Egress)
+	require.False(t, result.noPorts)
+	require.Nil(t, result.ports, "an empty port rule still allows every transport port")
+}
+
+func TestCiliumPortRuleValidationMirrorsCilium(t *testing.T) {
+	tests := []struct {
+		name      string
+		rule      ciliumPortRule
+		direction Direction
+		want      string
+	}{
+		{"dns on ingress", ciliumPortRule{Ports: []ciliumPortProtocol{{Port: "53", Protocol: "UDP"}}, Rules: json.RawMessage(`{"dns":[{"matchPattern":"*"}]}`)}, Ingress, "DNS rules are not allowed on ingress"},
+		{"dns without port", ciliumPortRule{Rules: json.RawMessage(`{"dns":[{"matchPattern":"*"}]}`)}, Egress, "port 53 must be specified"},
+		{"l7 on zero port", ciliumPortRule{Ports: []ciliumPortProtocol{{Port: "0", Protocol: "TCP"}}, Rules: json.RawMessage(`{"http":[{}]}`)}, Egress, "port is 0"},
+		{"l7 not tcp", ciliumPortRule{Ports: []ciliumPortProtocol{{Port: "80", Protocol: "UDP"}}, Rules: json.RawMessage(`{"http":[{}]}`)}, Egress, "only apply to TCP"},
+		{"l7 any protocol", ciliumPortRule{Ports: []ciliumPortProtocol{{Port: "80"}}, Rules: json.RawMessage(`{"http":[{}]}`)}, Egress, "only apply to TCP"},
+		{"multiple l7 types", ciliumPortRule{Ports: []ciliumPortProtocol{{Port: "80", Protocol: "TCP"}}, Rules: json.RawMessage(`{"http":[{}],"kafka":[{}]}`)}, Egress, "multiple L7 protocol"},
+		{"server names with l7 without tls", ciliumPortRule{Ports: []ciliumPortProtocol{{Port: "443", Protocol: "TCP"}}, ServerNames: []string{"a"}, Rules: json.RawMessage(`{"http":[{}]}`)}, Egress, "ServerNames are not allowed"},
+		{"empty server name", ciliumPortRule{Ports: []ciliumPortProtocol{{Port: "443", Protocol: "TCP"}}, ServerNames: []string{""}}, Egress, "empty server name"},
+		{"listener on ingress", ciliumPortRule{Ports: []ciliumPortProtocol{{Port: "443", Protocol: "TCP"}}, Listener: json.RawMessage(`{"name":"l"}`)}, Ingress, "listener is not allowed on ingress"},
+		{"listener with l7", ciliumPortRule{Ports: []ciliumPortProtocol{{Port: "443", Protocol: "TCP"}}, Listener: json.RawMessage(`{"name":"l"}`), Rules: json.RawMessage(`{"http":[{}]}`)}, Egress, "listener is not allowed with L7"},
+		{"invalid l7 document", ciliumPortRule{Ports: []ciliumPortProtocol{{Port: "443", Protocol: "TCP"}}, Rules: json.RawMessage(`[]`)}, Egress, "invalid L7 rules"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := normalizeCiliumPorts([]ciliumPortRule{test.rule}, test.direction)
+			require.ErrorContains(t, errors.Join(result.invalid...), test.want)
+		})
+	}
+	valid := normalizeCiliumPorts([]ciliumPortRule{{
+		Ports: []ciliumPortProtocol{{Port: "53", Protocol: "ANY"}},
+		Rules: json.RawMessage(`{"dns":[{"matchPattern":"*"}],"http":null}`),
+	}}, Egress)
+	require.Empty(t, valid.invalid)
+	families, err := ciliumL7Types(json.RawMessage(`{"custom":{}}`))
+	require.NoError(t, err)
+	require.Equal(t, []string{"l7"}, families)
 }
 
 func TestCiliumTrafficRuleUnsupportedSemanticsAreExplicit(t *testing.T) {
@@ -458,59 +564,118 @@ func TestCiliumTrafficRuleUnsupportedSemanticsAreExplicit(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "policy", Namespace: "payments"},
 		Type:       PolicyTypeCiliumNetworkPolicy,
 	}
+	raw := []json.RawMessage{json.RawMessage(`{}`)}
 	tests := []struct {
-		name      string
-		direction Direction
-		source    ciliumTrafficRule
-		want      string
-		matchNone bool
+		name           string
+		direction      Direction
+		source         ciliumTrafficRule
+		invalid        string
+		warning        string
+		matchNone      bool
+		noPorts        bool
+		uncertainPeers bool
 	}{
 		{
-			name: "multiple peer families",
-			source: ciliumTrafficRule{
-				FromEndpoints: []ciliumEndpointSelector{{}},
-				FromCIDR:      []string{"10.0.0.0/8"},
-			},
-			want: "multiple mutually exclusive",
+			name:    "endpoints and CIDR",
+			source:  ciliumTrafficRule{FromEndpoints: []ciliumEndpointSelector{{}}, FromCIDR: []string{"10.0.0.0/8"}},
+			invalid: "combining FromEndpoints and FromCIDR is not supported yet",
 		},
-		{name: "requires", source: ciliumTrafficRule{FromRequires: []json.RawMessage{json.RawMessage(`{}`)}}, want: "identity constraints"},
-		{name: "groups", source: ciliumTrafficRule{FromGroups: []json.RawMessage{json.RawMessage(`{}`)}}, want: "cloud-provider groups"},
-		{name: "nodes", source: ciliumTrafficRule{FromNodes: []json.RawMessage{json.RawMessage(`{}`)}}, matchNone: true},
-		{name: "services", direction: Egress, source: ciliumTrafficRule{ToServices: []json.RawMessage{json.RawMessage(`{}`)}}, want: "live Service"},
-		{name: "fqdns", direction: Egress, source: ciliumTrafficRule{ToFQDNs: []json.RawMessage{json.RawMessage(`{}`)}}, want: "live DNS"},
-		{name: "icmp", source: ciliumTrafficRule{ICMPs: []json.RawMessage{json.RawMessage(`{}`)}}, want: "L4 port model"},
 		{
-			name: "cidr group",
-			source: ciliumTrafficRule{FromCIDRSet: []ciliumCIDRRule{{
-				CIDRGroupRef: "external",
-			}}},
-			want: "runtime Cilium resolution",
+			name:      "CIDR and CIDR set",
+			direction: Egress,
+			source:    ciliumTrafficRule{ToCIDR: []string{"10.0.0.0/8"}, ToCIDRSet: []ciliumCIDRRule{{CIDR: "10.1.0.0/16"}}},
+			invalid:   "combining ToCIDR and ToCIDRSet is not supported yet",
+		},
+		{
+			name:      "entities and nodes",
+			direction: Egress,
+			source:    ciliumTrafficRule{ToEntities: []string{"world"}, ToNodes: raw},
+			invalid:   "combining ToEntities and ToNodes is not supported yet",
+		},
+		{
+			name:           "FQDNs and services",
+			direction:      Egress,
+			source:         ciliumTrafficRule{ToFQDNs: raw, ToServices: raw},
+			invalid:        "combining ToServices and ToFQDNs is not supported yet",
+			uncertainPeers: true,
+		},
+		{name: "requires", source: ciliumTrafficRule{FromRequires: raw}, warning: "identity constraints", uncertainPeers: true},
+		{name: "groups", source: ciliumTrafficRule{FromGroups: raw}, warning: "cloud-provider groups", uncertainPeers: true},
+		{name: "nodes", source: ciliumTrafficRule{FromNodes: raw}, matchNone: true},
+		{name: "services", direction: Egress, source: ciliumTrafficRule{ToServices: raw}, warning: "live Service", uncertainPeers: true},
+		{name: "fqdns", direction: Egress, source: ciliumTrafficRule{ToFQDNs: raw}, warning: "live DNS", uncertainPeers: true},
+		{name: "icmp only", source: ciliumTrafficRule{FromEntities: []string{"cluster"}, ICMPs: raw}, noPorts: true},
+		{
+			name:    "icmp with ports",
+			source:  ciliumTrafficRule{ICMPs: raw, ToPorts: []ciliumPortRule{{Ports: []ciliumPortProtocol{{Port: "80", Protocol: "TCP"}}}}},
+			invalid: "ICMPs block may only be present without ToPorts",
+			noPorts: true,
+		},
+		{
+			name:           "cidr group",
+			source:         ciliumTrafficRule{FromCIDRSet: []ciliumCIDRRule{{CIDRGroupRef: "external"}}},
+			warning:        "runtime Cilium resolution",
+			uncertainPeers: true,
+		},
+		{
+			name:      "cidr rule without target",
+			source:    ciliumTrafficRule{FromCIDRSet: []ciliumCIDRRule{{Except: []string{"10.0.0.0/8"}}}},
+			invalid:   "one of cidr, cidrGroupRef, or cidrGroupSelector is required",
+			matchNone: true,
+		},
+		{
+			name:      "cidr rule with two targets",
+			source:    ciliumTrafficRule{FromCIDRSet: []ciliumCIDRRule{{CIDR: "10.0.0.0/8", CIDRGroupRef: "external"}}},
+			invalid:   "more than one of cidr",
+			matchNone: true,
+		},
+		{name: "unknown entity", source: ciliumTrafficRule{FromEntities: []string{"everyone"}}, invalid: "unsupported entity", matchNone: true},
+		{
+			name:           "unsupported peer selector",
+			source:         ciliumTrafficRule{FromEndpoints: []ciliumEndpointSelector{{MatchLabels: map[string]string{"reserved:host": ""}}}},
+			warning:        "peer selector cannot be evaluated",
+			uncertainPeers: true,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			rule, errs := normalizeCiliumTrafficRule(
+			rule, validation := normalizeCiliumTrafficRule(
 				&policy, test.direction, PolicyActionAllow, 0, &test.source,
 			)
 			require.Equal(t, test.matchNone, rule.MatchNone)
-			if test.want != "" {
-				require.ErrorContains(t, errors.Join(errs...), test.want)
+			require.Equal(t, test.noPorts, rule.NoPorts)
+			require.Equal(t, test.uncertainPeers, rule.UncertainPeers)
+			if test.invalid != "" {
+				require.ErrorContains(t, errors.Join(validation...), test.invalid)
+			} else {
+				require.Empty(t, validation)
+			}
+			if test.warning != "" {
+				require.Contains(t, strings.Join(rule.Warnings, "\n"), test.warning)
 			}
 		})
 	}
 
-	auth := json.RawMessage(`{"mode":"required"}`)
-	rule, errs := normalizeCiliumTrafficRule(&policy, Ingress, PolicyActionAllow, 0, &ciliumTrafficRule{
+	rule, validation := normalizeCiliumTrafficRule(&policy, Ingress, PolicyActionAllow, 0, &ciliumTrafficRule{
 		FromEntities:   []string{"cluster"},
-		Authentication: auth,
+		Authentication: &ciliumAuthentication{Mode: "required"},
 	})
-	require.ErrorContains(t, errors.Join(errs...), "authentication requirements")
+	require.Empty(t, validation)
+	require.Contains(t, strings.Join(rule.Warnings, "\n"), "authentication requirements")
 	require.Contains(t, rule.Notes, "Cilium authentication requirements are not represented; reachability is existential")
+	rule, _ = normalizeCiliumTrafficRule(&policy, Ingress, PolicyActionAllow, 0, &ciliumTrafficRule{
+		FromEntities:   []string{"cluster"},
+		Authentication: &ciliumAuthentication{Mode: "disabled"},
+	})
+	require.Empty(t, rule.Warnings, "disabled authentication does not constrain traffic")
 
-	disabled := false
+	disabled, enabled := false, true
 	require.False(t, ciliumDirectionIsolates(&disabled, true))
+	require.True(t, ciliumDirectionIsolates(&enabled, true))
 	require.True(t, ciliumDirectionIsolates(nil, true))
 	require.False(t, ciliumDirectionIsolates(nil, false))
+	require.False(t, ciliumDirectionIsolates(&enabled, false), "enableDefaultDeny needs rules in that direction")
+	require.False(t, ciliumDirectionIsolates(&disabled, false))
 }
 
 func TestIstioConservativeSourceAndConditionHandling(t *testing.T) {
@@ -521,17 +686,17 @@ func TestIstioConservativeSourceAndConditionHandling(t *testing.T) {
 		TrustDomains:    []string{"cluster.local"},
 		NotTrustDomains: []string{"external.local"},
 	}
-	peer, errs, invalid := normalizeIstioSource("server", &source)
-	require.False(t, invalid)
+	peer, warnings, notes, disabled := normalizeIstioSource("server", &source)
+	require.False(t, disabled)
+	require.Empty(t, warnings, "identity constraints are notes, not uncertainty")
+	require.Empty(t, notes)
 	require.True(t, peer.CIDRMatchUnsupported)
 	require.Equal(t, "10.0.0.10/32", peer.IPBlocks[0].CIDR)
-	require.ErrorContains(t, errors.Join(errs...), "cluster.local trust domain")
-	require.ErrorContains(t, errors.Join(errs...), "CIDR applicability")
-	require.True(t, istioSourceHasIdentityConstraints(&source))
-	require.True(t, istioSourceHasPeerIdentityConstraints(&source))
+	require.True(t, peer.hasIdentityConstraints())
+	require.True(t, peer.hasPositiveIdentityConstraints())
 	require.False(t, normalizedPeerMatchesCIDR(&peer, &PrimitiveRef{Kind: PrimitiveCIDR, CIDR: "10.0.0.10/32"}))
 
-	_, errs, invalid = normalizeIstioSource("server", &istioSource{
+	_, warnings, _, disabled = normalizeIstioSource("server", &istioSource{
 		IPBlocks:             []string{"invalid"},
 		NotIPBlocks:          []string{"10.0.0.0/8"},
 		RemoteIPBlocks:       []string{"192.0.2.0/24"},
@@ -539,12 +704,21 @@ func TestIstioConservativeSourceAndConditionHandling(t *testing.T) {
 		RequestPrincipals:    []string{"issuer/user"},
 		NotRequestPrincipals: []string{"issuer/blocked"},
 	})
-	require.True(t, invalid)
-	message := errors.Join(errs...).Error()
+	require.True(t, disabled)
+	message := strings.Join(warnings, "\n")
 	require.Contains(t, message, "invalid Istio IP block")
 	require.Contains(t, message, "notIpBlocks")
 	require.Contains(t, message, "proxy forwarding")
 	require.Contains(t, message, "JWT request identity")
+
+	_, warnings, notes, disabled = normalizeIstioSource("server", &istioSource{
+		ServiceAccounts: []string{"client/*"},
+		Principals:      []string{"cluster.local/ns/*/sa/caller"},
+	})
+	require.False(t, disabled)
+	require.Contains(t, strings.Join(warnings, "\n"), "does not allow")
+	require.Contains(t, strings.Join(warnings, "\n"), "together with principals or namespaces")
+	require.Contains(t, strings.Join(notes, "\n"), "literally")
 
 	object := policyObject(t, `
 apiVersion: security.istio.io/v1
@@ -561,10 +735,14 @@ spec:
         - key: source.namespace
           values: [prod]
 `)
-	policies, policyErrs := normalizeIstioPolicy(&object, DefaultIstioRootNamespace)
+	policies, policyErrs := normalizeIstioPolicy(&object, nil)
 	require.Len(t, policies, 1)
 	require.True(t, policies[0].Ingress.Rules[0].Disabled)
 	require.ErrorContains(t, errors.Join(policyErrs...), "when conditions")
+	require.Equal(t,
+		[]string{"AuthorizationPolicy server/conditional: ingress allow rule 0: Istio when conditions cannot be evaluated from the policy snapshot"},
+		policies[0].Ingress.Rules[0].uncertain,
+	)
 }
 
 func TestIstioPolicyActionsScopeOperationsAndMatching(t *testing.T) {
@@ -577,7 +755,7 @@ metadata:
   annotations: {istio.io/dry-run: "true"}
 spec: {action: DENY}
 `)
-	policies, errs := normalizeIstioPolicy(&dryRun, DefaultIstioRootNamespace)
+	policies, errs := normalizeIstioPolicy(&dryRun, nil)
 	require.Empty(t, policies)
 	require.Empty(t, errs)
 
@@ -587,7 +765,7 @@ kind: AuthorizationPolicy
 metadata: {name: audit, namespace: server}
 spec: {action: AUDIT}
 `)
-	policies, errs = normalizeIstioPolicy(&audit, DefaultIstioRootNamespace)
+	policies, errs = normalizeIstioPolicy(&audit, nil)
 	require.Empty(t, policies)
 	require.Empty(t, errs)
 
@@ -600,48 +778,73 @@ spec:
     matchLabels: {role: server}
   rules: [{}]
 `)
-	policies, errs = normalizeIstioPolicy(&root, "mesh-root")
+	policies, errs = normalizeIstioPolicy(&root, &istioRootConfig{root: "mesh-root"})
 	require.Empty(t, errs)
 	require.True(t, policies[0].ClusterScoped)
-	require.Contains(t, policies[0].Notes[1], "resolved Istio root namespace")
+	require.Contains(t, strings.Join(policies[0].Notes, "\n"), "resolved Istio root namespace")
 
-	for _, manifest := range []string{
-		`apiVersion: security.istio.io/v1
+	policies, _ = normalizeIstioPolicy(&root, &istioRootConfig{root: "mesh-root", candidates: []string{"mesh-root", "other-root"}})
+	require.Equal(t, policySelectionUnknown, policies[0].State)
+	require.True(t, policies[0].ClusterScoped)
+	require.Contains(t, policies[0].reasons[0], "different root namespaces (mesh-root, other-root)")
+
+	target := policyObject(t, `apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata: {name: target, namespace: server}
-spec: {targetRef: {kind: Service, name: api}}`,
-		`apiVersion: security.istio.io/v1
+spec: {targetRef: {kind: Service, name: api}}`)
+	policies, errs = normalizeIstioPolicy(&target, nil)
+	require.Len(t, policies, 1)
+	require.Equal(t, policySelectionUnknown, policies[0].State)
+	require.False(t, policies[0].ClusterScoped, "selection-unknown namespaced policies stay in their namespace")
+	require.ErrorContains(t, errors.Join(errs...), "targetRefs")
+
+	custom := policyObject(t, `apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata: {name: custom, namespace: server}
-spec: {action: CUSTOM, provider: {name: ext-authz}}`,
-		`apiVersion: security.istio.io/v1
+spec: {action: CUSTOM, provider: {name: ext-authz}, rules: [{to: [{operation: {ports: ["8080"]}}]}]}`)
+	policies, errs = normalizeIstioPolicy(&custom, nil)
+	require.Len(t, policies, 1)
+	require.Equal(t, policyEnforced, policies[0].State)
+	require.False(t, policies[0].Ingress.Isolate, "CUSTOM never activates default deny")
+	require.Equal(t, PolicyActionCustom, policies[0].Ingress.Rules[0].Action)
+	require.True(t, policies[0].Ingress.Rules[0].Disabled)
+	require.ErrorContains(t, errors.Join(errs...), "external provider")
+
+	unknown := policyObject(t, `apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata: {name: unknown, namespace: server}
-spec: {action: BLOCK}`,
-	} {
-		object := policyObject(t, manifest)
-		policies, errs = normalizeIstioPolicy(&object, DefaultIstioRootNamespace)
-		require.Len(t, policies, 1)
-		require.True(t, policies[0].Disabled)
-		require.NotEmpty(t, errs)
-	}
+spec: {action: BLOCK}`)
+	policies, errs = normalizeIstioPolicy(&unknown, nil)
+	require.Len(t, policies, 1)
+	require.Equal(t, policyEffectUnknown, policies[0].State)
+	require.ErrorContains(t, errors.Join(errs...), `unsupported Istio action "BLOCK"`)
 
-	ports, notes, operationErrs, invalid := normalizeIstioOperations([]istioTo{
+	malformed := policyObject(t, `apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: malformed, namespace: mesh-root}
+spec: {rules: true}`)
+	policies, errs = normalizeIstioPolicy(&malformed, &istioRootConfig{root: "mesh-root"})
+	require.Len(t, policies, 1)
+	require.Equal(t, policySelectionUnknown, policies[0].State)
+	require.True(t, policies[0].ClusterScoped, "an undecodable root-namespace policy may apply mesh-wide")
+	require.NotEmpty(t, errs)
+
+	ports, notes, warnings, disabled := normalizeIstioOperations([]istioTo{
 		{Operation: istioOperation{Ports: []string{"8080"}, Methods: []string{"GET"}}},
 		{Operation: istioOperation{Ports: []string{"*"}}},
 	})
-	require.False(t, invalid)
+	require.False(t, disabled)
 	require.Nil(t, ports)
 	require.NotEmpty(t, notes)
-	require.ErrorContains(t, errors.Join(operationErrs...), "L7 operation")
+	require.Contains(t, strings.Join(warnings, "\n"), "L7 operation")
 
-	ports, _, operationErrs, invalid = normalizeIstioOperations([]istioTo{
+	ports, _, warnings, disabled = normalizeIstioOperations([]istioTo{
 		{Operation: istioOperation{NotPorts: []string{"8080"}}},
 		{Operation: istioOperation{Ports: []string{"invalid"}}},
 	})
-	require.True(t, invalid)
+	require.True(t, disabled)
 	require.Empty(t, ports)
-	require.Len(t, operationErrs, 2)
+	require.Len(t, warnings, 2)
 
 	block, err := istioIPBlock("2001:db8::1")
 	require.NoError(t, err)
@@ -651,15 +854,31 @@ spec: {action: BLOCK}`,
 	require.Equal(t, "192.0.2.0/24", block.CIDR)
 	_, err = istioIPBlock("invalid")
 	require.ErrorContains(t, err, "invalid Istio IP block")
+}
 
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "client", Labels: map[string]string{"role": "client"}},
+func TestIstioPeerIdentityRequiresMeshEnrollment(t *testing.T) {
+	enrolled := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "client", Name: "caller", Labels: map[string]string{"role": "client"}},
 		Spec:       corev1.PodSpec{ServiceAccountName: "caller"},
 		Status: corev1.PodStatus{
 			PodIP:  "10.0.0.10",
 			PodIPs: []corev1.PodIP{{IP: "2001:db8::1"}, {IP: "invalid"}},
 		},
 	}
+	outside := *enrolled.DeepCopy()
+	outside.Namespace, outside.Name = "plain", "outside"
+	unknown := *enrolled.DeepCopy()
+	unknown.Namespace, unknown.Name = "plain", "unknown"
+	unknown.Annotations = map[string]string{istioSidecarStatusAnnotation: "{}"}
+	snapshot := Snapshot{
+		Pods: []corev1.Pod{enrolled, outside, unknown},
+		Namespaces: []corev1.Namespace{
+			{ObjectMeta: metav1.ObjectMeta{Name: "client", Labels: map[string]string{istioDataplaneModeLabel: "ambient"}}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "plain"}},
+		},
+	}
+	x := newSnapshotIndex(&snapshot)
+	policy := &normalizedPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "server", Name: "authz"}}
 	peer := normalizedPeer{
 		AllNamespaces:   true,
 		IPBlocks:        []netv1.IPBlock{{CIDR: "10.0.0.0/24"}, {CIDR: "2001:db8::/64"}},
@@ -670,38 +889,75 @@ spec: {action: BLOCK}`,
 		TrustDomains:    []string{"cluster.*"},
 		NotTrustDomains: []string{"external.local"},
 	}
-	require.True(t, normalizedPeerMatchesPod(&peer, "server", pod, &corev1.Namespace{}))
-	peer.NotNamespaces = []string{"client"}
-	require.False(t, normalizedPeerMatchesPod(&peer, "server", pod, &corev1.Namespace{}))
+	peer.compile()
+	caller := x.info(&snapshot.Pods[0])
+	require.Equal(t, matchYes, peerMatchesPod(&peer, policy, caller))
+	peer.NotNamespaces = []string{"kube-*", "client"}
+	require.Equal(t, matchNo, peerMatchesPod(&peer, policy, caller), "later negative patterns are still checked")
 	peer.NotNamespaces = nil
 	peer.TrustDomains = []string{"external.local"}
-	require.False(t, normalizedPeerMatchesPod(&peer, "server", pod, &corev1.Namespace{}))
+	require.Equal(t, matchNo, peerMatchesPod(&peer, policy, caller))
 
-	require.True(t, podMatchesIPBlocks(pod, []netv1.IPBlock{{CIDR: "10.0.0.0/24"}}))
-	require.False(t, podMatchesIPBlocks(pod, []netv1.IPBlock{{
+	negative := normalizedPeer{AllNamespaces: true, NotPrincipals: []string{"cluster.local/ns/client/sa/caller"}}
+	require.Equal(t, matchNo, peerMatchesPod(&negative, policy, caller))
+	require.Equal(t, matchYes, peerMatchesPod(&negative, policy, x.info(&snapshot.Pods[1])),
+		"a source outside the mesh has no principal, so negative constraints do not exclude it")
+	positive := normalizedPeer{AllNamespaces: true, Principals: []string{"*"}}
+	require.Equal(t, matchYes, peerMatchesPod(&positive, policy, caller))
+	require.Equal(t, matchNo, peerMatchesPod(&positive, policy, x.info(&snapshot.Pods[1])),
+		"a source outside the mesh has no mTLS identity")
+	require.Equal(t, matchUnknown, peerMatchesPod(&positive, policy, x.info(&snapshot.Pods[2])))
+	require.Equal(t, matchYes, peerMatchesPod(&normalizedPeer{AllNamespaces: true}, policy, x.info(&snapshot.Pods[2])),
+		"peers without identity constraints do not depend on enrollment")
+
+	require.True(t, caller.matchesBlocks(&normalizedPeer{IPBlocks: []netv1.IPBlock{{CIDR: "10.0.0.0/24"}}}))
+	require.False(t, caller.matchesBlocks(&normalizedPeer{IPBlocks: []netv1.IPBlock{{
 		CIDR: "10.0.0.0/24", Except: []string{"10.0.0.0/24"},
-	}}))
-	address, err := netip.ParseAddr(pod.Status.PodIPs[0].IP)
+	}}}))
+	address, err := netip.ParseAddr(enrolled.Status.PodIPs[0].IP)
 	require.NoError(t, err)
-	require.True(t, ipBlockContainsAddress(&netv1.IPBlock{CIDR: "2001:db8::/64"}, address))
+	blocks := compileBlocks([]netv1.IPBlock{{CIDR: "2001:db8::/64"}, {CIDR: "invalid"}})
+	require.Len(t, blocks, 1)
+	require.True(t, blocks[0].contains(address))
 }
 
 func TestPolicyMatchingUtilityEdges(t *testing.T) {
 	tests := []struct {
+		name     string
 		value    string
 		patterns []string
+		match    func(value, pattern string) bool
 		want     bool
 	}{
-		{value: "client", patterns: nil, want: false},
-		{value: "client", patterns: []string{"*"}, want: true},
-		{value: "client", patterns: []string{"*lie*"}, want: true},
-		{value: "client", patterns: []string{"*ent"}, want: true},
-		{value: "client", patterns: []string{"cli*"}, want: true},
-		{value: "client", patterns: []string{"client"}, want: true},
-		{value: "client", patterns: []string{"server"}, want: false},
+		{"no patterns", "client", nil, istioMatchesString, false},
+		{"presence", "client", []string{"*"}, istioMatchesString, true},
+		{"presence requires a value", "", []string{"*"}, istioMatchesString, false},
+		{"suffix", "client", []string{"*ent"}, istioMatchesString, true},
+		{"prefix", "client", []string{"cli*"}, istioMatchesString, true},
+		{"exact", "client", []string{"client"}, istioMatchesString, true},
+		{"mismatch", "client", []string{"server"}, istioMatchesString, false},
+		{"later exact after wildcard", "client", []string{"prod-*", "client"}, istioMatchesString, true},
+		{"later wildcard after wildcard", "istio-system", []string{"kube-*", "istio-*"}, istioMatchesNamespace, true},
+		{"double wildcard is a literal suffix", "client", []string{"*lie*"}, istioMatchesString, false},
+		{"double wildcard literal suffix matches", "cliea*", []string{"*ea*"}, istioMatchesString, true},
+		{"inner wildcard is literal for principals", "a-b", []string{"a*b"}, istioMatchesString, false},
+		{"namespace inner wildcard", "prod-eu-1", []string{"prod-*-1"}, istioMatchesNamespace, true},
+		{"namespace contains wildcard", "client", []string{"*lie*"}, istioMatchesNamespace, true},
+		{"namespace multiple wildcards", "aXbYc", []string{"a*b*c"}, istioMatchesNamespace, true},
+		{"namespace wildcard mismatch", "abc", []string{"a*d"}, istioMatchesNamespace, false},
+		{"namespace exact", "client", []string{"client"}, istioMatchesNamespace, true},
+		{"namespace suffix overlap", "ab", []string{"ab*b"}, istioMatchesNamespace, false},
+		{"trust domain presence", "cluster.local", []string{"*"}, istioMatchesTrustDomain, true},
+		{"trust domain suffix", "cluster.local", []string{"*.local"}, istioMatchesTrustDomain, true},
+		{"trust domain inner wildcard", "cluster.local", []string{"clu*cal"}, istioMatchesTrustDomain, true},
+		{"trust domain overlap", "ab", []string{"ab*b"}, istioMatchesTrustDomain, false},
+		{"trust domain exact", "cluster.local", []string{"example.org", "cluster.local"}, istioMatchesTrustDomain, true},
+		{"service accounts are exact", "client/caller", []string{"client/*"}, istioMatchesServiceAccount, false},
 	}
 	for _, test := range tests {
-		require.Equal(t, test.want, matchesAnyPattern(test.value, test.patterns), "%q %#v", test.value, test.patterns)
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want, matchesAnyPattern(test.value, test.patterns, test.match))
+		})
 	}
 
 	port := intstr.FromInt32(8080)
@@ -709,9 +965,9 @@ func TestPolicyMatchingUtilityEdges(t *testing.T) {
 		TrustDomains:    []string{"cluster.local"},
 		NotTrustDomains: []string{"external.local"},
 	}
-	strings := normalizedPeerStrings([]normalizedPeer{peer}, false)
-	require.Contains(t, strings[0], "trustDomains=cluster.local")
-	require.Contains(t, strings[0], "notTrustDomains=external.local")
+	peerStrings := normalizedPeerStrings([]normalizedPeer{peer}, false)
+	require.Contains(t, peerStrings[0], "trustDomains=cluster.local")
+	require.Contains(t, peerStrings[0], "notTrustDomains=external.local")
 	require.Equal(t, []string{"<none>"}, normalizedPeerStrings(nil, true))
 	require.Equal(t, "TCP/8080", PortPermission{Port: &port}.String())
 }

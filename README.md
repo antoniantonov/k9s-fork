@@ -296,8 +296,13 @@ Binaries for Linux, Windows and Mac are available as tarballs in the [release pa
   land under `runs/<timestamp>/`. See the skill's `SKILL.md` for details and
   `references/test-matrix.md` for the coverage matrix. The `coverage` phase
   enforces at least 80% changed-statement coverage for the branch as a whole and
-  for `internal/netpol/policy.go`; set `DIFF_COVER_BASE` to override the default
-  `master` comparison ref.
+  for the core policy normalization files in `internal/netpol`; it compares
+  against `origin/master` (falling back to `master`), and `DIFF_COVER_BASE`
+  overrides that ref.
+
+  `scripts/netpol-conformance.sh` is an optional, separate lane that installs
+  Cilium and Istio in a dedicated kind cluster, probes real connections, and
+  compares them with the graph's verdicts.
 
 #### Building a multi-platform image
 
@@ -557,10 +562,13 @@ between ingress and egress: pressing `m` switches both directions at once.
 Per-direction filters, selection, and scroll position remain independent.
 
 - **Rules** lists the policy rules selecting the subject, including
-  synthetic unrestricted/default-deny explanations where applicable. Each row
-  shows the rule name, full policy type (`NetworkPolicy`,
+  synthetic unrestricted/default-deny explanations where applicable (and an
+  `authorization default-deny (TCP)` row when an Istio `ALLOW` isolates a mesh
+  pod). Each row shows the rule name, full policy type (`NetworkPolicy`,
   `CiliumNetworkPolicy`, `CiliumClusterwideNetworkPolicy`,
-  `AuthorizationPolicy`, or `Synthetic`), and ports.
+  `AuthorizationPolicy`, or `Synthetic`), and ports. Multi-spec Cilium rules
+  name their spec entry and deny rules name their action, for example
+  `payments/cnp specs[1] deny #0`.
 - **Primitives** evaluates reachable CIDRs, Pods, Namespaces, Deployments, and
   Jobs. Press `p` to enable or disable these five primitive kinds; the
   selection applies to both directions.
@@ -598,7 +606,8 @@ one direction is hidden. If both directions are hidden, the subject and details
 remain visible.
 
 Press `o` to open the Kubernetes resource behind the selected row. Rules mode
-opens the Kubernetes, Cilium, or Istio policy; Primitives mode opens the selected Pod, Namespace,
+opens the Kubernetes, Cilium, or Istio policy (custom resources by their fully
+qualified `plural.group` name); Primitives mode opens the selected Pod, Namespace,
 Deployment, or Job. CIDR primitives are not Kubernetes resources and cannot be
 opened. The reachability view appears in the breadcrumb trail as `<npg>`, so
 opening a resource pushes it onto the stack and `Esc` walks back through
@@ -680,7 +689,9 @@ requires access to:
 - `cilium.io/v2/ciliumnetworkpolicies`;
 - `cilium.io/v2/ciliumclusterwidenetworkpolicies`;
 - `security.istio.io/v1/authorizationpolicies` or its `v1beta1` fallback;
-- core `configmaps`, used to resolve the Istio mesh root namespace.
+- `get` on the istiod mesh ConfigMaps (`istio` or `istio-<revision>`, usually
+  in `istio-system`), used to resolve the Istio mesh root namespace. Without it,
+  NPG falls back to `istio-system` and shows a note.
 
 Access to the selected subject is also required. Namespace-scoped or otherwise
 incomplete RBAC can still produce useful results, but they are labeled partial
@@ -689,23 +700,26 @@ data and must not be treated as complete.
 ### Limitations
 
 This view models Kubernetes NetworkPolicy plus a conservative subset of Cilium
-and Istio authorization semantics; it does not prove packet delivery.
-Enforcement and some edge cases depend on the cluster's CNI and service-mesh
-configuration. Existing connections during policy changes, `hostNetwork` and
-node-local traffic, IP blocks before/after NAT, sidecar enrollment, and networks
-outside policy enforcement can differ from the graph.
+(1.16 or later) and Istio authorization semantics; it does not prove packet
+delivery. Enforcement and some edge cases depend on the cluster's CNI and
+service-mesh configuration. Existing connections during policy changes,
+node-local traffic, IP blocks before/after NAT, and networks outside policy
+enforcement can differ from the graph.
 
-Dynamic Cilium destinations such as FQDNs, Services, CIDR groups, nodes, and
-cloud-provider groups are reported as partial data. Istio `CUSTOM`,
-`targetRefs`, `when`, forwarded-client IPs, JWT identities, and negative
-port/CIDR constraints are also reported as partial rather than guessed.
-Unmodeled Cilium L7, TLS, SNI, and authentication constraints and Istio HTTP
-request conditions also produce partial data.
-Certificate-derived namespace, service-account, principal, and trust-domain
-matching is approximated from workload metadata and assumes `cluster.local`
-because PeerAuthentication/mTLS state is not part of the snapshot. Calico
-GlobalNetworkPolicy, AdminNetworkPolicy, DNS, routes, load balancers, node or
-cloud firewalls, and flow logs are not evaluated.
+Partial data is scoped: a policy feature NPG cannot evaluate only marks the pod
+pairs it could affect. Dynamic Cilium destinations such as FQDNs, Services, CIDR
+groups, and cloud-provider groups, Cilium L7, TLS, SNI, and authentication
+constraints, Istio `CUSTOM`, `targetRefs`, `when`, forwarded-client IPs, JWT
+identities, HTTP request conditions, and negative port/CIDR constraints degrade
+only the pairs of the pods their policies select. Cilium policies that Cilium's
+own validation rejects, pairs involving `hostNetwork` pods under Cilium
+policies, and pairs with pods whose Istio mesh enrollment is unknown are also
+partial. AuthorizationPolicy is only applied to pods enrolled in the mesh
+(sidecar or ambient). Certificate-derived namespace, service-account,
+principal, and trust-domain matching is evaluated from workload metadata,
+assumes mesh mTLS and `cluster.local`, and is shown as a rule note rather than
+partial data. Calico GlobalNetworkPolicy, AdminNetworkPolicy, DNS, routes, load
+balancers, node or cloud firewalls, and flow logs are not evaluated.
 
 ---
 

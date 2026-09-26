@@ -34,8 +34,13 @@ func TestCiliumDirectionIsolationMatrix(t *testing.T) {
 		{name: "port-only-wildcard", rules: `[{toPorts: [{ports: [{port: "8080", protocol: TCP}]}]}]`, want: []string{"TCP/8080"}},
 		{name: "explicit-all", rules: "[{%sEntities: [all]}]", want: all},
 		{name: "empty-endpoints-with-port", rules: `[{%sEndpoints: [], toPorts: [{ports: [{port: "8080", protocol: TCP}]}]}]`},
+		// The non-isolating allow is covered by the unrestricted direction, so
+		// canonical permissions no longer list a redundant TCP/8080.
 		{name: "default-deny-disabled", rules: `[{toPorts: [{ports: [{port: "8080", protocol: TCP}]}]}]`, defaultDeny: "false",
-			want: []string{"SCTP/all", "TCP/8080", "TCP/all", "UDP/all"}},
+			want: all},
+		// Cilium only applies enableDefaultDeny to a direction with rules.
+		{name: "default-deny-explicit-without-rules", defaultDeny: "true", want: all},
+		{name: "default-deny-disabled-without-rules", defaultDeny: "false", want: all},
 		{name: "empty-rule-isolation-disabled", rules: "[{}]", defaultDeny: "false", want: all},
 		{name: "another-policy-isolates", rules: `[{toPorts: [{ports: [{port: "8080", protocol: TCP}]}]}]`,
 			defaultDeny: "false", nativeIsolate: true, want: []string{"TCP/8080"}},
@@ -68,7 +73,7 @@ func TestCiliumDirectionIsolationMatrix(t *testing.T) {
 						}
 						snapshot.NetworkPolicies = []netv1.NetworkPolicy{policy}
 					}
-					result := evaluateServer(t, snapshot)
+					result := evaluateServer(t, &snapshot)
 					primitive := findPrimitive(t, result.Direction(direction), PrimitivePod, "client", "client")
 					require.ElementsMatch(t, test.want, permissionStrings(primitive.Permissions))
 					wantState := AccessAllowed
@@ -83,6 +88,29 @@ func TestCiliumDirectionIsolationMatrix(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestCiliumDefaultDenyNeedsRulesInThatDirection(t *testing.T) {
+	for _, policyType := range ciliumPolicyTypes() {
+		t.Run(policyType.Kind(), func(t *testing.T) {
+			snapshot := testSnapshot()
+			addCiliumPolicy(&snapshot, policyType, ciliumTestPolicy(t, policyType, "ingress-only", `
+  endpointSelector: {matchLabels: {role: server}}
+  enableDefaultDeny: {ingress: true, egress: true}
+  ingress: [{fromEntities: [cluster], toPorts: [{ports: [{port: "8080", protocol: TCP}]}]}]`))
+			result := evaluateServer(t, &snapshot)
+			ingress := findPrimitive(t, result.Ingress, PrimitivePod, "client", "client")
+			require.Equal(t, AccessAllowed, ingress.State)
+			require.Equal(t, []string{"TCP/8080"}, permissionStrings(ingress.Permissions))
+			egress := findPrimitive(t, result.Egress, PrimitivePod, "client", "client")
+			require.Equal(t, AccessAllowed, egress.State, "egress has no rules, so enableDefaultDeny does not isolate it")
+			require.Equal(t, []string{"SCTP/all", "TCP/all", "UDP/all"}, permissionStrings(egress.Permissions))
+			require.Empty(t, result.Warnings)
+			for _, rule := range result.Egress.Rules {
+				require.NotEqual(t, SyntheticDefaultDeny, rule.ID.SyntheticKind)
+			}
+		})
 	}
 }
 
@@ -124,7 +152,7 @@ func TestCiliumPeerScopeAndEntitiesEffectiveMatrix(t *testing.T) {
     - %s
 `, strings.ToLower(direction.String()), fmt.Sprintf(test.peer, ciliumPeerPrefix(direction)))))
 
-					result := evaluateServer(t, snapshot)
+					result := evaluateServer(t, &snapshot)
 					cross := test.cross
 					if policyType == PolicyTypeCiliumClusterwideNetworkPolicy {
 						cross = test.crossCCNP
@@ -331,7 +359,7 @@ func TestCiliumEffectivePortMatrix(t *testing.T) {
     - %sEntities: [cluster]
       %s
 `, strings.ToLower(direction.String()), ciliumPeerPrefix(direction), test.ports)))
-					result := evaluateServer(t, snapshot)
+					result := evaluateServer(t, &snapshot)
 					primitive := findPrimitive(t, result.Direction(direction), PrimitivePod, "client", "client")
 					require.Equal(t, test.state, primitive.State)
 					require.ElementsMatch(t, test.want, permissionStrings(primitive.Permissions))
@@ -364,7 +392,7 @@ spec:
 		object.Object["specs"] = []any{extra.Object["spec"]}
 		addCiliumPolicy(&snapshot, policyType, object)
 	}
-	result := evaluateServer(t, snapshot)
+	result := evaluateServer(t, &snapshot)
 	require.Empty(t, result.Warnings)
 	seen := sets.New[string]()
 	for _, direction := range []Direction{Ingress, Egress} {
@@ -396,7 +424,7 @@ spec:
 	}
 	slices.Reverse(snapshot.Pods)
 	slices.Reverse(snapshot.Namespaces)
-	repeated := evaluateServer(t, snapshot)
+	repeated := evaluateServer(t, &snapshot)
 	for _, direction := range []Direction{Ingress, Egress} {
 		var first, second []string
 		for _, rule := range result.Direction(direction).Rules {
@@ -442,9 +470,10 @@ func ciliumPairPolicy(
 
 func findPodApplicability(t *testing.T, rows []ApplicabilityRow, namespace, name string) ApplicabilityRow {
 	t.Helper()
-	for _, row := range rows {
+	for index := range rows {
+		row := &rows[index]
 		if row.Primitive.Ref.Kind == PrimitivePod && row.Primitive.Ref.Namespace == namespace && row.Primitive.Ref.Name == name {
-			return row
+			return *row
 		}
 	}
 	require.FailNow(t, "pod applicability not found", "%s/%s", namespace, name)

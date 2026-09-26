@@ -488,27 +488,76 @@ proc rule_name_matches {rendered reference} {
   return [regexp "^[regexp_quote $reference] #\\d+$" $rendered]
 }
 
-proc assert_selected_edge_rule {screen direction reference type version action ports} {
+# rule_spec returns the Cilium spec entry of a fixture rule and whether its
+# policy has several entries. The smoke script overrides it with fixture data.
+proc rule_spec {policy direction action} {
+  return [list "" 0]
+}
+
+# expected_rule_label mirrors the Rules panel label: multi-spec Cilium rules
+# name their spec entry and deny rules name their action.
+proc expected_rule_label {reference action spec multi} {
+  set label $reference
+  if {$multi && $spec ne ""} { append label " $spec" }
+  if {[string toupper $action] eq "DENY"} { append label " deny" }
+  return "$label #0"
+}
+
+proc assert_selected_edge_rule {screen direction reference type version action ports {spec ""} {multi 0}} {
   if {![selected_policy_matches $screen $type $reference $action]} {
     fail_case "wrong selected rule: expected $type $reference $action"
     return 0
   }
+  set label [expected_rule_label $reference $action $spec $multi]
   set matches 0
   foreach row [rule_rows $screen "$direction · Rules"] {
-    if {[dict get $row Name] eq "$reference #0" && [dict get $row Type] eq $type} {
+    if {[dict get $row Name] eq $label && [dict get $row Type] eq $type} {
       if {[dict get $row Ports] eq $ports} { incr matches }
     }
   }
   if {$matches != 1} {
-    fail_case "expected one exact rule row: $reference #0 | $type | $ports; got $matches\n$screen"
+    fail_case "expected one exact rule row: $label | $type | $ports; got $matches\n$screen"
     return 0
   }
   if {![regexp {Rule index: 0\M} $screen]} {
     fail_case "selected $reference $action did not retain rule index 0"
     return 0
   }
-  return [expr {[snapshot_contains $screen "API version: $version"] &&
-                [snapshot_excludes $screen "Spec index:"]}]
+  if {![snapshot_contains $screen "API version: $version"] || ![snapshot_excludes $screen "Spec index:"]} { return 0 }
+  # Cilium rules name their spec entry on the rule index line.
+  if {$spec eq ""} { return [snapshot_excludes $screen "Rule index: 0 in "] }
+  return [snapshot_contains $screen "Rule index: 0 in $spec (spec index "]
+}
+
+# scan_rule_details focuses the Rule Details text and scrolls it from the top,
+# because the pane is shorter than the details of most rules. It fails when a
+# forbidden value appears or a required value never does.
+proc scan_rule_details {required {forbidden {}}} {
+  send_key "\t"
+  send_key "\033\[H"
+  set seen [dict create]
+  set screen ""
+  for {set moves 0} {$moves <= 40} {incr moves} {
+    set screen [capture_screen]
+    set text [join [panel_lines $screen "Rule Details"] "\n"]
+    foreach value $forbidden {
+      if {[string first $value $text] >= 0} {
+        fail_case "Rule Details unexpectedly contain <$value>\n$screen"
+        return 0
+      }
+    }
+    foreach value $required {
+      if {[string first $value $text] >= 0} { dict set seen $value 1 }
+    }
+    if {[dict size $seen] == [llength $required]} { return 1 }
+    send_key "\033\[B" 150
+  }
+  set missing {}
+  foreach value $required {
+    if {![dict exists $seen $value]} { lappend missing $value }
+  }
+  fail_case "Rule Details never showed <[join $missing {>, <}]>\n$screen"
+  return 0
 }
 
 proc verify_edge_policy {name subject namespace direction policy policy_namespace type version resource action rule_ports peer peer_namespace effective_ports {controls {}}} {
@@ -517,7 +566,8 @@ proc verify_edge_policy {name subject namespace direction policy policy_namespac
   set reference $policy
   if {$policy_namespace ne ""} { set reference "$policy_namespace/$policy" }
   set screen [select_named_rule $policy $reference $type $action]
-  if {$screen eq "" || ![assert_selected_edge_rule $screen $direction $reference $type $version $action $rule_ports]} { return }
+  lassign [rule_spec $policy $direction $action] spec multi
+  if {$screen eq "" || ![assert_selected_edge_rule $screen $direction $reference $type $version $action $rule_ports $spec $multi]} { return }
   send_key "o"
   set resource_screen [capture_screen]
   if {![snapshot_contains $resource_screen $resource] ||
@@ -545,7 +595,8 @@ proc verify_edge_policy {name subject namespace direction policy policy_namespac
     lassign $control control_action control_ports control_peer control_namespace state ports peer_match opposite
     if {![open_edge_subject $subject $namespace $direction]} { return }
     set screen [select_named_rule $policy $reference $type $control_action]
-    if {$screen eq "" || ![assert_selected_edge_rule $screen $direction $reference $type $version $control_action $control_ports]} { return }
+    lassign [rule_spec $policy $direction $control_action] spec multi
+    if {$screen eq "" || ![assert_selected_edge_rule $screen $direction $reference $type $version $control_action $control_ports $spec $multi]} { return }
     send_key "\r"
     if {![filter_to "Pod $control_namespace/$control_peer"]} { return }
     if {![selected_policy_matches [capture_screen] $type $reference $control_action]} {
@@ -597,7 +648,7 @@ proc verify_source_authz_noninterference {} {
 
 proc verify_identity_edge {direction} {
   global ns_edge_src ns_edge_dst probe_id
-  start_case "istio-identity-[string tolower $direction]-partial-data" 0
+  start_case "istio-identity-[string tolower $direction]-note" 0
   if {$direction eq "Ingress"} {
     set subject authz-identity
     set namespace $ns_edge_dst
@@ -612,30 +663,15 @@ proc verify_identity_edge {direction} {
   if {![open_edge_subject $subject $namespace $direction]} { return }
   send_key "\r"
   if {![filter_to "Pod $peer_namespace/$peer"]} { return }
-  set screen [capture_screen]
-  if {![assert_edge_context $screen $subject $namespace $direction 1 0]} { return }
-  set row [exact_table_row $screen "Effective Applicability ($direction)" {Primitive Peer Opposite State Ports} "Pod $peer_namespace/$peer"]
-  if {$row eq ""} { return }
-  if {[dict get $row State] ne "Partial Data"} { fail_case "identity-dependent path was reported as known"; return }
-  if {[catch {set ports [port_set [dict get $row Ports]]} message]} { fail_case $message; return }
-  foreach required {UDP/5353 SCTP/9000} {
-    if {$required ni $ports} { fail_case "identity uncertainty removed non-TCP permission $required"; return }
-  }
-  foreach port $ports {
-    if {$port ni {TCP/8080 TCP/8081 UDP/5353 SCTP/9000}} {
-      fail_case "identity fixture invented permission $port"
-      return
-    }
-  }
+  # Both pods are in the ambient mesh, so the source presents a mesh identity
+  # and the namespace-constrained rule is evaluated definitively.
+  if {![assert_edge_row $subject $namespace $direction $peer $peer_namespace Allowed {SCTP/9000, TCP/8080, TCP/8081, UDP/5353} 0 0 true true]} { return }
   if {![open_edge_subject authz-identity $ns_edge_dst Ingress]} { return }
   set policy "probe-identity-$probe_id"
   set screen [select_named_rule $policy "$ns_edge_dst/$policy" AuthorizationPolicy ALLOW]
   if {$screen eq ""} { return }
-  if {![regexp -nocase {mTLS|certificate|identity} $screen]} {
-    fail_case "identity-constrained rule has no identity uncertainty note\n$screen"
-    return
-  }
-  if {[snapshot_contains $screen "Partial Data"]} { pass_case }
+  # The approximation is a note on the rule, not Partial Data.
+  if {[scan_rule_details {{State: Allowed (Allowed)} {mesh mTLS}} {{Partial Data} Warnings:}]} { pass_case }
 }
 
 proc unsupported_diagnostics {reference screen} {
@@ -651,7 +687,7 @@ proc unsupported_diagnostics {reference screen} {
     }
   }
   if {!$partial_subject} { return 0 }
-  set warning "Warning: snapshot resource \"ciliumnetworkpolicies\" could not be fully evaluated: $reference: egress allow rule 0: toFQDNs requires live DNS resolution"
+  set warning "Warning: CiliumNetworkPolicy $reference: egress allow rule 0: toFQDNs requires live DNS resolution"
   set diagnosed 0
   foreach line [panel_lines $screen "Effective Details"] {
     if {$line eq $warning} { set diagnosed 1; break }
@@ -669,13 +705,18 @@ proc verify_unsupported_policy {} {
   if {![open_edge_subject uncertain-client $ns_edge_src Egress]} { return }
   if {![assert_edge_context [capture_screen] uncertain-client $ns_edge_src Egress 1 0]} { return }
   send_key "\t"
-  send_key "\033\[F"
+  send_key "\033\[H"
   set reference "$ns_edge_src/probe-unsupported-$probe_id"
-  if {[wait_for_frame [list unsupported_diagnostics $reference] 15] eq ""} {
-    fail_case "effective details did not show Partial Data and the exact $reference toFQDNs warning\n$::last_wait_screen"
-    return
+  # Warnings are sorted, so the policy warning precedes hostNetwork peer
+  # warnings; scroll down from the top until the pane shows it.
+  for {set moves 0} {$moves <= 20} {incr moves} {
+    if {[wait_for_frame [list unsupported_diagnostics $reference] [expr {$moves == 0 ? 15 : 3}]] ne ""} {
+      pass_case
+      return
+    }
+    send_key "\033\[B" 150
   }
-  pass_case
+  fail_case "effective details did not show Partial Data and the exact $reference toFQDNs warning\n$::last_wait_screen"
 }
 
 proc verify_cidr_narrow_deny {} {
@@ -695,6 +736,80 @@ proc verify_cidr_narrow_deny {} {
     }
     if {[llength $matches] != 1} { fail_case "expected exactly one CIDR $prefix row\n$screen"; return }
     if {![assert_applicability_values [lindex $matches 0] $state {no ports} true n/a]} { return }
+  }
+  pass_case
+}
+
+# applicability_prefix_ready waits for exactly one complete applicability row
+# whose primitive starts with prefix, such as a DaemonSet pod.
+proc applicability_prefix_ready {title prefix screen} {
+  if {![applicability_surface_closed $title $screen]} { return 0 }
+  return [expr {[llength [prefix_table_rows $screen $title $prefix]] == 1}]
+}
+
+proc applicability_surface_closed {title screen} {
+  set active 0
+  foreach line [split $screen "\n"] {
+    if {!$active} {
+      if {[string first $title $line] >= 0} { set active 1 }
+      continue
+    }
+    if {[regexp {[╰└]} $line]} { return 1 }
+  }
+  return 0
+}
+
+proc prefix_table_rows {screen title prefix} {
+  set found {}
+  foreach row [table_rows $screen $title {Primitive Peer Opposite State Ports}] {
+    if {[string first $prefix [dict get $row Primitive]] == 0} { lappend found $row }
+  }
+  return $found
+}
+
+# verify_hostnetwork_peer checks a hostNetwork system pod as a peer. Cilium
+# identifies such pods as host or remote-node, so pairs with pods selected by
+# Cilium policies are Partial Data while other policy types stay definitive.
+proc verify_hostnetwork_peer {name subject namespace direction state ports partial} {
+  start_case $name 0
+  if {![open_edge_subject $subject $namespace $direction]} { return }
+  send_key "\r"
+  set prefix "Pod kube-system/kube-proxy-"
+  if {![filter_to $prefix]} { return }
+  set title "Effective Applicability ($direction)"
+  set screen [wait_for_frame [list applicability_prefix_ready $title $prefix] 20]
+  if {$screen eq ""} {
+    fail_case "timed out waiting for exactly one <$prefix*> row in <$title>\n$::last_wait_screen"
+    return
+  }
+  if {![assert_edge_context $screen $subject $namespace $direction $partial 0]} { return }
+  set row [lindex [prefix_table_rows $screen $title $prefix] 0]
+  if {[dict get $row State] ne $state} {
+    fail_case "wrong hostNetwork peer state: expected <$state>, got <[dict get $row State]>"
+    return
+  }
+  if {[assert_ports [dict get $row Ports] $ports]} { pass_case }
+}
+
+# verify_authorization_default_deny_row checks that an Istio ALLOW isolating a
+# mesh pod adds a TCP-scoped authorization row next to the network row.
+proc verify_authorization_default_deny_row {subject namespace} {
+  start_case istio-authorization-default-deny-row 0
+  if {![open_edge_subject $subject $namespace Ingress]} { return }
+  set screen [capture_screen]
+  set found {}
+  foreach row [rule_rows $screen "Ingress · Rules"] {
+    dict set found [dict get $row Name] [list [dict get $row Type] [dict get $row Ports]]
+  }
+  foreach name {{authorization default-deny (TCP) #-1} {default-deny #-1}} {
+    if {![dict exists $found $name] || [dict get $found $name] ne {Synthetic {no ports}}} {
+      fail_case "missing synthetic rule row <$name | Synthetic | no ports>\n$screen"
+      return
+    }
+  }
+  if {[dict exists $found {unrestricted #-1}]} {
+    fail_case "the network layer is isolated, so no unrestricted row may appear\n$screen"
+    return
   }
   pass_case
 }

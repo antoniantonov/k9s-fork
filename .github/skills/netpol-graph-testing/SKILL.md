@@ -8,7 +8,9 @@ description: Test the netpol graph, k9s NetworkPolicy reachability view, netpol 
 This skill validates the k9s NetworkPolicy reachability view (`:netpolgraph`, `:npgraph`, `:npg`, Shift-R) against a local kind demo topology.
 
 This is **live-API application/TUI testing**, not packet-delivery testing. The
-fixture CRDs do not install Cilium, Istio, or an enforcing dataplane.
+fixture CRDs do not install Cilium, Istio, or an enforcing dataplane. The
+optional conformance lane (`scripts/netpol-conformance.sh`, see below) is the
+only place where graph verdicts are compared with real enforcement.
 
 ## Prerequisites
 
@@ -31,8 +33,12 @@ Before populating workloads, agents must run:
 Only run the population path when `--check` fails, unless `--force-workloads` is explicitly needed.
 
 The check includes the original topology and isolated `${prefix}-edge-src`,
-`${prefix}-edge-dst`, and `${prefix}-edge-other` scenarios: 18 ready bare pods,
-namespace/pod labels, and 15 policy specifications. Policy `spec`/`specs` are
+`${prefix}-edge-dst`, and `${prefix}-edge-other` scenarios: 21 ready bare pods,
+namespace/pod labels (including the Istio mesh-enrollment labels and the stale
+sidecar annotation), and 18 policy specifications. `${prefix}-app`,
+`${prefix}-edge-src`, and `${prefix}-edge-dst` are labeled
+`istio.io/dataplane-mode=ambient`, because AuthorizationPolicy only applies to
+mesh workloads. Policy `spec`/`specs` are
 compared with the desired manifests using a **client-only dry run**; merely
 retaining an object name or ownership label cannot hide drift. It also rejects
 leftover uncertainty probes. Existing native/custom-only demo subjects are
@@ -69,9 +75,12 @@ executing TUI commands; balanced but invalid late-file commands also fail.
 
 Phases: `preflight`, `ensure-cluster`, `ensure-workloads`, `go-tests`,
 `coverage`, `build-image`, `tui-tests`, `report`. The coverage phase compares
-the merge base of `${DIFF_COVER_BASE:-master}` with the current working tree and
-requires at least 80% changed-statement coverage both overall and in
-`internal/netpol/policy.go`. Use `--only PHASE`, `--skip PHASE`, `--from PHASE`,
+the merge base of `$DIFF_COVER_BASE` (default `origin/master`, or `master` when
+there is no such remote branch) with the current working tree and requires at
+least 80% changed-statement coverage overall and in each of
+`internal/netpol/policy.go`, `policy_cilium.go`, `policy_istio.go`, `mesh.go`,
+and `selection.go`. A stale local `master` is never the default, because it
+would attribute upstream merges to the branch. Use `--only PHASE`, `--skip PHASE`, `--from PHASE`,
 `--rebuild`, `--clean-image`/`--no-image-cache`, `--image REF`, and
 `--force-workloads` as needed.
 
@@ -87,7 +96,7 @@ population even when the final file passes `bash -n`.
 
 ## Complete-data and uncertainty suites
 
-`tui-tests` runs **66 known-fixture cases**, then **2 identity cases**, then
+`tui-tests` runs **77 known-fixture cases**, then **2 identity cases**, then
 **2 unsupported-Cilium cases**, always using the same immutable image ID.
 New assertions reconstruct a fresh terminal repaint and compare the subject,
 direction, exact peer row, state and complete protocol/port set. Navigation
@@ -130,10 +139,17 @@ allowed rows are `true`/`true`; matched but disjoint or denied rows are
 `true`/`false`; unmatched selected rules are `false`/`false`. The selected CCNP
 deny remains Disallowed with `no ports` even when another port survives in the
 effective result. Zero-pair rows use `n/a` for Peer, Opposite and Ports.
-Rule names display the policy reference followed by `#<rule index>`, without a
-spec suffix or a Spec index detail field. The first CNP allow in `specs[0]`
-and first deny in `specs[1]` both display `#0`; action and port content identify
-the selected rule, not an invented visual spec number.
+Rule names display the policy reference, then the Cilium spec entry when the
+resource has several `spec`/`specs` entries, then `deny` for deny rules, then
+`#<rule index>`: the first CNP allow in `specs[0]` is `…/cnp-source specs[0] #0`
+and the first deny in `specs[1]` is `…/cnp-source specs[1] deny #0`. Rule
+Details show the entry on the rule index line, `Rule index: 0 in specs[1]
+(spec index 1)`, for Cilium rules only (the detail pane is short, so no line is
+added); native and Istio rules show a plain `Rule index: 0`, and no
+`Spec index:` label exists. The identity note sits below the rule YAML, so the
+identity case scrolls Rule Details from the top until it has seen
+`State: Allowed (Allowed)` and the note, rejecting any `Partial Data` or
+`Warnings:` on the way.
 
 The CIDR control checks **both** rows from `edge-src/cidr-client` egress.
 The partly denied `203.0.113.0/24` is **Unknown**, while the fully denied
@@ -141,28 +157,51 @@ The partly denied `203.0.113.0/24` is **Unknown**, while the fully denied
 Peer `true` and Opposite `n/a`. A narrower deny is address-overlap uncertainty,
 not snapshot-wide Partial Data and not uniform Disallowed for the broad range.
 
-Istio `source.namespaces` is certificate/mTLS-derived and therefore uncertain
-from Kubernetes objects alone. Known-state fixtures use identity-free port-only
-ALLOW/DENY rules. They also prove that a source-local ingress AuthorizationPolicy
-does not become a source egress policy. Effective port text is compared
-exactly: `SCTP/9000, TCP/8080, UDP/5353` after the TCP deny, and
-`SCTP/9000, UDP/5353` for the empty ALLOW control.
+Known-state Istio fixtures use identity-free port-only ALLOW/DENY rules. They
+also prove that a source-local ingress AuthorizationPolicy does not become a
+source egress policy. Effective port text is compared exactly:
+`SCTP/9000, TCP/8080, UDP/5353` after the TCP deny, and `SCTP/9000, UDP/5353`
+for the empty ALLOW control. Mesh enrollment is covered by `authz-unenrolled`
+(`istio.io/dataplane-mode=none`, so its allow-nothing policy is not enforced:
+`Allowed SCTP/9000, TCP/8080, TCP/8081, UDP/5353`) and `authz-unknown` (a
+`sidecar.istio.io/status` annotation without an `istio-proxy` container, so
+enrollment is unknown: `Partial Data SCTP/9000, TCP/8080, UDP/5353`). The
+`istio-authorization-default-deny-row` case checks that an Istio ALLOW adds a
+separate `authorization default-deny (TCP) #-1` synthetic row next to the
+network `default-deny #-1` row.
 
-Normalization uncertainty is **snapshot-wide**. The identity and unsupported
-policies are never part of ordinary population. For each final probe suite the
+Uncertainty is **scoped to the pairs it can affect**. The ordinary topology
+contains `cnp-l7`, an L7 rule on `l7-server` that only matches the `control`
+pod: `control → l7-server` is `Partial Data TCP/8080`, while the unmatched
+`authz-client → l7-server` pair stays a definitive `Disallowed`. Pods with
+Cilium policies see `hostNetwork` system pods as `Partial Data`
+(`cilium-hostnetwork-peer-partial-data`, matched by the `kube-proxy-` prefix),
+while the same peer of a native/Istio-only subject stays definitive
+(`hostnetwork-peer-native-control`). Every known case that expects a complete
+result asserts that no `Partial Data` cell is on screen.
+
+The identity and unsupported probes stay opt-in so their suites run against a
+fixed topology. For each final probe suite the
 runner checks that known fixtures are clean, checks the probe before applying
 it, launches a fresh TUI process, and removes only the exact policy carrying
 that run's ownership ID in an EXIT/signal cleanup handler. The normal topology
 is rechecked even after a failing TUI run or failed deletion. A failed cleanup
 fails validation; a subsequent suite cannot populate over an unclean topology.
-The unsupported probe checks the exact snapshot-resource
-`"ciliumnetworkpolicies"` diagnostic, owned namespace/policy name, egress allow
-rule index and `toFQDNs requires live DNS resolution` text in **Effective
-Details**, scrolling that pane when necessary. Partial state is confirmed by
-the subject's `PARTIAL DATA` badge and applicability `Partial Data` cells, not
-an invented mixed-case label in the lowercase details summary. Disabled empty rules
-may be omitted from the Rules panel, so this case does not invent a selectable
-raw rule. The known Cilium navigation cases cover its API version and YAML.
+The unsupported probe checks the exact per-rule diagnostic
+`CiliumNetworkPolicy <namespace>/<probe>: egress allow rule 0: toFQDNs requires
+live DNS resolution` in **Effective Details**, scrolling that pane from the top
+when necessary (warnings are sorted, so it precedes the `hostNetwork` peer
+warnings). Partial state is confirmed by the subject's `PARTIAL DATA` badge and
+applicability `Partial Data` cells, not an invented mixed-case label in the
+lowercase details summary. Disabled empty rules may be omitted from the Rules
+panel, so this case does not invent a selectable raw rule. While the probe is
+applied, `unsupported-scoped-egress-control` proves scoping: `cnp-client →
+cnp-server` stays `Allowed TCP/8081` with no Partial Data. The identity probe
+(`source.namespaces` on `authz-identity`) is evaluated from workload metadata
+because both pods are in the mesh: the path is a definitive
+`Allowed SCTP/9000, TCP/8080, TCP/8081, UDP/5353`, and the selected rule's
+details carry the `mesh mTLS` approximation note with `State: Allowed`. The
+known Cilium navigation cases cover its API version and YAML.
 
 For controlled diagnosis, the demo entry point exposes the same probe flags:
 
@@ -193,7 +232,7 @@ parse this block rather than those lines:
 === authoritative combined smoke summary ===
   PASS   known/launch-npg-view
   ...
-=== 70 case(s), 0 failure(s) ===
+=== 81 case(s), 0 failure(s) ===
 ```
 
 Every declared case must have exactly one verdict. Missing, duplicate,
@@ -220,8 +259,9 @@ upstream races in `TestFlash`, `TestFlashBurst`, `TestShowPrompt` and
 
 The `coverage` phase reruns the changed NPG packages with a combined cover
 profile, tests the repository-local diff coverage parser, and fails unless the
-aggregate and `internal/netpol/policy.go` changed-statement thresholds both
-reach 80%.
+aggregate and the per-file thresholds for the policy normalization files
+(`policy.go`, `policy_cilium.go`, `policy_istio.go`, `mesh.go`,
+`selection.go`) all reach 80%.
 
 The denominator includes committed branch changes and staged, unstaged and
 untracked production Go files. Changed executable functions missing from the
@@ -230,9 +270,10 @@ does not invent executable statements. Profile paths are matched within the
 actual module, not by ambiguous basename suffixes. These are Go **statement**
 coverage gates, not independent branch-coverage instrumentation.
 
-The helper's Go tests also exercise shell stubs, the 18-pod/15-policy fixture
-inventory, Tcl compilation, fresh-screen parsing, both CIDR rows, same-index
-allow/deny identities, headerless declared-rule rows, delayed startup and
+The helper's Go tests also exercise shell stubs, the 21-pod/18-policy fixture
+inventory and its mesh labels, Tcl compilation, fresh-screen parsing, both CIDR
+rows, spec-entry and action rule labels, per-layer synthetic rows, prefix-matched
+hostNetwork peer rows, headerless declared-rule rows, delayed startup and
 command-prompt closure, fragmented repaint completion, an exact live
 unsupported-policy screen fixture with negative diagnostic controls, and verdict
 accounting without contacting Docker or Kubernetes. A real local PTY stub
@@ -253,6 +294,28 @@ mkdir -p .github/skills/netpol-graph-testing/runs/helper-check
 TMPDIR="$PWD/.github/skills/netpol-graph-testing/runs/helper-check" \
 GOTMPDIR="$PWD/.github/skills/netpol-graph-testing/runs/helper-check" \
   go test ./.github/skills/netpol-graph-testing/diffcover -count=1
+```
+
+## Optional conformance lane
+
+`scripts/netpol-conformance.sh` compares graph verdicts with real enforcement.
+It creates a separate kind cluster (default `k9s-netpol-conformance`, never the
+demo cluster) without the default CNI, installs Cilium and Istio (sidecar mode)
+with Helm, deploys a small workload set with Services, applies Kubernetes,
+Cilium, and Istio policies, and probes HTTP requests through the Service
+ClusterIPs until two rounds agree. Sidecars only present an mTLS identity to
+destinations they know as mesh endpoints, so bare pod IPs are not probed. The
+same live objects are then evaluated by
+`go test -tags conformance ./internal/netpol/conformance`, which fails on any
+definitive graph verdict that disagrees with a probe (Partial Data verdicts are
+reported but not compared). It covers Cilium allow/deny, Istio namespace
+identities from mesh and non-mesh sources, an AuthorizationPolicy on a non-mesh
+pod that is not enforced, and native egress. The lane needs internet access for
+the charts and images and is not part of `run-tests.sh`:
+
+```bash
+scripts/netpol-conformance.sh            # create, test, keep the cluster
+scripts/netpol-conformance.sh --delete   # remove the conformance cluster
 ```
 
 ## Cleanup

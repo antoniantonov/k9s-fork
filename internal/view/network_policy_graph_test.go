@@ -1010,6 +1010,24 @@ func TestNetworkPolicyGraphSubjectInfoReportsState(t *testing.T) {
 	assert.Contains(t, view.subjectInfo.Table.GetCell(0, 0).Text, "No workloads found")
 }
 
+func TestNetworkPolicyGraphNotesAreNotWarnings(t *testing.T) {
+	view := newTestNetworkPolicyGraph()
+	result := testSubjectResult()
+	result.Notes = []string{"Istio mesh config was not found; using the default root namespace istio-system"}
+	view.applyResult(result)
+
+	assert.NotContains(t, view.subjectInfo.SummaryText(), "PARTIAL DATA", "notes do not make results partial")
+	text := view.effectiveDetailsText(netpol.Ingress, nil)
+	assert.Contains(t, text, "Note: Istio mesh config was not found; using the default root namespace istio-system")
+	assert.NotContains(t, text, "Warning:")
+
+	result.Warnings = []string{"CiliumNetworkPolicy ns/p: egress allow rule 0: toFQDNs requires live DNS resolution"}
+	view.applyResult(result)
+	assert.Contains(t, view.subjectInfo.SummaryText(), "PARTIAL DATA (1 warning(s))")
+	text = view.effectiveDetailsText(netpol.Ingress, nil)
+	assert.Less(t, strings.Index(text, "Warning: CiliumNetworkPolicy ns/p"), strings.Index(text, "Note: Istio"))
+}
+
 func TestNetworkPolicyGraphSubjectKindsIgnorePrimitiveFilter(t *testing.T) {
 	view := newTestNetworkPolicyGraph()
 	view.kinds = sets.New[netpol.PrimitiveKind]()
@@ -1367,19 +1385,19 @@ func subjectPromotionResult() *netpol.SubjectResult {
 
 func mixedApplicabilitySubjectResult() *netpol.SubjectResult {
 	result := testSubjectResult()
-	result.Ingress.Primitives = mixedApplicabilityPrimitives(netpol.Ingress, result.Ingress.Rules[0].ID)
-	result.Egress.Primitives = mixedApplicabilityPrimitives(netpol.Egress, result.Egress.Rules[0].ID)
+	result.Ingress.Primitives = mixedApplicabilityPrimitives(netpol.Ingress, &result.Ingress.Rules[0].ID)
+	result.Egress.Primitives = mixedApplicabilityPrimitives(netpol.Egress, &result.Egress.Rules[0].ID)
 	return result
 }
 
 func mixedApplicabilityPrimitives(
 	direction netpol.Direction,
-	ruleID netpol.RuleID,
+	ruleID *netpol.RuleID,
 ) map[netpol.PrimitiveKind][]netpol.PrimitiveResult {
 	permission := netpol.PortPermission{All: true}
 	oppositeID := netpol.RuleID{Direction: oppositeDirection(direction), SyntheticKind: "unrestricted"}
 	pair := func(name string, allowed bool) netpol.PairDecision {
-		evidence := []netpol.PolicyEvidence{{RuleID: ruleID, Ports: []netpol.PortPermission{permission}}}
+		evidence := []netpol.PolicyEvidence{{RuleID: *ruleID, Ports: []netpol.PortPermission{permission}}}
 		if allowed {
 			evidence = append(evidence, netpol.PolicyEvidence{RuleID: oppositeID})
 		}
@@ -2842,7 +2860,8 @@ func TestNetworkPolicyGraphCustomPolicyTargets(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, test.path, resourcePath)
 				router := &Command{alias: dao.NewAlias(nil)}
-				router.alias.Define(test.gvr, test.gvr.String(), test.gvr.R())
+				router.alias.Define(test.gvr, test.gvr.String(), test.gvr.R(), test.gvr.R()+"."+test.gvr.G())
+				assert.Equal(t, policyCommand(test.gvr), command)
 				routed, _, _, err := router.viewMetaFor(cmd.NewInterpreter(command))
 				require.NoError(t, err)
 				assert.Equal(t, test.gvr, routed)
@@ -2868,8 +2887,28 @@ func TestNetworkPolicyGraphCustomPolicyTargets(t *testing.T) {
 		}
 	}
 
-	_, ok := policyGVR(netpol.RuleID{SyntheticKind: "default-deny"})
+	_, ok := policyGVR(&netpol.RuleID{SyntheticKind: "default-deny"})
 	assert.False(t, ok)
+}
+
+func TestNetworkPolicyGraphPolicyCommandsAreQualified(t *testing.T) {
+	linkerd := client.NewGVR("policy.linkerd.io/v1beta3/authorizationpolicies")
+	router := &Command{alias: dao.NewAlias(nil)}
+	// Another CRD claims the bare plural first, as k9s aliases keep the first
+	// definition.
+	router.alias.Define(linkerd, linkerd.R(), linkerd.R()+"."+linkerd.G())
+	for _, gvr := range []*client.GVR{client.AuthzGVR, client.CnpGVR, client.CcnpGVR} {
+		router.alias.Define(gvr, gvr.R(), gvr.R()+"."+gvr.G())
+		command := policyCommand(gvr)
+		assert.Equal(t, gvr.R()+"."+gvr.G(), command)
+		routed, _, _, err := router.viewMetaFor(cmd.NewInterpreter(command))
+		require.NoError(t, err)
+		assert.Equal(t, gvr, routed, command)
+	}
+	assert.Equal(t, "networkpolicies", policyCommand(client.NpGVR))
+	routed, _, _, err := router.viewMetaFor(cmd.NewInterpreter("authorizationpolicies"))
+	require.NoError(t, err)
+	assert.Equal(t, linkerd, routed, "the bare plural is ambiguous")
 }
 
 func TestNetworkPolicyGraphSyntheticPolicyNavigation(t *testing.T) {
@@ -2897,7 +2936,7 @@ func TestNetworkPolicyGraphSyntheticPolicyNavigation(t *testing.T) {
 				_, _, ok = view.yamlTarget()
 				assert.False(t, ok)
 				_, _, err := view.openPrimitiveTarget()
-				assert.ErrorIs(t, err, errNoPrimitiveTarget)
+				require.ErrorIs(t, err, errNoPrimitiveTarget)
 				assert.False(t, visibleHint(view, "o"))
 				assert.False(t, visibleHint(view, "y"))
 				view.applyFocusTarget(focusDetails)

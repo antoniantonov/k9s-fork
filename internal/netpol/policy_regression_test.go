@@ -31,7 +31,7 @@ func TestCiliumEmptyRulesDoNotAllowTraffic(t *testing.T) {
     matchLabels: {role: server}
   `+strings.ToLower(direction.String())+`: [`+rule+`]`))
 
-					result := evaluateServer(t, snapshot)
+					result := evaluateServer(t, &snapshot)
 					primitive := findPrimitive(t, result.Direction(direction), PrimitivePod, "client", "client")
 					require.Equal(t, AccessDisallowed, primitive.State)
 					require.Empty(t, primitive.Permissions)
@@ -73,7 +73,7 @@ func TestCiliumCIDRDenyOverlapIsNotUniformAllow(t *testing.T) {
       toPorts: [{ports: [{port: "80", protocol: TCP}]}]
 `, field, peer, prefixes[0], field, peer, prefixes[1])))
 
-					result := evaluateServer(t, snapshot)
+					result := evaluateServer(t, &snapshot)
 					broad := findCIDRPrimitive(t, result.Direction(direction), prefixes[0], nil)
 					require.Equal(t, AccessUnknown, broad.State)
 					require.Empty(t, broad.Permissions, "no TCP/80 permission applies throughout the broad CIDR")
@@ -127,7 +127,7 @@ func TestCiliumCIDRDenyRespectsExcludedAddresses(t *testing.T) {
       toPorts: [{ports: [{port: "80", protocol: TCP}]}]
 `, field, peer, field, peer)))
 
-			result := evaluateServer(t, snapshot)
+			result := evaluateServer(t, &snapshot)
 			allowed := findCIDRPrimitive(t, result.Direction(direction), "192.0.2.0/24", []string{"192.0.2.0/25"})
 			require.Equal(t, AccessAllowed, allowed.State)
 			require.Equal(t, []string{"TCP/80"}, permissionStrings(allowed.Permissions))
@@ -153,7 +153,7 @@ func TestCiliumCIDRDenyOverlapKeepsUniformPermissions(t *testing.T) {
       toPorts: [{ports: [{port: "80", protocol: TCP}]}]
 `, field, peer, field, peer)))
 
-			result := evaluateServer(t, snapshot)
+			result := evaluateServer(t, &snapshot)
 			broad := findCIDRPrimitive(t, result.Direction(direction), "192.0.2.0/24", nil)
 			require.Equal(t, AccessUnknown, broad.State)
 			require.Equal(t, []string{"TCP/90", "UDP/53"}, permissionStrings(broad.Permissions))
@@ -196,7 +196,7 @@ func TestCiliumCIDRDenyExclusionsAndProtocolIsolation(t *testing.T) {
     - %sCIDRSet: [%s]
       toPorts: [{ports: [{port: "80", protocol: %s}]}]
 `, field, peer, test.allowed, field, peer, test.denied, test.protocol)))
-				result := evaluateServer(t, snapshot)
+				result := evaluateServer(t, &snapshot)
 				primitive := findCIDRPrimitive(t, result.Direction(direction), "192.0.2.0/24", test.except)
 				require.Equal(t, AccessAllowed, primitive.State)
 				require.Equal(t, []string{"TCP/80"}, permissionStrings(primitive.Permissions))
@@ -215,13 +215,22 @@ func TestCiliumRejectsSupernetCIDRExclusions(t *testing.T) {
   %s:
     - %sCIDRSet: [{cidr: "192.0.0.0/24", except: ["192.0.0.0/16"]}]
 `, strings.ToLower(direction.String()), ciliumPeerPrefix(direction))))
-			result := evaluateServer(t, snapshot)
+			result := evaluateServer(t, &snapshot)
+			require.Contains(t, strings.Join(result.Warnings, "\n"),
+				"CiliumNetworkPolicy server/invalid-except: Cilium rejects this policy: spec: "+strings.ToLower(direction.String())+" allow rule 0:")
 			require.Contains(t, strings.Join(result.Warnings, "\n"), "is not inside")
 			require.Empty(t, result.Direction(direction).Primitives[PrimitiveCIDR])
 			for _, primitive := range result.Direction(direction).Primitives[PrimitivePod] {
+				// Cilium does not import a rejected policy, so the modeled
+				// permissions exclude it while the pair stays partial data.
 				require.Equal(t, AccessPartialData, primitive.State)
-				require.Empty(t, primitive.Permissions)
+				require.Equal(t, []string{"SCTP/all", "TCP/all", "UDP/all"}, permissionStrings(primitive.Permissions))
 			}
+			rule := findPolicyRule(t, result.Direction(direction), "invalid-except")
+			require.Contains(t, strings.Join(rule.Warnings, "\n"), "Cilium rejects this policy")
+			other := findPrimitive(t, result.Direction(opposite(direction)), PrimitivePod, "client", "client")
+			require.Equal(t, AccessAllowed, other.State, "the rejected policy has no rules in the other direction")
+			require.Empty(t, other.Warnings)
 		})
 	}
 }
@@ -269,7 +278,7 @@ spec:
   `+strings.ToLower(test.direction.String())+`:
     - `+test.rule))
 			}
-			result := evaluateServer(t, snapshot)
+			result := evaluateServer(t, &snapshot)
 			primitive := findPrimitive(t, result.Direction(test.direction), PrimitivePod, "client", "client")
 			require.Equal(t, AccessPartialData, primitive.State)
 			require.Contains(t, strings.Join(result.Warnings, "\n"), test.warning)
@@ -292,9 +301,16 @@ spec:
 				result, test.direction, rule.ID, sets.New(PrimitivePod),
 			))
 			require.Equal(t, AccessPartialData, row.EffectiveState)
-			for _, oppositePrimitive := range result.Direction(opposite(test.direction)).Primitives[PrimitivePod] {
-				require.Equal(t, AccessPartialData, oppositePrimitive.State, "normalization uncertainty is snapshot-wide")
+			// Uncertainty is scoped to pairs the uncertain rule could match:
+			// the opposite direction to the client is unaffected.
+			unaffected := findPrimitive(t, result.Direction(opposite(test.direction)), PrimitivePod, "client", "client")
+			require.Equal(t, AccessAllowed, unaffected.State, "normalization uncertainty is not snapshot-wide")
+			require.Empty(t, unaffected.Warnings)
+			reference := test.policyType.Kind() + " server/unsupported: "
+			if test.policyType == PolicyTypeCiliumClusterwideNetworkPolicy {
+				reference = test.policyType.Kind() + " unsupported: "
 			}
+			require.Contains(t, strings.Join(primitive.Warnings, "\n"), reference, "pair warnings name the uncertain policy")
 		})
 	}
 }
@@ -321,7 +337,7 @@ func TestCiliumUnknownPortDeniesDoNotProveAllows(t *testing.T) {
     - toPorts: [{ports: [{port: "http", protocol: TCP}]}]
 `, field, field)))
 
-			result := evaluateServer(t, snapshot)
+			result := evaluateServer(t, &snapshot)
 			primitive := findPrimitive(t, result.Direction(direction), PrimitivePod, "client", "client")
 			require.Equal(t, AccessUnknown, primitive.State)
 			require.False(t, knownPermissions(primitive.Permissions))
@@ -344,15 +360,18 @@ func TestCiliumProtocolWideDenyRemovesUnknownAllow(t *testing.T) {
   endpointSelector: {matchLabels: {role: server}}
   ingressDeny: [{fromEntities: [all]}]`))
 
-	result := evaluateServer(t, snapshot)
+	result := evaluateServer(t, &snapshot)
 	primitive := findPrimitive(t, result.Ingress, PrimitivePod, "client", "client")
 	require.Equal(t, AccessDisallowed, primitive.State)
 	require.Empty(t, primitive.Permissions)
 }
 
 func TestCiliumUnknownAnyProtocolPreservesProtocols(t *testing.T) {
-	ports, err := ciliumPort(ciliumPortProtocol{Port: "http", Protocol: "ANY"})
+	ports, note, warning, err := ciliumPort(ciliumPortProtocol{Port: "HTTP", Protocol: "ANY"}, false)
 	require.NoError(t, err)
+	require.Empty(t, note)
+	require.Empty(t, warning)
+	require.Equal(t, "http", ports[0].Port.StrVal, "Cilium lower-cases IANA service names")
 	permissions, known := permissionsForPorts(ports, nil)
 	require.False(t, known)
 	require.Len(t, permissions, 3)
@@ -382,7 +401,7 @@ func TestCiliumUnknownNamedRuleApplicability(t *testing.T) {
   endpointSelector: {matchLabels: {role: server}}
   %s: [{toPorts: [{ports: [{port: "http", protocol: TCP}]}]}]
 `, strings.ToLower(direction.String()))))
-				result := evaluateServer(t, snapshot)
+				result := evaluateServer(t, &snapshot)
 				primitive := findPrimitive(t, result.Direction(direction), PrimitivePod, "client", "client")
 				require.Equal(t, AccessUnknown, primitive.State)
 				rule := findPolicyRule(t, result.Direction(direction), "named-allow")
@@ -500,7 +519,7 @@ func TestCiliumSelectedRuleUncertaintyUsesOwnPorts(t *testing.T) {
 			addCiliumPolicy(&snapshot, PolicyTypeCiliumNetworkPolicy, ciliumTestPolicy(
 				t, PolicyTypeCiliumNetworkPolicy, "selected-ports", spec,
 			))
-			result := evaluateServer(t, snapshot)
+			result := evaluateServer(t, &snapshot)
 			require.Empty(t, result.Warnings)
 			primitive := findPrimitive(t, result.Ingress, PrimitivePod, "client", "client")
 			state := AccessUnknown
@@ -570,7 +589,7 @@ func TestCiliumSelectedRuleUncertaintyUsesOwnPairs(t *testing.T) {
     - toPorts: [{ports: [{port: "80", protocol: TCP}]}]
     - toPorts: [{ports: [{port: "dns", protocol: UDP}]}]
 `))
-	result := evaluateServer(t, snapshot)
+	result := evaluateServer(t, &snapshot)
 	primitive := findPrimitive(t, result.Ingress, PrimitiveNamespace, "", "client")
 	require.Equal(t, AccessPartial, primitive.State)
 	require.Len(t, primitive.PairDecisions, 2)
@@ -622,7 +641,7 @@ func TestCiliumSelectedCIDRRuleKeepsWholeRangeGuarantees(t *testing.T) {
 			addCiliumPolicy(&snapshot, PolicyTypeCiliumNetworkPolicy, ciliumTestPolicy(
 				t, PolicyTypeCiliumNetworkPolicy, "selected-cidr", spec,
 			))
-			result := evaluateServer(t, snapshot)
+			result := evaluateServer(t, &snapshot)
 			require.Empty(t, result.Warnings)
 			broad := findCIDRPrimitive(t, result.Egress, "203.0.113.0/24", nil)
 			narrow := findCIDRPrimitive(t, result.Egress, "203.0.113.128/25", nil)
@@ -823,14 +842,39 @@ func TestCustomPolicyConversionFailuresStayPartial(t *testing.T) {
 				object.Object["spec"] = true
 				addCiliumPolicy(&snapshot, policyType, object)
 			}
-			result := evaluateServer(t, snapshot)
+			result := evaluateServer(t, &snapshot)
 			require.Contains(t, strings.Join(result.Warnings, "\n"), "malformed")
 			require.Contains(t, strings.Join(result.Warnings, "\n"), "decode policy resource")
-			for _, direction := range []Direction{Ingress, Egress} {
-				for _, primitive := range result.Direction(direction).Primitives[PrimitivePod] {
-					require.Equal(t, AccessPartialData, primitive.State)
-					require.Equal(t, []string{"SCTP/all", "TCP/all", "UDP/all"}, permissionStrings(primitive.Permissions))
+			require.Contains(t, strings.Join(result.Warnings, "\n"), "the pods it selects cannot be determined")
+			client, err := NewEvaluator().EvaluateSubject(
+				SubjectRef{Kind: SubjectPod, Namespace: "client", Name: "client"}, snapshot, Options{},
+			)
+			require.NoError(t, err)
+			// A policy whose selection is unknown can affect any pod in its
+			// scope: the server namespace, or every namespace for a CCNP.
+			// Istio authorization only affects destination ingress.
+			clusterWide := policyType == PolicyTypeCiliumClusterwideNetworkPolicy
+			network := policyType != PolicyTypeIstioAuthorizationPolicy
+			for _, check := range []struct {
+				result    SubjectResult
+				direction Direction
+				peer      string
+				partial   bool
+			}{
+				{result, Ingress, "client", true},
+				{result, Ingress, "server", true},
+				{result, Egress, "client", network && !clusterWide || clusterWide},
+				{result, Egress, "server", true},
+				{client, Egress, "server", true},
+				{client, Ingress, "client", clusterWide},
+			} {
+				primitive := findPrimitive(t, check.result.Direction(check.direction), PrimitivePod, check.peer, check.peer)
+				want := AccessAllowed
+				if check.partial {
+					want = AccessPartialData
 				}
+				require.Equal(t, want, primitive.State, "%s %s %s", check.result.Subject.Ref.Name, check.direction, check.peer)
+				require.Equal(t, []string{"SCTP/all", "TCP/all", "UDP/all"}, permissionStrings(primitive.Permissions))
 			}
 		})
 	}
@@ -906,10 +950,10 @@ func addCiliumPolicy(snapshot *Snapshot, policyType PolicyType, object unstructu
 	}
 }
 
-func evaluateServer(t *testing.T, snapshot Snapshot) SubjectResult {
+func evaluateServer(t *testing.T, snapshot *Snapshot) SubjectResult {
 	t.Helper()
 	result, err := NewEvaluator().EvaluateSubject(
-		SubjectRef{Kind: SubjectPod, Namespace: "server", Name: "server"}, snapshot, Options{},
+		SubjectRef{Kind: SubjectPod, Namespace: "server", Name: "server"}, *snapshot, Options{},
 	)
 	require.NoError(t, err)
 	return result
@@ -918,9 +962,9 @@ func evaluateServer(t *testing.T, snapshot Snapshot) SubjectResult {
 func findCIDRPrimitive(t *testing.T, result DirectionResult, cidr string, except []string) PrimitiveResult {
 	t.Helper()
 	id := PrimitiveRef{Kind: PrimitiveCIDR, CIDR: cidr, CIDRExcept: except}.ID()
-	for _, primitive := range result.Primitives[PrimitiveCIDR] {
-		if primitive.Ref.ID() == id {
-			return primitive
+	for index := range result.Primitives[PrimitiveCIDR] {
+		if result.Primitives[PrimitiveCIDR][index].Ref.ID() == id {
+			return result.Primitives[PrimitiveCIDR][index]
 		}
 	}
 	require.FailNow(t, "CIDR primitive not found", "%s except %v", cidr, except)
@@ -929,9 +973,9 @@ func findCIDRPrimitive(t *testing.T, result DirectionResult, cidr string, except
 
 func findCIDRApplicability(t *testing.T, rows []ApplicabilityRow, id string) ApplicabilityRow {
 	t.Helper()
-	for _, row := range rows {
-		if row.Primitive.Ref.ID() == id {
-			return row
+	for index := range rows {
+		if rows[index].Primitive.Ref.ID() == id {
+			return rows[index]
 		}
 	}
 	require.FailNow(t, "CIDR applicability not found", "%s", id)

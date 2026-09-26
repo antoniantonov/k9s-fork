@@ -713,15 +713,33 @@ func orDefaultColor(color config.Color, fallback tcell.Color) tcell.Color {
 	return color.Color()
 }
 
+// formatRuleName renders a rule's identity. Multi-spec Cilium rules add
+// their spec entry and non-allow rules add their action, so an allow and a
+// deny at the same index, or rules from different specs, never share a label.
 func formatRuleName(rule *netpol.RuleResult) string {
+	if rule.ID.PolicyName == "" {
+		return fmt.Sprintf("%s #%d", syntheticRuleName(rule.ID.SyntheticKind), rule.ID.Index)
+	}
 	name := rule.ID.PolicyName
 	if rule.ID.PolicyNamespace != "" {
 		name = rule.ID.PolicyNamespace + "/" + name
 	}
-	if name == "" {
-		name = valueOrDash(rule.ID.SyntheticKind)
+	if rule.PolicySpecCount > 1 && rule.PolicySpec != "" {
+		name += " " + rule.PolicySpec
+	}
+	if action := rule.ID.Action; action != "" && action != netpol.PolicyActionAllow {
+		name += " " + action.String()
 	}
 	return fmt.Sprintf("%s #%d", name, rule.ID.Index)
+}
+
+// syntheticRuleName labels synthetic rules. The authorization default deny
+// only covers TCP, so its label says so.
+func syntheticRuleName(kind string) string {
+	if kind == netpol.SyntheticAuthorizationDefaultDeny {
+		return "authorization default-deny (TCP)"
+	}
+	return valueOrDash(kind)
 }
 
 func formatPrimitiveName(ref *netpol.PrimitiveRef) string {
@@ -1028,13 +1046,19 @@ func colorName(color tcell.Color) string {
 func RuleDetailsText(rule netpol.RuleResult) string {
 	var b strings.Builder
 	state, label := ruleState(&rule)
-	fmt.Fprintf(&b, "Policy: %s/%s\nPolicy type: %s\nPolicy API version: %s\nPolicy UID: %s\nDirection: %s\nAction: %s\nRule index: %d\nState: %s (%s)\nPolicy pod selector: %s\nSubjects: %d/%d\nPeers:\n",
+	fmt.Fprintf(&b, "Policy: %s/%s\nPolicy type: %s\nPolicy API version: %s\n",
 		valueOrDash(rule.ID.PolicyNamespace), valueOrDash(rule.ID.PolicyName),
-		rule.ID.SourceType().Kind(), valueOrDash(rule.ID.PolicyVersion),
-		valueOrDash(string(rule.ID.PolicyUID)),
-		rule.ID.Direction, rule.ID.Action.String(),
-		rule.ID.Index, state, label, valueOrDash(rule.PolicySelector),
-		rule.SubjectMatchCount, rule.SubjectPodCount)
+		rule.ID.SourceType().Kind(), valueOrDash(rule.ID.PolicyVersion))
+	fmt.Fprintf(&b, "Policy UID: %s\nDirection: %s\nAction: %s\nRule index: %d",
+		valueOrDash(string(rule.ID.PolicyUID)), rule.ID.Direction, rule.ID.Action.String(), rule.ID.Index)
+	// The Cilium spec entry shares the rule index line so the identity stays
+	// visible in the short detail pane.
+	if rule.PolicySpec != "" {
+		fmt.Fprintf(&b, " in %s (spec index %d)", rule.PolicySpec, rule.ID.PolicySpecIndex)
+	}
+	fmt.Fprintf(&b, "\nState: %s (%s)\n", state, label)
+	fmt.Fprintf(&b, "Policy pod selector: %s\nSubjects: %d/%d\nPeers:\n",
+		valueOrDash(rule.PolicySelector), rule.SubjectMatchCount, rule.SubjectPodCount)
 	if len(rule.Peers) == 0 {
 		fmt.Fprintf(&b, "  - %s\n", valueOrDash(rule.PeerSummary))
 	}

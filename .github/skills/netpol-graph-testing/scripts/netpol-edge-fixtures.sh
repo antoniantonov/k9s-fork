@@ -3,30 +3,63 @@
 # Copyright Authors of K9s
 
 # Sourced by the demo entry point; all Kubernetes access uses its explicit
-# KUBECTL array. Probe policies are opt-in because uncertainty is snapshot-wide.
+# KUBECTL array. Uncertainty is scoped to the pairs a policy can affect, so the
+# ordinary topology may contain uncertain rules; the identity and unsupported
+# probes stay opt-in so their suites prove scoping against a fixed topology.
+#
+# The source and destination namespaces are enrolled in the Istio ambient mesh
+# (istio.io/dataplane-mode=ambient). AuthorizationPolicy only applies to mesh
+# workloads, so the fixtures also carry an opted-out pod and a pod whose stale
+# sidecar status annotation makes its enrollment unknown.
 
+# Columns: namespace, pod, app label, netpol-role label, mesh fixture. The mesh
+# fixture is "-" (inherits the namespace), "opt-out" (istio.io/dataplane-mode
+# =none) or "stale-sidecar" (sidecar.istio.io/status without istio-proxy).
 edge_pods() {
   cat <<PODS
-$NS_EDGE_SRC cnp-client cnp-client allowed
-$NS_EDGE_SRC cnp-blocked cnp-client blocked
-$NS_EDGE_SRC ccnp-client ccnp-client allowed
-$NS_EDGE_SRC cnp-empty cnp-empty empty
-$NS_EDGE_SRC ccnp-empty ccnp-empty empty
-$NS_EDGE_SRC cidr-client cidr-client allowed
-$NS_EDGE_SRC authz-client authz-client allowed
-$NS_EDGE_SRC uncertain-client uncertain-client probe
-$NS_EDGE_DST cnp-server cnp-server allowed
-$NS_EDGE_DST cnp-denied cnp-server egress-denied
-$NS_EDGE_DST cnp-mismatch cnp-mismatch mismatch
-$NS_EDGE_DST ccnp-server ccnp-server allowed
-$NS_EDGE_DST ccnp-denied ccnp-server egress-denied
-$NS_EDGE_DST authz-server authz-server allowed
-$NS_EDGE_DST authz-no-tcp authz-no-tcp restricted
-$NS_EDGE_DST authz-closed authz-closed restricted
-$NS_EDGE_DST authz-identity authz-identity probe
-$NS_EDGE_OTHER control control control
+$NS_EDGE_SRC cnp-client cnp-client allowed -
+$NS_EDGE_SRC cnp-blocked cnp-client blocked -
+$NS_EDGE_SRC ccnp-client ccnp-client allowed -
+$NS_EDGE_SRC cnp-empty cnp-empty empty -
+$NS_EDGE_SRC ccnp-empty ccnp-empty empty -
+$NS_EDGE_SRC cidr-client cidr-client allowed -
+$NS_EDGE_SRC authz-client authz-client allowed -
+$NS_EDGE_SRC uncertain-client uncertain-client probe -
+$NS_EDGE_DST cnp-server cnp-server allowed -
+$NS_EDGE_DST cnp-denied cnp-server egress-denied -
+$NS_EDGE_DST cnp-mismatch cnp-mismatch mismatch -
+$NS_EDGE_DST ccnp-server ccnp-server allowed -
+$NS_EDGE_DST ccnp-denied ccnp-server egress-denied -
+$NS_EDGE_DST authz-server authz-server allowed -
+$NS_EDGE_DST authz-no-tcp authz-no-tcp restricted -
+$NS_EDGE_DST authz-closed authz-closed restricted -
+$NS_EDGE_DST authz-identity authz-identity probe -
+$NS_EDGE_DST authz-unenrolled authz-unenrolled restricted opt-out
+$NS_EDGE_DST authz-unknown authz-unknown restricted stale-sidecar
+$NS_EDGE_DST l7-server l7-server l7 -
+$NS_EDGE_OTHER control control control -
 PODS
 }
+
+# edge_namespace_mesh prints the dataplane mode label of a fixture namespace.
+edge_namespace_mesh() {
+  case "$1" in
+    source|destination) printf 'ambient' ;;
+  esac
+}
+
+# edge_pod_mesh prints the expected dataplane label and sidecar status of a
+# fixture pod, separated by "|".
+edge_pod_mesh() {
+  case "$1" in
+    opt-out) printf 'none|' ;;
+    stale-sidecar) printf '|%s' "$EDGE_STALE_SIDECAR_STATUS" ;;
+    *) printf '|' ;;
+  esac
+}
+
+EDGE_STALE_SIDECAR_STATUS='{"containers":["istio-proxy"]}'
+
 
 check_resource_value() {
   local description="$1" expected="$2" actual
@@ -185,7 +218,7 @@ JSON
   "egress": [{
     "to": [{
       "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "$NS_EDGE_DST"}},
-      "podSelector": {"matchExpressions": [{"key": "app", "operator": "In", "values": ["authz-server", "authz-no-tcp", "authz-closed", "authz-identity"]}]}
+      "podSelector": {"matchExpressions": [{"key": "app", "operator": "In", "values": ["authz-server", "authz-no-tcp", "authz-closed", "authz-identity", "authz-unenrolled", "authz-unknown"]}]}
     }], $ports
   }]
 }
@@ -193,7 +226,7 @@ JSON
 )" || return 1
   edge_policy networkpolicies.networking.k8s.io NetworkPolicy networking.k8s.io/v1 "$NS_EDGE_DST" authz-target-network "$(cat <<JSON
 "spec": {
-  "podSelector": {"matchExpressions": [{"key": "app", "operator": "In", "values": ["authz-server", "authz-no-tcp", "authz-identity"]}]}, "policyTypes": ["Ingress"],
+  "podSelector": {"matchExpressions": [{"key": "app", "operator": "In", "values": ["authz-server", "authz-no-tcp", "authz-identity", "authz-unenrolled", "authz-unknown"]}]}, "policyTypes": ["Ingress"],
   "ingress": [{
     "from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "$NS_EDGE_SRC"}}, "podSelector": {"matchLabels": {"app": "authz-client"}}}],
     $ports
@@ -220,7 +253,24 @@ JSON
   edge_policy authorizationpolicies.security.istio.io AuthorizationPolicy security.istio.io/v1 "$NS_EDGE_DST" authz-closed \
     '"spec": {"selector": {"matchLabels": {"app": "authz-closed"}}, "action": "ALLOW", "rules": []}' || return 1
   edge_policy authorizationpolicies.security.istio.io AuthorizationPolicy security.istio.io/v1 "$NS_EDGE_SRC" authz-client-ingress-deny \
-    '"spec": {"selector": {"matchLabels": {"app": "authz-client"}}, "action": "DENY", "rules": [{}]}'
+    '"spec": {"selector": {"matchLabels": {"app": "authz-client"}}, "action": "DENY", "rules": [{}]}' || return 1
+  # Not enforced: the selected pod opts out of the mesh.
+  edge_policy authorizationpolicies.security.istio.io AuthorizationPolicy security.istio.io/v1 "$NS_EDGE_DST" authz-unenrolled \
+    '"spec": {"selector": {"matchLabels": {"app": "authz-unenrolled"}}, "action": "ALLOW", "rules": []}' || return 1
+  # Enforcement is uncertain: the selected pod has a stale sidecar status.
+  edge_policy authorizationpolicies.security.istio.io AuthorizationPolicy security.istio.io/v1 "$NS_EDGE_DST" authz-unknown \
+    '"spec": {"selector": {"matchLabels": {"app": "authz-unknown"}}, "action": "ALLOW", "rules": [{"to": [{"operation": {"ports": ["8080"]}}]}]}' || return 1
+  # An ordinary uncertain rule: only pairs it can match become Partial Data.
+  edge_policy ciliumnetworkpolicies.cilium.io CiliumNetworkPolicy cilium.io/v2 "$NS_EDGE_DST" cnp-l7 "$(cat <<JSON
+"spec": {
+  "endpointSelector": {"matchLabels": {"k8s:app": "l7-server"}},
+  "ingress": [{
+    "fromEndpoints": [{"matchLabels": {"k8s:app": "control", "k8s:io.kubernetes.pod.namespace": "$NS_EDGE_OTHER"}}],
+    "toPorts": [{"ports": [{"port": "8080", "protocol": "TCP"}], "rules": {"http": [{"method": "GET"}]}}]
+  }]
+}
+JSON
+)"
 }
 
 edge_probe_policy() {
@@ -244,21 +294,21 @@ JSON
 }
 
 check_edge_fixtures() {
-  local failures=0 namespace side name app role
+  local failures=0 namespace side name app role mesh
   for side in source destination other; do
     case "$side" in
       source) namespace="$NS_EDGE_SRC" ;;
       destination) namespace="$NS_EDGE_DST" ;;
       other) namespace="$NS_EDGE_OTHER" ;;
     esac
-    check_resource_value "scenario namespace $namespace labels" "$PREFIX|$EDGE_SCENARIO|$side" \
+    check_resource_value "scenario namespace $namespace labels" "$PREFIX|$EDGE_SCENARIO|$side|$(edge_namespace_mesh "$side")" \
       "${KUBECTL[@]}" get namespace "$namespace" \
-      -o jsonpath='{.metadata.labels.netpol-demo-prefix}{"|"}{.metadata.labels.netpol-scenario}{"|"}{.metadata.labels.netpol-side}' || failures=$((failures + 1))
+      -o jsonpath='{.metadata.labels.netpol-demo-prefix}{"|"}{.metadata.labels.netpol-scenario}{"|"}{.metadata.labels.netpol-side}{"|"}{.metadata.labels.istio\.io/dataplane-mode}' || failures=$((failures + 1))
   done
-  while read -r namespace name app role; do
-    check_resource_value "scenario pod $namespace/$name labels and readiness" "$PREFIX|$app|$role|True" \
+  while read -r namespace name app role mesh; do
+    check_resource_value "scenario pod $namespace/$name labels, mesh fixture and readiness" "$PREFIX|$app|$role|$(edge_pod_mesh "$mesh")|True" \
       "${KUBECTL[@]}" get pod -n "$namespace" "$name" \
-      -o jsonpath='{.metadata.labels.netpol-demo-prefix}{"|"}{.metadata.labels.app}{"|"}{.metadata.labels.netpol-role}{"|"}{.status.conditions[?(@.type=="Ready")].status}' || failures=$((failures + 1))
+      -o jsonpath='{.metadata.labels.netpol-demo-prefix}{"|"}{.metadata.labels.app}{"|"}{.metadata.labels.netpol-role}{"|"}{.metadata.labels.istio\.io/dataplane-mode}{"|"}{.metadata.annotations.sidecar\.istio\.io/status}{"|"}{.status.conditions[?(@.type=="Ready")].status}' || failures=$((failures + 1))
   done < <(edge_pods)
   EDGE_MODE=check edge_policies || failures=$((failures + 1))
   for namespace in "$NS_EDGE_SRC" "$NS_EDGE_DST"; do
@@ -270,22 +320,31 @@ check_edge_fixtures() {
 }
 
 apply_edge_fixtures() {
-  local namespace side name app role
+  local namespace side name app role mesh mode labels annotations
   for side in source destination other; do
     case "$side" in
       source) namespace="$NS_EDGE_SRC" ;;
       destination) namespace="$NS_EDGE_DST" ;;
       other) namespace="$NS_EDGE_OTHER" ;;
     esac
+    labels=""
+    mode="$(edge_namespace_mesh "$side")"
+    [[ -n "$mode" ]] && labels=",\"istio.io/dataplane-mode\":\"$mode\""
     "${KUBECTL[@]}" apply -f - <<JSON
-{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"$namespace","labels":{"netpol-demo":"true","netpol-demo-prefix":"$PREFIX","netpol-scenario":"$EDGE_SCENARIO","netpol-side":"$side"}}}
+{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"$namespace","labels":{"netpol-demo":"true","netpol-demo-prefix":"$PREFIX","netpol-scenario":"$EDGE_SCENARIO","netpol-side":"$side"$labels}}}
 JSON
   done
-  while read -r namespace name app role; do
+  while read -r namespace name app role mesh; do
+    labels=""
+    annotations="{}"
+    case "$mesh" in
+      opt-out) labels=',"istio.io/dataplane-mode":"none"' ;;
+      stale-sidecar) annotations="{\"sidecar.istio.io/status\":$(printf '%s' "$EDGE_STALE_SIDECAR_STATUS" | sed 's/"/\\"/g; s/^/"/; s/$/"/')}" ;;
+    esac
     "${KUBECTL[@]}" apply -f - <<JSON
 {
   "apiVersion":"v1","kind":"Pod",
-  "metadata":{"name":"$name","namespace":"$namespace","labels":{"netpol-demo-prefix":"$PREFIX","app":"$app","netpol-role":"$role"}},
+  "metadata":{"name":"$name","namespace":"$namespace","annotations":$annotations,"labels":{"netpol-demo-prefix":"$PREFIX","app":"$app","netpol-role":"$role"$labels}},
   "spec":{"containers":[{"name":"idle","image":"$IMAGE","imagePullPolicy":"IfNotPresent","command":["sh","-c","while true; do sleep 3600; done"],"resources":{"requests":{"cpu":"5m","memory":"8Mi"}}}]}
 }
 JSON

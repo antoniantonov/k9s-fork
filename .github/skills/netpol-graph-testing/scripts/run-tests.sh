@@ -274,9 +274,23 @@ phase_go_tests() {
   go test -race ./internal/model/ -run 'NetPolGraph|NetworkPolicyGraph' || return 1
 }
 
+# coverage_base defaults to origin/master: a local master branch is often
+# stale and would attribute upstream merges to the branch under test.
+coverage_base() {
+  if [[ -n "${DIFF_COVER_BASE:-}" ]]; then
+    printf '%s\n' "$DIFF_COVER_BASE"
+  elif git -C "$REPO_ROOT" rev-parse --verify --quiet origin/master >/dev/null; then
+    printf 'origin/master\n'
+  else
+    printf 'master\n'
+  fi
+}
+
 phase_coverage() {
   local profile="$RUN_DIR/diff-coverage.out"
-  local base="${DIFF_COVER_BASE:-master}"
+  local base
+  base="$(coverage_base)"
+  echo "diff coverage base: $base"
   cd "$REPO_ROOT"
   go test \
     -coverpkg=./internal/netpol,./internal/model,./internal/ui,./internal/view,./internal/client,./.github/skills/netpol-graph-testing/diffcover \
@@ -287,7 +301,11 @@ phase_coverage() {
     --base "$base" \
     --profile "$profile" \
     --threshold 80 \
-    --file-threshold internal/netpol/policy.go=80
+    --file-threshold internal/netpol/policy.go=80 \
+    --file-threshold internal/netpol/policy_cilium.go=80 \
+    --file-threshold internal/netpol/policy_istio.go=80 \
+    --file-threshold internal/netpol/mesh.go=80 \
+    --file-threshold internal/netpol/selection.go=80
 }
 
 resolve_test_image() {

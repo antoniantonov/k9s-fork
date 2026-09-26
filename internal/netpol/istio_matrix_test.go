@@ -197,27 +197,36 @@ func TestIstioAuthorizationRootAndWorkloadScope(t *testing.T) {
 
 func TestIstioSourceIdentityAndIPBoundaries(t *testing.T) {
 	tests := []struct {
-		name    string
-		source  string
-		matches bool
-		warning string
+		name        string
+		source      string
+		matches     bool
+		warning     string
+		cidrWarning string
 	}{
-		{"ipv4-source", `ipBlocks: ["192.0.2.0/24"]`, true, ""},
-		{"ipv6-source", `ipBlocks: ["2001:db8::/64"]`, true, ""},
-		{"unmatched-address", `ipBlocks: ["198.51.100.0/24"]`, false, ""},
-		{"namespace", `namespaces: [client]`, true, "mTLS identity"},
-		{"namespace-negative", `namespaces: [client], notNamespaces: [client]`, false, "mTLS identity"},
-		{"principal-prefix", `principals: ["cluster.local/ns/client/sa/*"]`, true, "mTLS identity"},
-		{"principal-negative", `notPrincipals: ["cluster.local/ns/client/sa/caller"]`, false, "mTLS identity"},
-		{"service-account-qualified", `serviceAccounts: ["client/caller"]`, true, "mTLS identity"},
-		{"service-account-policy-relative", `serviceAccounts: [caller]`, false, "mTLS identity"},
-		{"service-account-negative", `notServiceAccounts: ["client/caller"]`, false, "mTLS identity"},
-		{"trust-domain", `trustDomains: [cluster.local]`, true, "mTLS identity"},
-		{"trust-domain-negative", `notTrustDomains: [cluster.local]`, false, "mTLS identity"},
-		{"address-and-identity", `ipBlocks: ["192.0.2.0/24"], namespaces: [client]`, true, "CIDR applicability"},
-		{"jwt-unsupported", `requestPrincipals: ["issuer/user"]`, false, "JWT request identity"},
-		{"forwarded-ip-unsupported", `remoteIpBlocks: ["192.0.2.0/24"]`, false, "proxy forwarding"},
-		{"negative-ip-unsupported", `notIpBlocks: ["198.51.100.0/24"]`, false, "notIpBlocks"},
+		{name: "ipv4-source", source: `ipBlocks: ["192.0.2.0/24"]`, matches: true},
+		{name: "ipv6-source", source: `ipBlocks: ["2001:db8::/64"]`, matches: true},
+		{name: "unmatched-address", source: `ipBlocks: ["198.51.100.0/24"]`},
+		// Identity constraints are evaluated from workload metadata for enrolled
+		// sources; the approximation is a rule note, not partial data.
+		{name: "namespace", source: `namespaces: [client]`, matches: true},
+		{name: "namespace-list", source: `namespaces: ["prod-*", client]`, matches: true},
+		{name: "namespace-negative", source: `namespaces: [client], notNamespaces: [client]`},
+		{name: "namespace-negative-list", source: `notNamespaces: ["kube-*", client]`},
+		{name: "principal-prefix", source: `principals: ["cluster.local/ns/client/sa/*"]`, matches: true},
+		{name: "principal-list", source: `principals: ["*/sa/other", "cluster.local/ns/client/sa/caller"]`, matches: true},
+		{name: "principal-negative", source: `notPrincipals: ["cluster.local/ns/client/sa/caller"]`},
+		{name: "service-account-qualified", source: `serviceAccounts: ["client/caller"]`, matches: true},
+		{name: "service-account-policy-relative", source: `serviceAccounts: [caller]`},
+		{name: "service-account-negative", source: `notServiceAccounts: ["client/caller"]`},
+		{name: "trust-domain", source: `trustDomains: [cluster.local]`, matches: true},
+		{name: "trust-domain-negative", source: `notTrustDomains: [cluster.local]`},
+		{
+			name: "address-and-identity", source: `ipBlocks: ["192.0.2.0/24"], namespaces: [client]`, matches: true,
+			cidrWarning: "cannot prove identity constraints ANDed with ipBlocks",
+		},
+		{name: "jwt-unsupported", source: `requestPrincipals: ["issuer/user"]`, warning: "JWT request identity"},
+		{name: "forwarded-ip-unsupported", source: `remoteIpBlocks: ["192.0.2.0/24"]`, warning: "proxy forwarding"},
+		{name: "negative-ip-unsupported", source: `notIpBlocks: ["198.51.100.0/24"]`, warning: "notIpBlocks"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -252,26 +261,76 @@ func TestIstioSourceIdentityAndIPBoundaries(t *testing.T) {
 						require.Contains(t, strings.Join(result.Warnings, "\n"), test.warning)
 						require.Contains(t, strings.Join(primitive.Warnings, "\n"), test.warning)
 					} else {
-						require.Empty(t, result.Warnings)
+						require.Empty(t, primitive.Warnings)
 					}
 					require.Equal(t, wantState, primitive.State)
-					if side.direction == Ingress {
-						rule := findPolicyRule(t, result.Ingress, "source-constraints")
-						row := findApplicability(t, NewEvaluator().RuleApplicability(
-							result, Ingress, rule.ID, sets.New(PrimitivePod),
-						))
-						require.Equal(t, test.matches, row.PeerMatches)
-						if test.warning != "" {
-							require.Equal(t, AccessPartialData, row.EffectiveState)
-						}
-						if test.name == "address-and-identity" {
-							cidr := findCIDRPrimitive(t, result.Ingress, "192.0.2.0/24", nil)
-							require.Equal(t, AccessPartialData, cidr.State)
-							require.NotContains(t, permissionStrings(cidr.Permissions), "TCP/8080",
-								"an address-only peer cannot prove the ANDed identity")
-						}
+					if side.direction != Ingress {
+						return
+					}
+					rule := findPolicyRule(t, result.Ingress, "source-constraints")
+					row := findApplicability(t, NewEvaluator().RuleApplicability(
+						result, Ingress, rule.ID, sets.New(PrimitivePod),
+					))
+					require.Equal(t, test.matches, row.PeerMatches)
+					switch {
+					case test.warning != "":
+						require.Equal(t, AccessPartialData, row.EffectiveState)
+					case test.matches:
+						require.Equal(t, AccessAllowed, row.EffectiveState)
+					default:
+						require.Equal(t, AccessDisallowed, row.EffectiveState)
+					}
+					identity := false
+					for _, field := range []string{"namespaces", "otNamespaces", "principals: ", "otPrincipals", "erviceAccounts", "rustDomains"} {
+						identity = identity || strings.Contains(test.source, field)
+					}
+					if identity {
+						require.Contains(t, strings.Join(rule.Notes, "\n"), "mesh mTLS")
+					} else {
+						require.NotContains(t, strings.Join(rule.Notes, "\n"), "mesh mTLS")
+					}
+					if test.cidrWarning != "" {
+						cidr := findCIDRPrimitive(t, result.Ingress, "192.0.2.0/24", nil)
+						require.Equal(t, AccessPartialData, cidr.State)
+						require.Contains(t, strings.Join(cidr.Warnings, "\n"), test.cidrWarning)
+						require.NotContains(t, permissionStrings(cidr.Permissions), "TCP/8080",
+							"an address-only peer cannot prove the ANDed identity")
+						require.Contains(t, strings.Join(result.Warnings, "\n"), test.cidrWarning)
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestIstioIdentityConstraintsNeedMeshSources(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		annotation map[string]string
+		labels     map[string]string
+		want       AccessState
+		ports      []string
+	}{
+		{name: "enrolled", labels: map[string]string{istioDataplaneModeLabel: "ambient"}, want: AccessAllowed, ports: []string{"SCTP/9000", "TCP/8080", "UDP/5353"}},
+		{name: "outside-mesh", want: AccessAllowed, ports: []string{"SCTP/9000", "UDP/5353"}},
+		{name: "unknown", annotation: map[string]string{istioSidecarStatusAnnotation: "{}"}, want: AccessPartialData, ports: []string{"SCTP/9000", "UDP/5353"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := istioTransportSnapshot()
+			snapshot.Namespaces[0].Labels = map[string]string{"team": "client"}
+			snapshot.Pods[0].Labels[istioDataplaneModeLabel] = test.labels[istioDataplaneModeLabel]
+			snapshot.Pods[0].Annotations = test.annotation
+			snapshot.IstioAuthorizationPolicies = []unstructured.Unstructured{
+				istioTestPolicy(t, "server", "identity", "server", "ALLOW",
+					`[{from: [{source: {namespaces: [client]}}], to: [{operation: {ports: ["8080"]}}]}]`),
+			}
+			result := evaluateServer(t, &snapshot)
+			primitive := findPrimitive(t, result.Ingress, PrimitivePod, "client", "client")
+			require.Equal(t, test.want, primitive.State)
+			require.Equal(t, test.ports, permissionStrings(primitive.Permissions))
+			if test.want == AccessPartialData {
+				require.Contains(t, strings.Join(primitive.Warnings, "\n"),
+					"AuthorizationPolicy server/identity: ingress allow rule 0: identity constraints cannot be evaluated because the Istio mesh enrollment of pod client/client is unknown")
 			}
 		})
 	}

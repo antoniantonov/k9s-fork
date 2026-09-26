@@ -18,22 +18,27 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-type engine struct{}
+type engine struct {
+	cache *normalizationCache
+}
 
 const (
-	syntheticDefaultDeny  = "default-deny"
-	syntheticUnrestricted = "unrestricted"
+	syntheticDefaultDeny  = SyntheticDefaultDeny
+	syntheticUnrestricted = SyntheticUnrestricted
 	cidrPartialDeny       = "CIDR partially overlaps an explicit deny; listed known permissions apply throughout the range, but other ports may vary by address"
 )
 
-// NewEvaluator returns a stateless NetworkPolicy evaluator.
+// NewEvaluator returns a NetworkPolicy evaluator. It keeps no evaluation
+// state between calls apart from a cache of normalized policies.
 func NewEvaluator() Evaluator {
-	return &engine{}
+	return &engine{cache: newNormalizationCache()}
 }
 
 //nolint:gocritic // Snapshot is part of the public Evaluator contract.
 func (e *engine) EvaluateSubject(ref SubjectRef, snapshot Snapshot, options Options) (SubjectResult, error) {
-	x := newSnapshotIndex(&snapshot)
+	e.cache.begin()
+	x := buildSnapshotIndex(&snapshot, e.cache)
+	e.cache.sweep()
 	subject, warnings, err := x.resolveSubject(ref)
 	if err != nil {
 		return SubjectResult{}, err
@@ -46,13 +51,17 @@ func (e *engine) EvaluateSubject(ref SubjectRef, snapshot Snapshot, options Opti
 	result := SubjectResult{
 		Subject:     subject,
 		GeneratedAt: generatedAt,
-		Warnings:    uniqueStrings(warnings),
+		Notes:       uniqueStrings(snapshot.Notes),
 		ResultLimit: options.Limit(),
 	}
 	ingressBudget := newDirectionBudget(result.ResultLimit)
 	egressBudget := newDirectionBudget(result.ResultLimit)
 	result.Ingress = e.evaluateDirection(x, &subject, Ingress, ingressBudget)
 	result.Egress = e.evaluateDirection(x, &subject, Egress, egressBudget)
+	// Only uncertainty that affected an evaluated pair of this subject is
+	// reported; unrelated uncertain policies leave the subject definitive.
+	warnings = append(warnings, x.uncertaintyWarnings()...)
+	result.Warnings = uniqueStrings(warnings)
 	result.Truncated = ingressBudget.truncated || egressBudget.truncated
 	if result.Truncated {
 		result.Warnings = uniqueStrings(append(result.Warnings, fmt.Sprintf("results truncated at limit %d per direction", result.ResultLimit)))
@@ -217,13 +226,14 @@ func (b *directionBudget) takeCandidate() bool {
 func (e *engine) evaluateDirection(x *snapshotIndex, subject *Subject, direction Direction, budget *directionBudget) DirectionResult {
 	result := DirectionResult{Primitives: map[PrimitiveKind][]PrimitiveResult{}}
 	pods := sortedPods(x.pods)
+	rules := newRuleAccumulator(direction)
 
 	cidrRefs := cidrPrimitives(x, subject, direction)
 	for index := range cidrRefs {
 		if !budget.takeCandidate() {
 			break
 		}
-		primitive, truncated := e.evaluateCIDRPrimitive(x, subject, direction, &cidrRefs[index], budget)
+		primitive, truncated := e.evaluateCIDRPrimitive(x, subject, direction, &cidrRefs[index], budget, rules)
 		budget.truncated = budget.truncated || truncated
 		result.Primitives[PrimitiveCIDR] = append(result.Primitives[PrimitiveCIDR], primitive)
 	}
@@ -233,7 +243,7 @@ func (e *engine) evaluateDirection(x *snapshotIndex, subject *Subject, direction
 		}
 		primitive, truncated := e.evaluatePodPrimitive(x, subject, direction, &PrimitiveRef{
 			Kind: PrimitivePod, Namespace: p.Namespace, Name: p.Name, UID: p.UID,
-		}, []*corev1.Pod{p}, nil, false, budget)
+		}, []*corev1.Pod{p}, nil, false, budget, rules)
 		budget.truncated = budget.truncated || truncated
 		result.Primitives[PrimitivePod] = append(result.Primitives[PrimitivePod], primitive)
 	}
@@ -249,7 +259,7 @@ func (e *engine) evaluateDirection(x *snapshotIndex, subject *Subject, direction
 		}
 		primitive, truncated := e.evaluatePodPrimitive(x, subject, direction, &PrimitiveRef{
 			Kind: PrimitiveNamespace, Name: ns.Name, UID: ns.UID,
-		}, members, nil, false, budget)
+		}, members, nil, false, budget, nil)
 		budget.truncated = budget.truncated || truncated
 		result.Primitives[PrimitiveNamespace] = append(result.Primitives[PrimitiveNamespace], primitive)
 	}
@@ -267,7 +277,7 @@ func (e *engine) evaluateDirection(x *snapshotIndex, subject *Subject, direction
 		}
 		primitive, truncated := e.evaluatePodPrimitive(x, subject, direction, &PrimitiveRef{
 			Kind: PrimitiveDeployment, Namespace: deployment.Namespace, Name: deployment.Name, UID: deployment.UID,
-		}, members, warnings, fallback, budget)
+		}, members, warnings, fallback, budget, nil)
 		budget.truncated = budget.truncated || truncated
 		result.Primitives[PrimitiveDeployment] = append(result.Primitives[PrimitiveDeployment], primitive)
 	}
@@ -282,14 +292,17 @@ func (e *engine) evaluateDirection(x *snapshotIndex, subject *Subject, direction
 		}
 		primitive, truncated := e.evaluatePodPrimitive(x, subject, direction, &PrimitiveRef{
 			Kind: PrimitiveJob, Namespace: job.Namespace, Name: job.Name, UID: job.UID,
-		}, members, warnings, fallback, budget)
+		}, members, warnings, fallback, budget, nil)
 		budget.truncated = budget.truncated || truncated
 		result.Primitives[PrimitiveJob] = append(result.Primitives[PrimitiveJob], primitive)
 	}
-	result.Rules = e.buildRules(x, subject, direction, result.Primitives)
+	result.Rules = e.buildRules(x, subject, direction, rules)
 	return result
 }
 
+// evaluatePodPrimitive aggregates the pairs between the subject pods and the
+// primitive's pods. Only pod primitives feed the rule accumulator: namespace
+// and workload primitives repeat the same pairs.
 func (e *engine) evaluatePodPrimitive(
 	x *snapshotIndex,
 	subject *Subject,
@@ -299,9 +312,11 @@ func (e *engine) evaluatePodPrimitive(
 	warnings []string,
 	uncertain bool,
 	budget *directionBudget,
+	rules *ruleAccumulator,
 ) (PrimitiveResult, bool) {
 	result := PrimitiveResult{Ref: *ref, Warnings: slices.Clone(warnings)}
 	var permissions []PortPermission
+	var evidence evidenceSet
 	truncated := false
 	for _, subjectRef := range subject.Pods {
 		subjectPod := x.pods[key(subjectRef.Namespace, subjectRef.Name)]
@@ -319,7 +334,8 @@ func (e *engine) evaluatePodPrimitive(
 			if source == nil || destination == nil {
 				continue
 			}
-			decision := e.evaluatePair(x, source, destination)
+			pair := e.evaluatePair(x, source, destination)
+			decision := pair.decision
 			result.PairDecisions = append(result.PairDecisions, PairDecision{
 				Source: podRef(source), Destination: podRef(destination), Decision: decision,
 			})
@@ -328,7 +344,8 @@ func (e *engine) evaluatePodPrimitive(
 				result.AllowedPairs++
 			}
 			permissions = append(permissions, decision.Permissions...)
-			result.Evidence = append(result.Evidence, decision.Evidence...)
+			evidence.add(pair.keys, decision.Evidence)
+			rules.add(pair.keys, decision.Evidence, subjectPod)
 			result.Warnings = append(result.Warnings, decision.Warnings...)
 		}
 		if truncated {
@@ -336,7 +353,7 @@ func (e *engine) evaluatePodPrimitive(
 		}
 	}
 	result.Permissions = canonicalPermissions(permissions)
-	result.Evidence = uniqueEvidence(result.Evidence)
+	result.Evidence = evidence.sorted()
 	result.Warnings = uniqueStrings(result.Warnings)
 	if truncated {
 		result.Warnings = append(result.Warnings, "pair evaluation truncated by result limit")
@@ -348,14 +365,36 @@ func (e *engine) evaluatePodPrimitive(
 	return result, truncated
 }
 
-func (e *engine) evaluatePair(x *snapshotIndex, source, destination *corev1.Pod) Decision {
-	egress := e.evaluateSide(x, Egress, source, destination)
-	ingress := e.evaluateSide(x, Ingress, destination, source)
+// layerDecision is a side or layer decision plus the reasons that make the
+// pair partial data. Uncertainty is kept apart from State so that layer
+// composition still works on the modeled permissions.
+type layerDecision struct {
+	Decision
+	uncertain []string
+}
+
+// pairResult is a memoized pair decision with the sort keys of its evidence.
+type pairResult struct {
+	decision Decision
+	keys     []string
+}
+
+// evaluatePair evaluates one source/destination pair. The result is shared by
+// the pod, namespace, deployment and job primitives containing the pair.
+func (e *engine) evaluatePair(x *snapshotIndex, source, destination *corev1.Pod) pairResult {
+	pair := pairKey{source: source, destination: destination}
+	if result, ok := x.pairs[pair]; ok {
+		return result
+	}
+	sourceInfo, destinationInfo := x.info(source), x.info(destination)
+	egress := e.evaluateSide(x, Egress, sourceInfo, destinationInfo)
+	ingress := e.evaluateSide(x, Ingress, destinationInfo, sourceInfo)
 	permissions, known := intersectPermissions(egress.Permissions, ingress.Permissions)
+	evidence, keys := uniqueEvidenceKeys(append(slices.Clone(egress.Evidence), ingress.Evidence...))
 	decision := Decision{
 		Permissions: permissions,
-		Evidence:    uniqueEvidence(append(egress.Evidence, ingress.Evidence...)),
-		Warnings:    uniqueStrings(append(egress.Warnings, ingress.Warnings...)),
+		Evidence:    evidence,
+		Warnings:    uniqueStrings(append(slices.Clone(egress.Warnings), ingress.Warnings...)),
 	}
 	switch {
 	case egress.State == AccessDisallowed || ingress.State == AccessDisallowed:
@@ -374,28 +413,49 @@ func (e *engine) evaluatePair(x *snapshotIndex, source, destination *corev1.Pod)
 		decision.State = AccessUnknown
 		decision.Explanation = "traffic cannot be determined because a named destination port is ambiguous"
 	}
-	return decision
+	x.applyUncertainty(&decision, append(slices.Clone(egress.uncertain), ingress.uncertain...))
+	result := pairResult{decision: decision, keys: keys}
+	x.pairs[pair] = result
+	return result
 }
 
-func (e *engine) evaluateSide(x *snapshotIndex, direction Direction, selectedPod, peerPod *corev1.Pod) Decision {
-	namespace := x.namespaces[peerPod.Namespace]
-	destination := selectedPod
+// applyUncertainty marks a decision as partial data when a policy that could
+// affect it cannot be evaluated. The modeled permissions are kept.
+func (x *snapshotIndex) applyUncertainty(decision *Decision, uncertain []string) {
+	uncertain = uniqueStrings(uncertain)
+	if len(uncertain) == 0 {
+		return
+	}
+	x.noteUncertainty(uncertain)
+	decision.State = AccessPartialData
+	decision.Explanation = "policy data needed for this pair is incomplete; " + decision.Explanation
+	decision.Warnings = uniqueStrings(append(decision.Warnings, uncertain...))
+}
+
+func (e *engine) evaluateSide(x *snapshotIndex, direction Direction, selected, peer *podInfo) layerDecision {
+	destination := selected.pod
 	if direction == Egress {
-		destination = peerPod
+		destination = peer.pod
 	}
-	match := func(policy *normalizedPolicy, rule *normalizedRule) (bool, int) {
-		return normalizedRulePeersMatch(rule, policy.Namespace, peerPod, namespace)
-	}
-	network := e.evaluatePolicyLayer(x, policyLayerNetwork, direction, selectedPod, destination, match)
+	matcher := podMatcher{x: x, peer: peer}
+	network := e.evaluatePolicyLayer(x, policyLayerNetwork, direction, selected, destination, matcher)
 	if direction == Egress {
 		return network
 	}
-	authorization := e.evaluatePolicyLayer(x, policyLayerAuthorization, direction, selectedPod, destination, match)
-	return combinePolicyLayers(network, authorization)
+	authorization := e.evaluatePolicyLayer(x, policyLayerAuthorization, direction, selected, destination, matcher)
+	return combinePolicyLayers(&network, &authorization)
 }
 
-func (e *engine) evaluateCIDRPrimitive(x *snapshotIndex, subject *Subject, direction Direction, ref *PrimitiveRef, budget *directionBudget) (PrimitiveResult, bool) {
+func (e *engine) evaluateCIDRPrimitive(
+	x *snapshotIndex,
+	subject *Subject,
+	direction Direction,
+	ref *PrimitiveRef,
+	budget *directionBudget,
+	rules *ruleAccumulator,
+) (PrimitiveResult, bool) {
 	result := PrimitiveResult{Ref: *ref}
+	var evidence evidenceSet
 	truncated := false
 	for _, subjectRef := range subject.Pods {
 		if !budget.takePair() {
@@ -406,13 +466,16 @@ func (e *engine) evaluateCIDRPrimitive(x *snapshotIndex, subject *Subject, direc
 		if pod == nil {
 			continue
 		}
-		decision := e.evaluateCIDRSide(x, direction, pod, ref)
+		decision := e.evaluateCIDRSide(x, direction, x.info(pod), ref)
+		var keys []string
+		decision.Evidence, keys = uniqueEvidenceKeys(decision.Evidence)
 		result.TotalPairs++
 		if decision.State == AccessAllowed {
 			result.AllowedPairs++
 		}
 		result.Permissions = append(result.Permissions, decision.Permissions...)
-		result.Evidence = append(result.Evidence, decision.Evidence...)
+		evidence.add(keys, decision.Evidence)
+		rules.add(keys, decision.Evidence, pod)
 		result.Warnings = append(result.Warnings, decision.Warnings...)
 		pair := PairDecision{Decision: decision}
 		if direction == Ingress {
@@ -423,7 +486,7 @@ func (e *engine) evaluateCIDRPrimitive(x *snapshotIndex, subject *Subject, direc
 		result.PairDecisions = append(result.PairDecisions, pair)
 	}
 	result.Permissions = canonicalPermissions(result.Permissions)
-	result.Evidence = uniqueEvidence(result.Evidence)
+	result.Evidence = evidence.sorted()
 	if truncated {
 		result.Warnings = append(result.Warnings, "pair evaluation truncated by result limit")
 	}
@@ -438,116 +501,92 @@ func (e *engine) evaluateCIDRPrimitive(x *snapshotIndex, subject *Subject, direc
 	return result, truncated
 }
 
-func (e *engine) evaluateCIDRSide(x *snapshotIndex, direction Direction, pod *corev1.Pod, ref *PrimitiveRef) Decision {
-	destination := pod
+func (e *engine) evaluateCIDRSide(x *snapshotIndex, direction Direction, info *podInfo, ref *PrimitiveRef) Decision {
+	destination := info.pod
 	if direction == Egress {
 		destination = nil
 	}
-	contains := func(_ *normalizedPolicy, rule *normalizedRule) (bool, int) {
-		return normalizedRuleMatchesCIDR(rule, ref)
-	}
-	partialDeny := false
-	match := func(policy *normalizedPolicy, rule *normalizedRule) (bool, int) {
-		matched, peerIndex := contains(policy, rule)
-		if matched || rule.Action != PolicyActionDeny || rule.Disabled || rule.MatchNone {
-			return matched, peerIndex
-		}
-		for index := range rule.Peers {
-			peer := &rule.Peers[index]
-			if peer.CIDRMatchUnsupported {
-				continue
-			}
-			for blockIndex := range peer.IPBlocks {
-				if ipBlockIntersects(&peer.IPBlocks[blockIndex], ref) {
-					partialDeny = true
-					return true, index
-				}
-			}
-		}
-		return false, -1
-	}
-	evaluate := func(matcher policyRuleMatcher) Decision {
-		network := e.evaluatePolicyLayer(x, policyLayerNetwork, direction, pod, destination, matcher)
+	evaluate := func(matcher *cidrMatcher) layerDecision {
+		network := e.evaluatePolicyLayer(x, policyLayerNetwork, direction, info, destination, matcher)
 		if direction == Egress {
 			return network
 		}
-		authorization := e.evaluatePolicyLayer(x, policyLayerAuthorization, direction, pod, destination, matcher)
-		return combinePolicyLayers(network, authorization)
+		authorization := e.evaluatePolicyLayer(x, policyLayerAuthorization, direction, info, destination, matcher)
+		return combinePolicyLayers(&network, &authorization)
 	}
-	decision := evaluate(match)
-	if partialDeny {
+	matcher := &cidrMatcher{ref: ref, partialDeny: true}
+	decision := evaluate(matcher)
+	if matcher.intersected {
 		// Subtract intersecting denies to retain only whole-range guarantees.
 		// A different containment-only result means permissions can vary within
 		// the CIDR, not that every address is uniformly denied.
-		possible := evaluate(contains)
+		possible := evaluate(&cidrMatcher{ref: ref})
 		// Bound each allow's evidence by the post-deny possible result before
 		// attributing uncertainty to that selected rule. Keep deny evidence
 		// and the rule's separately recorded declared ports intact.
-		for index := range decision.Evidence {
-			item := &decision.Evidence[index]
+		evidence := slices.Clone(decision.Evidence)
+		for index := range evidence {
+			item := &evidence[index]
 			if item.RuleID.Action != PolicyActionDeny {
 				item.Ports, _ = intersectPermissions(item.Ports, possible.Permissions)
 			}
 		}
-		decision.Evidence = uniqueEvidence(decision.Evidence)
+		decision.Evidence = uniqueEvidence(evidence)
 		if permissionsKey(decision.Permissions) != permissionsKey(possible.Permissions) {
 			decision.State = AccessUnknown
 			decision.Explanation = cidrPartialDeny
 			decision.Warnings = uniqueStrings(append(decision.Warnings, cidrPartialDeny))
 		}
 	}
-	return decision
+	x.applyUncertainty(&decision.Decision, decision.uncertain)
+	return decision.Decision
 }
 
-type policyRuleMatcher func(*normalizedPolicy, *normalizedRule) (bool, int)
-
-func (_ *engine) evaluatePolicyLayer(
+func (*engine) evaluatePolicyLayer(
 	x *snapshotIndex,
 	layer policyLayer,
 	direction Direction,
-	selectedPod, destination *corev1.Pod,
-	match policyRuleMatcher,
-) Decision {
-	var selected []*normalizedPolicy
-	isolated := false
-	namespace := x.namespaces[selectedPod.Namespace]
-	for _, policy := range x.policiesForPod(selectedPod) {
-		policyDirection := policy.direction(direction)
-		if policy.Layer != layer ||
-			(!policyDirection.Isolate && len(policyDirection.Rules) == 0) ||
-			!normalizedPolicySelectsPod(policy, selectedPod, namespace) {
-			continue
-		}
-		selected = append(selected, policy)
-		isolated = isolated || policyDirection.Isolate
+	selected *podInfo,
+	destination *corev1.Pod,
+	matcher sideMatcher,
+) layerDecision {
+	podSelection := x.selection(selected)
+	selection := podSelection.layer(direction, layer)
+	uncertain := slices.Clone(selection.uncertain)
+	if reason := matcher.peerUncertainty(layer, podSelection, direction); reason != "" {
+		uncertain = append(uncertain, reason)
 	}
 
 	var permissions []PortPermission
 	var evidence []PolicyEvidence
-	if !isolated {
+	if !selection.isolated {
 		permissions = allPermissions()
-		if layer == policyLayerNetwork || len(selected) > 0 {
+		if layer == policyLayerNetwork {
 			id := RuleID{Direction: direction, Index: -1, SyntheticKind: syntheticUnrestricted}
 			evidence = append(evidence, PolicyEvidence{
 				RuleID: id, PeerIndex: -1, Ports: allPermissions(),
-				Summary: "no allow policy isolates this pod in this layer",
+				Summary: "no allow policy isolates this pod in the network layer",
 			})
 		}
 	}
 
 	var denied []PortPermission
-	var warnings []string
-	for _, policy := range selected {
-		for index := range policy.direction(direction).Rules {
-			rule := &policy.direction(direction).Rules[index]
-			matches, peerIndex := match(policy, rule)
-			if !matches {
+	for _, policy := range selection.policies {
+		policyDirection := policy.direction(direction)
+		for index := range policyDirection.Rules {
+			rule := &policyDirection.Rules[index]
+			if len(rule.uncertain) > 0 && matcher.couldMatch(policy, rule) {
+				uncertain = append(uncertain, rule.uncertain...)
+			}
+			match := matcher.match(policy, direction, rule)
+			if match.uncertain != "" {
+				uncertain = append(uncertain, match.uncertain)
+			}
+			if !match.matched {
 				continue
 			}
-			perms, _ := permissionsForNormalizedRule(rule, destination)
-			item := policyEvidence(policy, direction, rule, peerIndex, perms)
-			evidence = append(evidence, item)
-			warnings = append(warnings, rule.Warnings...)
+			perms := permissionsForNormalizedRule(rule, destination)
+			evidence = append(evidence, policyEvidence(policy, direction, rule, match.peerIndex, perms))
 			if rule.Action == PolicyActionDeny {
 				denied = append(denied, perms...)
 			} else {
@@ -561,52 +600,63 @@ func (_ *engine) evaluatePolicyLayer(
 	permissions, subtractionKnown = subtractPermissions(permissions, canonicalPermissions(denied))
 	unknown := !subtractionKnown
 	evidence = uniqueEvidence(evidence)
-	warnings = uniqueStrings(warnings)
+	result := layerDecision{uncertain: uniqueStrings(uncertain)}
 
 	if len(permissions) == 0 {
 		if unknown {
-			return Decision{
-				State: AccessUnknown, Evidence: evidence, Warnings: warnings,
+			result.Decision = Decision{
+				State: AccessUnknown, Evidence: evidence,
 				Explanation: "policy permissions cannot be determined exactly",
 			}
+			return result
 		}
-		if isolated && !evidenceHasExplicitRule(evidence) {
-			id := RuleID{Direction: direction, Index: -1, SyntheticKind: syntheticDefaultDeny}
+		if selection.isolated && !evidenceHasExplicitRule(evidence) {
+			kind, summary := syntheticDefaultDeny, "pod is isolated and no allow rule matches the peer"
+			if layer == policyLayerAuthorization {
+				kind, summary = SyntheticAuthorizationDefaultDeny,
+					"an Istio ALLOW policy isolates TCP to this pod and no allow rule matches the request"
+			}
 			evidence = append(evidence, PolicyEvidence{
-				RuleID: id, PeerIndex: -1,
-				Summary: "pod is isolated and no allow rule matches the peer",
+				RuleID:    RuleID{Direction: direction, Index: -1, SyntheticKind: kind},
+				PeerIndex: -1, Summary: summary,
 			})
 		}
-		return Decision{
-			State: AccessDisallowed, Evidence: uniqueEvidence(evidence), Warnings: warnings,
+		result.Decision = Decision{
+			State: AccessDisallowed, Evidence: uniqueEvidence(evidence),
 			Explanation: "policy isolation or an explicit deny rule permits no destination ports",
 		}
+		return result
 	}
 	state := AccessAllowed
 	explanation := "matching policy rules permit one or more destination ports"
+	var warnings []string
 	if unknown && !knownPermissions(permissions) {
 		state = AccessUnknown
 		explanation = "matching policy rules contain unresolved port constraints"
 	} else if unknown {
-		warnings = uniqueStrings(append(warnings, "additional traffic may be affected by an unresolved port constraint"))
+		warnings = []string{"additional traffic may be affected by an unresolved port constraint"}
 	}
-	return Decision{
+	result.Decision = Decision{
 		State: state, Permissions: permissions, Evidence: evidence,
 		Explanation: explanation, Warnings: warnings,
 	}
+	return result
 }
 
-func permissionsForNormalizedRule(rule *normalizedRule, destination *corev1.Pod) ([]PortPermission, bool) {
-	if rule.MatchNone {
-		return nil, true
+func permissionsForNormalizedRule(rule *normalizedRule, destination *corev1.Pod) []PortPermission {
+	if rule.MatchNone || rule.NoPorts {
+		return nil
 	}
 	if rule.TCPOnly && len(rule.Ports) == 0 {
-		return []PortPermission{{Protocol: corev1.ProtocolTCP, All: true}}, true
+		return []PortPermission{{Protocol: corev1.ProtocolTCP, All: true}}
 	}
-	return permissionsForPorts(rule.Ports, destination)
+	permissions, _ := permissionsForPorts(rule.Ports, destination)
+	return permissions
 }
 
-func combinePolicyLayers(network, authorization Decision) Decision {
+// combinePolicyLayers intersects network TCP permissions with the Istio
+// authorization layer. Non-TCP network permissions pass through unchanged.
+func combinePolicyLayers(network, authorization *layerDecision) layerDecision {
 	var networkTCP, networkNonTCP []PortPermission
 	for _, permission := range network.Permissions {
 		if normalizedProtocol(permission.Protocol) == corev1.ProtocolTCP {
@@ -619,8 +669,8 @@ func combinePolicyLayers(network, authorization Decision) Decision {
 	permissions := canonicalPermissions(append(networkNonTCP, tcpPermissions...))
 	decision := Decision{
 		Permissions: permissions,
-		Evidence:    uniqueEvidence(append(network.Evidence, authorization.Evidence...)),
-		Warnings:    uniqueStrings(append(network.Warnings, authorization.Warnings...)),
+		Evidence:    uniqueEvidence(append(slices.Clone(network.Evidence), authorization.Evidence...)),
+		Warnings:    uniqueStrings(append(slices.Clone(network.Warnings), authorization.Warnings...)),
 	}
 	switch {
 	case network.State == AccessDisallowed:
@@ -646,7 +696,10 @@ func combinePolicyLayers(network, authorization Decision) Decision {
 		decision.State = AccessUnknown
 		decision.Explanation = "network and authorization policy layers have no definitely common ports"
 	}
-	return decision
+	return layerDecision{
+		Decision:  decision,
+		uncertain: uniqueStrings(append(slices.Clone(network.uncertain), authorization.uncertain...)),
+	}
 }
 
 func evidenceHasExplicitRule(evidence []PolicyEvidence) bool {
@@ -658,37 +711,9 @@ func evidenceHasExplicitRule(evidence []PolicyEvidence) bool {
 	return false
 }
 
-func (_ *engine) buildRules(x *snapshotIndex, subject *Subject, direction Direction, primitives map[PrimitiveKind][]PrimitiveResult) []RuleResult {
+func (*engine) buildRules(x *snapshotIndex, subject *Subject, direction Direction, accumulator *ruleAccumulator) []RuleResult {
 	rules := map[string]*RuleResult{}
-	matchedSubjects := map[string]map[string]struct{}{}
-	for _, subjectRef := range subject.Pods {
-		pod := x.pods[key(subjectRef.Namespace, subjectRef.Name)]
-		if pod == nil {
-			continue
-		}
-		selected := false
-		namespace := x.namespaces[pod.Namespace]
-		for _, policy := range x.policiesForPod(pod) {
-			policyDirection := policy.direction(direction)
-			if (!policyDirection.Isolate && len(policyDirection.Rules) == 0) ||
-				!normalizedPolicySelectsPod(policy, pod, namespace) {
-				continue
-			}
-			selected = selected || policyDirection.Isolate
-			for index := range policyDirection.Rules {
-				rule := &policyDirection.Rules[index]
-				id := policy.ruleID(direction, rule)
-				k := id.String()
-				if rules[k] == nil {
-					rules[k] = explicitRuleResult(policy, direction, rule)
-				}
-				rules[k].SubjectPodCount++
-			}
-		}
-		kind := syntheticUnrestricted
-		if selected {
-			kind = syntheticDefaultDeny
-		}
+	addSynthetic := func(kind string) {
 		id := RuleID{Direction: direction, Index: -1, SyntheticKind: kind}
 		k := id.String()
 		if rules[k] == nil {
@@ -702,37 +727,44 @@ func (_ *engine) buildRules(x *snapshotIndex, subject *Subject, direction Direct
 		}
 		rules[k].SubjectPodCount++
 	}
-	for _, kind := range []PrimitiveKind{PrimitivePod, PrimitiveCIDR} {
-		list := primitives[kind]
-		for primitiveIndex := range list {
-			primitive := &list[primitiveIndex]
-			for pairIndex := range primitive.PairDecisions {
-				pair := &primitive.PairDecisions[pairIndex]
-				for evidenceIndex := range pair.Decision.Evidence {
-					evidence := &pair.Decision.Evidence[evidenceIndex]
-					k := evidence.RuleID.String()
-					rule := rules[k]
-					if rule == nil || evidence.RuleID.Direction != direction {
-						continue
+	for _, subjectRef := range subject.Pods {
+		pod := x.pods[key(subjectRef.Namespace, subjectRef.Name)]
+		if pod == nil {
+			continue
+		}
+		selection := x.selection(x.info(pod))
+		for _, layer := range []policyLayer{policyLayerNetwork, policyLayerAuthorization} {
+			layerSelection := selection.layer(direction, layer)
+			for _, policy := range append(slices.Clone(layerSelection.policies), layerSelection.effectUnknown...) {
+				policyDirection := policy.direction(direction)
+				for index := range policyDirection.Rules {
+					rule := &policyDirection.Rules[index]
+					k := policy.ruleID(direction, rule).String()
+					if rules[k] == nil {
+						rules[k] = explicitRuleResult(policy, direction, rule)
 					}
-					rule.Evidence = append(rule.Evidence, *evidence)
-					rule.Permissions = append(rule.Permissions, evidence.Ports...)
-					if matchedSubjects[k] == nil {
-						matchedSubjects[k] = map[string]struct{}{}
-					}
-					selectedPod := pair.Destination
-					if direction == Egress {
-						selectedPod = pair.Source
-					}
-					matchedSubjects[k][selectedPod.ID()] = struct{}{}
+					rules[k].SubjectPodCount++
 				}
 			}
 		}
+		// Each layer explains its own isolation: an Istio ALLOW only isolates
+		// TCP, so it must not turn the network row into a full default deny.
+		if selection.layer(direction, policyLayerNetwork).isolated {
+			addSynthetic(syntheticDefaultDeny)
+		} else {
+			addSynthetic(syntheticUnrestricted)
+		}
+		if selection.layer(direction, policyLayerAuthorization).isolated {
+			addSynthetic(SyntheticAuthorizationDefaultDeny)
+		}
 	}
 	out := make([]RuleResult, 0, len(rules))
-	for _, rule := range rules {
-		rule.SubjectMatchCount = len(matchedSubjects[rule.ID.String()])
-		rule.Evidence = uniqueEvidence(rule.Evidence)
+	for k, rule := range rules {
+		rule.Evidence = accumulator.evidence(k)
+		for index := range rule.Evidence {
+			rule.Permissions = append(rule.Permissions, rule.Evidence[index].Ports...)
+		}
+		rule.SubjectMatchCount = accumulator.subjectCount(k)
 		rule.Permissions = canonicalPermissions(rule.Permissions)
 		out = append(out, *rule)
 	}
@@ -750,8 +782,12 @@ func explicitRuleResult(policy *normalizedPolicy, direction Direction, rule *nor
 		Notes:          uniqueStrings(append(slices.Clone(policy.Notes), rule.Notes...)),
 		Warnings:       slices.Clone(rule.Warnings),
 	}
+	if policy.SpecPath != "" {
+		result.PolicySpec = policy.SpecPath
+		result.PolicySpecCount = policy.SpecCount
+	}
 	result.PeerSummary = peerSummary(result.Peers)
-	result.Permissions, _ = permissionsForNormalizedRule(rule, nil)
+	result.Permissions = permissionsForNormalizedRule(rule, nil)
 	return result
 }
 
@@ -849,8 +885,8 @@ func policyEvidence(
 		RuleID:      policy.ruleID(direction, rule),
 		PolicyTypes: slices.Clone(policy.PolicyTypes), PeerIndex: peerIndex,
 		Ports: slices.Clone(permissions),
-		Summary: fmt.Sprintf("%s %s/%s %s rule %d matched peer %d",
-			policy.Type.Kind(), policy.Namespace, policy.Name, rule.Action, rule.Index, peerIndex),
+		Summary: fmt.Sprintf("%s %s %s rule %d matched peer %d",
+			policy.Type.Kind(), policy.reference(), rule.Action, rule.Index, peerIndex),
 	}
 }
 
@@ -861,19 +897,24 @@ func aggregateState(pairs []PairDecision, partialData bool) (state AccessState, 
 		}
 		return AccessUnknown, "no concrete pod pairs are available"
 	}
-	allowed, denied, unknown := 0, 0, 0
+	allowed, denied, unknown, partial := 0, 0, 0, 0
 	for index := range pairs {
 		switch pairs[index].Decision.State {
 		case AccessAllowed:
 			allowed++
 		case AccessDisallowed:
 			denied++
+		case AccessPartialData:
+			partial++
 		default:
 			unknown++
 		}
 	}
 	if partialData {
-		return AccessPartialData, fmt.Sprintf("snapshot is partial; observed %d allowed, %d denied, and %d unknown pairs", allowed, denied, unknown)
+		return AccessPartialData, fmt.Sprintf("snapshot is partial; observed %d allowed, %d denied, and %d unknown pairs", allowed, denied, unknown+partial)
+	}
+	if partial > 0 {
+		return AccessPartialData, fmt.Sprintf("%d of %d concrete pod pairs depend on policy data that cannot be evaluated", partial, len(pairs))
 	}
 	if allowed == len(pairs) {
 		return AccessAllowed, "all concrete pod pairs are allowed"
@@ -895,37 +936,35 @@ func cidrPrimitives(x *snapshotIndex, subject *Subject, direction Direction) []P
 		if pod == nil {
 			continue
 		}
-		namespace := x.namespaces[pod.Namespace]
-		for _, policy := range x.policiesForPod(pod) {
-			policyDirection := policy.direction(direction)
-			if (!policyDirection.Isolate && len(policyDirection.Rules) == 0) ||
-				!normalizedPolicySelectsPod(policy, pod, namespace) {
-				continue
-			}
-			for ruleIndex := range policyDirection.Rules {
-				rule := &policyDirection.Rules[ruleIndex]
-				if rule.Disabled || rule.MatchNone {
-					continue
-				}
-				if len(rule.Peers) == 0 {
-					allAddresses = true
-				}
-				for peerIndex := range rule.Peers {
-					peer := &rule.Peers[peerIndex]
-					if normalizedPeerMatchesCIDR(peer, &PrimitiveRef{Kind: PrimitiveCIDR, CIDR: "0.0.0.0/0"}) &&
-						len(peer.IPBlocks) == 0 {
+		selection := x.selection(x.info(pod))
+		for _, layer := range []policyLayer{policyLayerNetwork, policyLayerAuthorization} {
+			layerSelection := selection.layer(direction, layer)
+			for _, policy := range append(slices.Clone(layerSelection.policies), layerSelection.effectUnknown...) {
+				policyDirection := policy.direction(direction)
+				for ruleIndex := range policyDirection.Rules {
+					rule := &policyDirection.Rules[ruleIndex]
+					if rule.Disabled || rule.MatchNone {
+						continue
+					}
+					if len(rule.Peers) == 0 {
 						allAddresses = true
 					}
-					for blockIndex := range peer.IPBlocks {
-						addCIDR(refs, &peer.IPBlocks[blockIndex])
+					for peerIndex := range rule.Peers {
+						peer := &rule.Peers[peerIndex]
+						if len(peer.IPBlocks) == 0 && peerMatchesAddresses(peer) {
+							allAddresses = true
+						}
+						for blockIndex := range peer.IPBlocks {
+							addCIDR(refs, &peer.IPBlocks[blockIndex])
+						}
 					}
 				}
 			}
 		}
 	}
 	if allAddresses {
-		addCIDRRef(refs, &PrimitiveRef{Kind: PrimitiveCIDR, CIDR: "0.0.0.0/0"})
-		addCIDRRef(refs, &PrimitiveRef{Kind: PrimitiveCIDR, CIDR: "::/0"})
+		addCIDRRef(refs, &PrimitiveRef{Kind: PrimitiveCIDR, CIDR: allIPv4})
+		addCIDRRef(refs, &PrimitiveRef{Kind: PrimitiveCIDR, CIDR: allIPv6})
 	}
 	keys := mapsKeys(refs)
 	slices.Sort(keys)
@@ -956,14 +995,6 @@ func addCIDRRef(refs map[string]PrimitiveRef, ref *PrimitiveRef) {
 	}
 	ref.CIDRExcept = uniqueStrings(ref.CIDRExcept)
 	refs[ref.ID()] = *ref
-}
-
-func peerMatchesCIDR(peer netv1.NetworkPolicyPeer, ref *PrimitiveRef) bool {
-	if peer.IPBlock != nil {
-		return ipBlockContains(peer.IPBlock, ref)
-	}
-
-	return peer.PodSelector == nil && peer.NamespaceSelector == nil
 }
 
 func ipBlockContains(block *netv1.IPBlock, ref *PrimitiveRef) bool {
@@ -1142,32 +1173,20 @@ func sortedJobs(x *snapshotIndex) []*batchv1.Job {
 	return out
 }
 
-func uniqueEvidence(in []PolicyEvidence) []PolicyEvidence {
-	seen := map[string]PolicyEvidence{}
-	for index := range in {
-		evidence := &in[index]
-		k := fmt.Sprintf("%s\x00%d\x00%s", evidence.RuleID.String(), evidence.PeerIndex, permissionsKey(evidence.Ports))
-		seen[k] = *evidence
-	}
-	keys := mapsKeys(seen)
-	slices.Sort(keys)
-	out := make([]PolicyEvidence, 0, len(keys))
-	for _, k := range keys {
-		out = append(out, seen[k])
-	}
-	return out
-}
-
 func permissionsKey(permissions []PortPermission) string {
-	var values []string
-	for _, permission := range canonicalPermissions(permissions) {
+	canonical := canonicalPermissions(permissions)
+	values := make([]string, 0, len(canonical))
+	for _, permission := range canonical {
 		values = append(values, permissionKey(permission))
 	}
-	return fmt.Sprint(values)
+	return "[" + strings.Join(values, " ") + "]"
 }
 
 func uniqueStrings(in []string) []string {
-	set := map[string]struct{}{}
+	if len(in) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(in))
 	for _, value := range in {
 		if value != "" {
 			set[value] = struct{}{}
@@ -1179,23 +1198,30 @@ func uniqueStrings(in []string) []string {
 }
 
 func evidenceContains(evidence []PolicyEvidence, id *RuleID) bool {
+	target := id.String()
 	for index := range evidence {
-		if evidence[index].RuleID.String() == id.String() {
+		if evidence[index].RuleID.String() == target {
 			return true
 		}
 	}
 	return false
 }
 
+// isDefaultDenyKind reports synthetic default-deny evidence. It is present on
+// every denied pair of an isolated pod, so it never counts as a peer match.
+func isDefaultDenyKind(kind string) bool {
+	return kind == syntheticDefaultDeny || kind == SyntheticAuthorizationDefaultDeny
+}
+
 // evidenceHasDirection reports whether a real (non default-deny) rule in the
 // given direction covers the pair. Synthetic default-deny evidence is present
 // on every denied pair, so counting it would make peer matching degenerate to
 // "always true". This mirrors evidencePermissionsForDirection, which skips the
-// same synthetic kind.
+// same synthetic kinds.
 func evidenceHasDirection(evidence []PolicyEvidence, direction Direction) bool {
 	for index := range evidence {
 		item := &evidence[index]
-		if item.RuleID.Direction != direction || item.RuleID.SyntheticKind == syntheticDefaultDeny {
+		if item.RuleID.Direction != direction || isDefaultDenyKind(item.RuleID.SyntheticKind) {
 			continue
 		}
 		return true
@@ -1205,9 +1231,10 @@ func evidenceHasDirection(evidence []PolicyEvidence, direction Direction) bool {
 
 func evidencePermissions(evidence []PolicyEvidence, id *RuleID) []PortPermission {
 	var permissions []PortPermission
+	target := id.String()
 	for index := range evidence {
 		item := &evidence[index]
-		if item.RuleID.String() != id.String() {
+		if item.RuleID.String() != target {
 			continue
 		}
 		if item.RuleID.SyntheticKind == syntheticUnrestricted {
@@ -1224,7 +1251,7 @@ func evidencePermissionsForDirection(evidence []PolicyEvidence, direction Direct
 	found := false
 	for index := range evidence {
 		item := &evidence[index]
-		if item.RuleID.Direction != direction || item.RuleID.SyntheticKind == syntheticDefaultDeny {
+		if item.RuleID.Direction != direction || isDefaultDenyKind(item.RuleID.SyntheticKind) {
 			continue
 		}
 		found = true

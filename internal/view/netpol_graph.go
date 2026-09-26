@@ -823,7 +823,7 @@ func (v *NetworkPolicyGraph) detailStops(direction netpol.Direction) (details, a
 		if !ok {
 			return false, false
 		}
-		return true, len(v.visibleApplicability(direction, v.ruleApplicability(direction, rule.ID))) > 0
+		return true, len(v.visibleApplicability(direction, v.ruleApplicability(direction, &rule.ID))) > 0
 	}
 	// Primitives render a plain text pane with no applicability table.
 	_, ok := v.selectedPrimitive(direction, id)
@@ -1365,7 +1365,7 @@ func (v *NetworkPolicyGraph) renderDetails(direction netpol.Direction) {
 			v.refocusDetail()
 			return
 		}
-		rows := v.visibleApplicability(direction, v.ruleApplicability(direction, rule.ID))
+		rows := v.visibleApplicability(direction, v.ruleApplicability(direction, &rule.ID))
 		ruleDetail := ui.NewRuleDetailsWithStyle(rule, rows, v.reachabilityStyle())
 		ruleDetail.Applicability.SetTitle(v.applicabilityTitle("Applicability", direction))
 		v.applyDetailFocusStyle(ruleDetail)
@@ -1551,6 +1551,9 @@ func (v *NetworkPolicyGraph) appendResultWarnings(b *strings.Builder) {
 	for _, warning := range v.result.Warnings {
 		fmt.Fprintf(b, "\nWarning: %s", warning)
 	}
+	for _, note := range v.result.Notes {
+		fmt.Fprintf(b, "\nNote: %s", note)
+	}
 	if refresh := v.model.LastRefresh(); len(refresh.Incomplete) > 0 {
 		keys := make([]string, 0, len(refresh.Incomplete))
 		for resource := range refresh.Incomplete {
@@ -1643,18 +1646,18 @@ func (v *NetworkPolicyGraph) projection(direction netpol.Direction) *projectionC
 
 // ruleApplicability returns the applicability rows contributed by a single
 // rule, reusing the last computation when the pane repaints unchanged.
-func (v *NetworkPolicyGraph) ruleApplicability(direction netpol.Direction, id netpol.RuleID) []netpol.ApplicabilityRow {
+func (v *NetworkPolicyGraph) ruleApplicability(direction netpol.Direction, id *netpol.RuleID) []netpol.ApplicabilityRow {
 	mask := v.kindMask()
 	if memo := v.rows[direction]; memo != nil && memo.generation == v.dataGen && memo.kindMask == mask &&
-		!memo.effective && memo.ruleID == id {
+		!memo.effective && memo.ruleID == *id {
 		return memo.rows
 	}
 	v.rows[direction] = &applicabilityMemo{
 		generation: v.dataGen,
 		kindMask:   mask,
 		direction:  direction,
-		ruleID:     id,
-		rows:       v.evaluator.RuleApplicability(v.result, direction, id, v.kinds),
+		ruleID:     *id,
+		rows:       v.evaluator.RuleApplicability(v.result, direction, *id, v.kinds),
 	}
 	return v.rows[direction].rows
 }
@@ -2116,11 +2119,11 @@ func (v *NetworkPolicyGraph) directionYAMLTarget(direction netpol.Direction) (*c
 		if !ok {
 			return nil, "", false
 		}
-		gvr, ok := policyGVR(ruleID)
+		gvr, ok := policyGVR(&ruleID)
 		if !ok {
 			return nil, "", false
 		}
-		return gvr, policyPath(ruleID), true
+		return gvr, policyPath(&ruleID), true
 	}
 	primitive, ok := v.selectedPrimitive(direction, id)
 	if !ok {
@@ -2184,7 +2187,7 @@ func primitiveGVR(ref *netpol.PrimitiveRef) (*client.GVR, string, bool) {
 	}
 }
 
-func policyGVR(ruleID netpol.RuleID) (*client.GVR, bool) {
+func policyGVR(ruleID *netpol.RuleID) (*client.GVR, bool) {
 	switch ruleID.SourceType() {
 	case netpol.PolicyTypeNetworkPolicy:
 		return client.NpGVR, true
@@ -2202,12 +2205,22 @@ func policyGVR(ruleID netpol.RuleID) (*client.GVR, bool) {
 	}
 }
 
-func policyPath(ruleID netpol.RuleID) string {
+func policyPath(ruleID *netpol.RuleID) string {
 	namespace := ruleID.PolicyNamespace
 	if ruleID.SourceType() == netpol.PolicyTypeCiliumClusterwideNetworkPolicy {
 		namespace = client.ClusterScope
 	}
 	return client.FQN(namespace, ruleID.PolicyName)
+}
+
+// policyCommand names a policy resource unambiguously. Custom resources use
+// plural.group, because another CRD, such as Linkerd's
+// authorizationpolicies.policy.linkerd.io, may share the bare plural.
+func policyCommand(gvr *client.GVR) string {
+	if gvr == client.NpGVR {
+		return gvr.R()
+	}
+	return gvr.R() + "." + gvr.G()
 }
 
 // escapeCmd clears the focused panel selection so the details pane shows the
@@ -2278,11 +2291,11 @@ func (v *NetworkPolicyGraph) directionPrimitiveTarget(direction netpol.Direction
 		if !ok {
 			return "", "", errNoPrimitiveTarget
 		}
-		gvr, ok := policyGVR(ruleID)
+		gvr, ok := policyGVR(&ruleID)
 		if !ok {
 			return "", "", errNoPrimitiveTarget
 		}
-		return gvr.R(), policyPath(ruleID), nil
+		return policyCommand(gvr), policyPath(&ruleID), nil
 	}
 	primitive, ok := v.selectedPrimitive(direction, id)
 	if !ok {

@@ -183,6 +183,28 @@ example/untracked.go:3.1,5.2 2 1
 	}
 }
 
+func TestDefaultBasePrefersOriginMaster(t *testing.T) {
+	repository := t.TempDir()
+	runGit(t, repository, "init", "-b", "master")
+	runGit(t, repository, "config", "user.email", "test@example.com")
+	runGit(t, repository, "config", "user.name", "Diff Cover Test")
+	writeTestFile(t, repository, "go.mod", "module example\n")
+	runGit(t, repository, "add", "go.mod")
+	runGit(t, repository, "commit", "-m", "base")
+	t.Chdir(repository)
+	if got := defaultBase(); got != "master" {
+		t.Fatalf("without origin/master the base is %q, want master", got)
+	}
+	runGit(t, repository, "update-ref", "refs/remotes/origin/master", "HEAD")
+	if got := defaultBase(); got != "origin/master" {
+		t.Fatalf("with origin/master the base is %q, want origin/master", got)
+	}
+	t.Setenv("DIFF_COVER_BASE", "release")
+	if got := envOrDefault("DIFF_COVER_BASE", defaultBase()); got != "release" {
+		t.Fatalf("DIFF_COVER_BASE must override the default, got %q", got)
+	}
+}
+
 func TestRunRejectsMissingProfileFiles(t *testing.T) {
 	for _, tracked := range []bool{false, true} {
 		t.Run(map[bool]string{false: "untracked", true: "tracked"}[tracked], func(t *testing.T) {

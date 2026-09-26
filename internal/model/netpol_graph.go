@@ -526,7 +526,8 @@ func loadOptionalPolicyResources(ctx context.Context, factory dao.Factory, snaps
 			},
 		},
 	}
-	for _, resource := range resources {
+	for index := range resources {
+		resource := &resources[index]
 		if err := ctx.Err(); err != nil {
 			snapshot.Incomplete[resource.name] = err
 			continue
@@ -546,62 +547,164 @@ func loadOptionalPolicyResources(ctx context.Context, factory dao.Factory, snaps
 		}
 		resource.assign(convertSnapshotObjects[unstructured.Unstructured](resource.name, objects, snapshot))
 	}
-	loadIstioRootNamespace(factory, snapshot)
+	loadIstioRootNamespace(ctx, factory, snapshot)
 }
 
-func loadIstioRootNamespace(factory dao.Factory, snapshot *netpol.Snapshot) {
+const istioMeshConfigTimeout = 3 * time.Second
+
+// istioMeshConfig is the part of Istio's MeshConfig the graph needs.
+type istioMeshConfig struct {
+	RootNamespace string `json:"rootNamespace"`
+}
+
+// istioConfigMapTarget names an istiod mesh ConfigMap.
+type istioConfigMapTarget struct {
+	namespace, name string
+}
+
+func (t istioConfigMapTarget) String() string {
+	return t.namespace + "/" + t.name
+}
+
+type configMapGetter func(ctx context.Context, namespace, name string) (*corev1.ConfigMap, error)
+
+// loadIstioRootNamespace resolves the Istio root namespace with targeted GETs
+// of the istiod mesh ConfigMaps (istio or istio-<revision>) instead of a
+// cluster-wide ConfigMap list and watch. Failures fall back to Istio's
+// default root with a note rather than making the snapshot incomplete.
+func loadIstioRootNamespace(ctx context.Context, factory dao.Factory, snapshot *netpol.Snapshot) {
 	if len(snapshot.IstioAuthorizationPolicies) == 0 {
 		return
 	}
-	objects, err := factory.List(client.CmGVR, client.BlankNamespace, true, labels.Everything())
+	fallback := func(reason string) {
+		snapshot.Notes = append(snapshot.Notes, fmt.Sprintf(
+			"Istio mesh config %s; using the default root namespace %s", reason, netpol.DefaultIstioRootNamespace,
+		))
+	}
+	getter, err := istioConfigMapGetter(factory)
 	if err != nil {
-		snapshot.Incomplete["istio-mesh-config"] = fmt.Errorf("list Istio mesh config: %w", err)
+		fallback(fmt.Sprintf("could not be read (%v)", err))
 		return
 	}
-	configMaps := convertSnapshotObjects[corev1.ConfigMap]("istio-mesh-config", objects, snapshot)
-	roots := map[string]struct{}{}
-	for index := range configMaps {
-		configMap := &configMaps[index]
-		if configMap.Name != "istio" && !strings.HasPrefix(configMap.Name, "istio-") {
+	targets := istioMeshConfigTargets(snapshot.Deployments)
+	roots := map[string][]string{}
+	var failures []string
+	for _, target := range targets {
+		lookupCtx, cancel := context.WithTimeout(ctx, istioMeshConfigTimeout)
+		configMap, err := getter(lookupCtx, target.namespace, target.name)
+		cancel()
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("get ConfigMap %s: %v", target, err))
 			continue
 		}
 		raw, present := configMap.Data["mesh"]
 		if !present {
 			continue
 		}
-		var meshConfig struct {
-			RootNamespace string `yaml:"rootNamespace"`
-		}
-		meshConfig.RootNamespace = netpol.DefaultIstioRootNamespace
+		var meshConfig istioMeshConfig
 		if err := yaml.Unmarshal([]byte(raw), &meshConfig); err != nil {
-			snapshot.Incomplete["istio-mesh-config"] = errors.Join(
-				snapshot.Incomplete["istio-mesh-config"],
-				fmt.Errorf("parse ConfigMap %s/%s mesh config: %w", configMap.Namespace, configMap.Name, err),
-			)
+			failures = append(failures, fmt.Sprintf("parse ConfigMap %s mesh config: %v", target, err))
 			continue
 		}
-		if meshConfig.RootNamespace != "" {
-			roots[meshConfig.RootNamespace] = struct{}{}
+		root := meshConfig.RootNamespace
+		if root == "" {
+			root = netpol.DefaultIstioRootNamespace
+		}
+		roots[root] = append(roots[root], target.String())
+	}
+	candidates := slices.Sorted(maps.Keys(roots))
+	switch len(candidates) {
+	case 0:
+		if len(failures) > 0 {
+			fallback("could not be read (" + strings.Join(failures, "; ") + ")")
+		} else {
+			fallback("was not found in " + joinTargets(targets))
+		}
+		return
+	case 1:
+		snapshot.IstioRootNamespace = candidates[0]
+	default:
+		snapshot.IstioRootNamespace = defaultRevisionRoot(roots, candidates)
+		snapshot.IstioRootNamespaceCandidates = candidates
+		snapshot.Notes = append(snapshot.Notes, fmt.Sprintf(
+			"Istio revisions report different root namespaces (%s); AuthorizationPolicies in those namespaces are partial data",
+			strings.Join(candidates, ", "),
+		))
+	}
+	if len(failures) > 0 {
+		snapshot.Notes = append(snapshot.Notes, "some Istio mesh config could not be read: "+strings.Join(failures, "; "))
+	}
+}
+
+// istioMeshConfigTargets returns the mesh ConfigMaps of the istiod
+// deployments in the snapshot, or Istio's default location.
+func istioMeshConfigTargets(deployments []appsv1.Deployment) []istioConfigMapTarget {
+	seen := map[istioConfigMapTarget]struct{}{}
+	for index := range deployments {
+		deployment := &deployments[index]
+		template := deployment.Spec.Template.Labels
+		if deployment.Labels["app"] != "istiod" && template["app"] != "istiod" {
+			continue
+		}
+		revision := deployment.Labels["istio.io/rev"]
+		if revision == "" {
+			revision = template["istio.io/rev"]
+		}
+		name := "istio"
+		if revision != "" && revision != "default" {
+			name += "-" + revision
+		}
+		seen[istioConfigMapTarget{namespace: deployment.Namespace, name: name}] = struct{}{}
+	}
+	if len(seen) == 0 {
+		seen[istioConfigMapTarget{namespace: netpol.DefaultIstioRootNamespace, name: "istio"}] = struct{}{}
+	}
+	targets := make([]istioConfigMapTarget, 0, len(seen))
+	for target := range seen {
+		targets = append(targets, target)
+	}
+	slices.SortFunc(targets, func(a, b istioConfigMapTarget) int { return strings.Compare(a.String(), b.String()) })
+	return targets
+}
+
+func joinTargets(targets []istioConfigMapTarget) string {
+	values := make([]string, 0, len(targets))
+	for _, target := range targets {
+		values = append(values, "ConfigMap "+target.String())
+	}
+	return strings.Join(values, ", ")
+}
+
+// defaultRevisionRoot prefers the root reported by a default-revision
+// ConfigMap named "istio" when revisions disagree.
+func defaultRevisionRoot(roots map[string][]string, candidates []string) string {
+	for _, root := range candidates {
+		for _, source := range roots[root] {
+			if strings.HasSuffix(source, "/istio") {
+				return root
+			}
 		}
 	}
-	if len(roots) == 0 {
-		return
+	return candidates[0]
+}
+
+// istioConfigMapGetter reads single ConfigMaps directly, which needs only get
+// permission on them and keeps no informer or cache.
+func istioConfigMapGetter(factory dao.Factory) (configMapGetter, error) {
+	connection := factory.Client()
+	if connection == nil {
+		return nil, errors.New("no API connection")
 	}
-	if len(roots) > 1 {
-		values := make([]string, 0, len(roots))
-		for root := range roots {
-			values = append(values, root)
-		}
-		slices.Sort(values)
-		snapshot.Incomplete["istio-mesh-config"] = errors.Join(
-			snapshot.Incomplete["istio-mesh-config"],
-			fmt.Errorf("multiple Istio root namespaces discovered: %s", strings.Join(values, ", ")),
-		)
-		return
+	clientset, err := connection.Dial()
+	if err != nil {
+		return nil, err
 	}
-	for root := range roots {
-		snapshot.IstioRootNamespace = root
-	}
+	return func(ctx context.Context, namespace, name string) (*corev1.ConfigMap, error) {
+		return clientset.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+	}, nil
 }
 
 func discoverOptionalResource(factory dao.Factory, candidates []*client.GVR) (*client.GVR, error) {
@@ -629,8 +732,8 @@ func selectOptionalResource(discoveryClient optionalResourceDiscoverer, candidat
 			}
 			return nil, fmt.Errorf("discover %s: %w", candidate, err)
 		}
-		for _, resource := range resources.APIResources {
-			if resource.Name == candidate.R() {
+		for index := range resources.APIResources {
+			if resources.APIResources[index].Name == candidate.R() {
 				return candidate, nil
 			}
 		}
@@ -712,6 +815,7 @@ func cloneSubjectResult(source *netpol.SubjectResult) netpol.SubjectResult {
 	result := *source
 	result.Subject.Pods = append([]netpol.PodRef(nil), result.Subject.Pods...)
 	result.Warnings = append([]string(nil), result.Warnings...)
+	result.Notes = append([]string(nil), result.Notes...)
 	result.Ingress = cloneDirectionResult(result.Ingress)
 	result.Egress = cloneDirectionResult(result.Egress)
 	return result
