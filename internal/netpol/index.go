@@ -10,7 +10,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	netv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -18,7 +17,8 @@ import (
 type snapshotIndex struct {
 	pods                map[string]*corev1.Pod
 	namespaces          map[string]*corev1.Namespace
-	policies            map[string][]*netv1.NetworkPolicy
+	policies            map[string][]*normalizedPolicy
+	globalPolicies      []*normalizedPolicy
 	deployments         map[string]*appsv1.Deployment
 	replicaSets         map[types.UID]*appsv1.ReplicaSet
 	jobs                map[string]*batchv1.Job
@@ -30,7 +30,7 @@ func newSnapshotIndex(snapshot *Snapshot) *snapshotIndex {
 	x := &snapshotIndex{
 		pods:                make(map[string]*corev1.Pod, len(snapshot.Pods)),
 		namespaces:          make(map[string]*corev1.Namespace, len(snapshot.Namespaces)),
-		policies:            make(map[string][]*netv1.NetworkPolicy),
+		policies:            make(map[string][]*normalizedPolicy),
 		deployments:         make(map[string]*appsv1.Deployment, len(snapshot.Deployments)),
 		replicaSets:         make(map[types.UID]*appsv1.ReplicaSet, len(snapshot.ReplicaSets)),
 		jobs:                make(map[string]*batchv1.Job, len(snapshot.Jobs)),
@@ -44,9 +44,14 @@ func newSnapshotIndex(snapshot *Snapshot) *snapshotIndex {
 		ns := &snapshot.Namespaces[i]
 		x.namespaces[ns.Name] = ns
 	}
-	for i := range snapshot.NetworkPolicies {
-		p := &snapshot.NetworkPolicies[i]
-		x.policies[p.Namespace] = append(x.policies[p.Namespace], p)
+	policies, policyFailures := normalizeSnapshotPolicies(snapshot)
+	for i := range policies {
+		policy := &policies[i]
+		if policy.ClusterScoped {
+			x.globalPolicies = append(x.globalPolicies, policy)
+		} else {
+			x.policies[policy.Namespace] = append(x.policies[policy.Namespace], policy)
+		}
 	}
 	for i := range snapshot.Deployments {
 		d := &snapshot.Deployments[i]
@@ -68,24 +73,43 @@ func newSnapshotIndex(snapshot *Snapshot) *snapshotIndex {
 			x.incomplete = append(x.incomplete, fmt.Sprintf("snapshot resource %q is incomplete: %v", resource, err))
 		}
 	}
+	for resource, err := range policyFailures {
+		x.incompleteResources[resource] = struct{}{}
+		x.incomplete = append(x.incomplete, fmt.Sprintf("snapshot resource %q could not be fully evaluated: %v", resource, err))
+	}
 	slices.Sort(x.incomplete)
 	for ns := range x.policies {
-		slices.SortFunc(x.policies[ns], func(a, b *netv1.NetworkPolicy) int {
-			if a.Name < b.Name {
-				return -1
-			}
-			if a.Name > b.Name {
-				return 1
-			}
-			return 0
-		})
+		sortNormalizedPolicies(x.policies[ns])
 	}
+	sortNormalizedPolicies(x.globalPolicies)
 	return x
 }
 
 func (x *snapshotIndex) resourceIncomplete(resource string) bool {
 	_, ok := x.incompleteResources[resource]
 	return ok
+}
+
+func (x *snapshotIndex) policiesForPod(pod *corev1.Pod) []*normalizedPolicy {
+	out := make([]*normalizedPolicy, 0, len(x.policies[pod.Namespace])+len(x.globalPolicies))
+	out = append(out, x.policies[pod.Namespace]...)
+	out = append(out, x.globalPolicies...)
+	return out
+}
+
+func sortNormalizedPolicies(policies []*normalizedPolicy) {
+	slices.SortFunc(policies, func(a, b *normalizedPolicy) int {
+		if a.Type != b.Type {
+			return cmpString(a.Type.String(), b.Type.String())
+		}
+		if a.Namespace != b.Namespace {
+			return cmpString(a.Namespace, b.Namespace)
+		}
+		if a.Name != b.Name {
+			return cmpString(a.Name, b.Name)
+		}
+		return a.SpecIndex - b.SpecIndex
+	})
 }
 
 func key(namespace, name string) string {

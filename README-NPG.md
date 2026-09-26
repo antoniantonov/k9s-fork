@@ -5,9 +5,11 @@ K9s.
 ![alt text](assets/npg/intro.png)
 ## 1. What Is Network Policy Graph?
 
-Network Policy Graph is a read-only reachability view for standard Kubernetes
-`networking.k8s.io/v1` `NetworkPolicy` resources. It explains how NetworkPolicy
-affects traffic to and from a selected workload, called the **subject**.
+Network Policy Graph is a read-only reachability view for Kubernetes
+`NetworkPolicy`, Cilium `CiliumNetworkPolicy` and
+`CiliumClusterwideNetworkPolicy`, and Istio `AuthorizationPolicy` resources. It
+explains how those policies affect traffic to and from a selected workload,
+called the **subject**.
 
 NPG is intended to answer questions such as:
 
@@ -25,9 +27,9 @@ NPG evaluates concrete pod-to-pod paths. For a path to be allowed:
 2. The destination pod's ingress policy must allow it.
 3. The two sides must allow at least one common protocol and destination port.
 
-NetworkPolicy rules are additive allow rules; they are not explicit deny rules.
-A disallowed result normally means that a pod is isolated in that direction and
-no matching allow rule permits the peer and port.
+Kubernetes NetworkPolicy rules are additive allow rules. Cilium and Istio
+policies can also contribute explicit deny rules, which take precedence over
+matching allows.
 
 NPG can be opened with:
 
@@ -50,9 +52,9 @@ aliases such as `po`, `deploy`, `jobs`, and `ns` are accepted. Examples:
 The same panel can be opened from a selected Pod, Deployment, Job, or Namespace
 by pressing `Shift-R`.
 
-The panel does not edit, create, or delete NetworkPolicies. It evaluates the
-current cluster snapshot and provides navigation to related resources and YAML.
-Opening a resource leaves NPG and pushes the resource view onto the normal K9s
+The panel does not edit, create, or delete policies. It evaluates the current
+cluster snapshot and provides navigation to related resources and YAML. Opening
+a resource leaves NPG and pushes the resource view onto the normal K9s
 breadcrumb stack.
 
 While NPG is active, the status row beneath the K9s logo shows the
@@ -62,10 +64,32 @@ is not a global K9s status.
 NPG evaluates reachability once when opened. Automatic refresh is disabled by
 default. It can be enabled at a five-second interval with `r`.
 
-NPG models the standard Kubernetes NetworkPolicy API, not guaranteed packet
-delivery. CNI behavior, NAT, `hostNetwork`, node-local traffic, service meshes,
-cloud firewalls, vendor-specific policies, application authorization, and
-other networking layers may change the real result.
+NPG models the supported declarative policy fields, not guaranteed packet
+delivery. CNI behavior, NAT, `hostNetwork`, node-local traffic, sidecar
+enrollment, cloud firewalls, and other networking layers may change the real
+result. Dynamic Cilium destinations such as FQDNs, Services, CIDR groups, nodes,
+and cloud-provider groups, plus Istio external authorization, `targetRefs`,
+`when` conditions, forwarded-client IPs, JWT identities, and negative ports or
+CIDRs, are reported as incomplete rather than guessed.
+Unmodeled Cilium L7, TLS, SNI, and authentication constraints, and Istio
+HTTP request conditions, also produce Partial Data rather than complete
+reachability claims.
+
+Kubernetes and Cilium policies form the network layer. Istio authorization is a
+second destination-ingress layer; both layers must permit a pod-to-pod path.
+Consequently, a destination AuthorizationPolicy can restrict the subject's
+egress results even though AuthorizationPolicy has no egress rules.
+Istio `ALLOW` activates default deny for selected destinations and Istio
+`DENY` overrides matching allows. `AUDIT` and dry-run policies do not enforce
+reachability in the graph. NPG resolves the mesh root namespace from installed
+Istio mesh ConfigMaps and otherwise uses Istio's `istio-system` default.
+Unavailable, invalid, or conflicting mesh configuration is reported as partial
+data. Certificate-derived source namespace, service-account, principal, and
+trust-domain constraints require mTLS state that is not present in the graph
+snapshot. NPG approximates them from workload metadata using the default
+`cluster.local` trust domain and labels the result partial data.
+AuthorizationPolicy is TCP/HTTP-scoped, so network-layer UDP and SCTP
+permissions pass through unchanged.
 
 ## 2. Terminology
 
@@ -111,6 +135,11 @@ A **primitive** is a peer-side reachability target or source:
 For aggregate primitives, `Allowed` means every evaluated concrete pod pair is
 allowed. A mix of allowed and non-allowed pairs is `Partial`, not `Allowed`.
 
+CIDR permissions must hold across the entire displayed range. An overlapping
+explicit deny can make a CIDR result `Unknown`. In that case, the graph keeps
+only port permissions guaranteed for the whole range, rather than implying
+that the range is uniformly allowed or denied.
+
 ### Pod pair
 
 A **pod pair** is one concrete source pod and destination pod combination.
@@ -151,16 +180,22 @@ An egress rule:
 End-to-end egress reachability also requires the destination pod's ingress side
 to allow compatible traffic.
 
-### NetworkPolicy rules
+### Policy rules
 
-A NetworkPolicy rule is one entry in `spec.ingress` or `spec.egress`. NPG
-identifies a real rule by:
+A policy rule is a Kubernetes or Cilium ingress/egress entry, or an Istio
+authorization rule. NPG identifies a real rule by:
 
+- policy type (`NetworkPolicy`, `CiliumNetworkPolicy`,
+  `CiliumClusterwideNetworkPolicy`, or `AuthorizationPolicy`);
 - policy namespace and name;
+- allow or deny action;
 - direction;
 - zero-based rule index.
 
-Rules can match peers with:
+Cilium resources with multiple top-level `specs` also include the spec index in
+their stable rule identity.
+
+Native Kubernetes NetworkPolicy rules can match peers with:
 
 - `podSelector`;
 - `namespaceSelector`;
@@ -168,14 +203,24 @@ Rules can match peers with:
 - `ipBlock`, including `except` ranges;
 - an omitted peer list, which means all peers.
 
-An omitted port list allows all ports for the protocols represented by the
-evaluation. Named ports are resolved against destination pod container ports
-when possible. Ambiguous named ports are reported as unknown rather than being
-treated as allowed.
+For native NetworkPolicy, an omitted port list allows all ports for the
+protocols represented by the evaluation. Named ports are resolved against
+destination pod container ports when possible. Ambiguous named ports are
+reported as unknown rather than being treated as allowed.
+
+Empty rules are API-specific. A native NetworkPolicy `{}` rule allows all peers
+and ports. For Cilium policies, an omitted or empty direction list has no
+effect, while `ingress: [{}]` or `egress: [{}]` does not itself allow traffic
+and normally isolates that direction; `enableDefaultDeny` controls isolation.
+Use explicit Cilium peers such as `fromEntities: [all]` or `toEntities: [all]`
+for a blanket allow. Istio `ALLOW` also distinguishes absent or empty `rules`
+(no allowed requests) from `rules: [{}]` (all requests, still intersected with
+network permissions).
 
 NPG can also display synthetic rules:
 
-- **unrestricted**: no NetworkPolicy isolates the pod in that direction;
+- **unrestricted**: no policy in the evaluated layer isolates the pod in that
+  direction;
 - **default-deny**: a policy isolates the pod, but no additive allow rule
   permits the evaluated peer and port.
 
@@ -304,9 +349,10 @@ Rules are rendered as two-line blocks without a header.
 | Displayed field | Meaning | Possible values |
 |---|---|---|
 | Rule identity | Policy namespace/name and zero-based rule index. Synthetic rows use their synthetic name and index `-1`. | `payments/allow-api #0`, `default-deny #-1`, `unrestricted #-1`. |
+| Type | API policy type supplying the rule. | `NetworkPolicy`, `CiliumNetworkPolicy`, `CiliumClusterwideNetworkPolicy`, `AuthorizationPolicy`, or `Synthetic`. |
 | Ports | Permissions contributed by the rule. | Protocol/all, numeric ports, ranges, named or unknown ports, or `no ports`. |
-| `subjects matched/selected` | Number of subject pods for which the rule contributed evidence divided by the number selected by the policy for that direction. | For example, `subjects 2/3`. |
-| `peer` | Compact summary of the rule's peer selectors. | `all peers`, selector text, CIDR text, `default-deny`, or `unrestricted`. |
+| `subjects matched/selected` | Number of subject pods for which the rule contributed evidence divided by the subject pods selected by the policy for that direction. Ingress subjects are destinations; egress subjects are sources. | For example, `subjects 2/3`. |
+| `peer` | Compact summary of the opposite endpoint matched by the rule. For ingress the peer is a source; for egress it is a destination. | `all peers`, selector text, CIDR text, `default-deny`, or `unrestricted`. |
 
 Rules do not use a separate visible state column. The row color carries the
 state, and the full state is shown in Rule Details.
@@ -319,11 +365,11 @@ state, and the full state is shown in Rule Details.
 | `[EMPTY]` | No subject pod was available or no selected subject pod matched the rule. Non-synthetic empty rules are hidden; synthetic explanation rows remain visible. |
 
 Synthetic rows use the normal foreground color instead of an allow/deny color
-because they are explanations, not real NetworkPolicy rules.
+because they are explanations, not real policy rules.
 
 When a real rule is selected and the direction panel has focus:
 
-- `o` opens the NetworkPolicy resource;
+- `o` opens the Kubernetes, Cilium, or Istio policy resource;
 - `y` opens its YAML.
 
 These actions are unavailable for synthetic rules.
@@ -365,7 +411,7 @@ The Details panel follows the active direction and current selection.
 When a rule is selected in Rules mode, Rule Details contains:
 
 - direction and subject identity;
-- policy namespace, name, and UID;
+- policy type, namespace, name, API version, UID, and allow/deny action;
 - zero-based rule index;
 - rule state;
 - policy pod selector;
@@ -373,6 +419,7 @@ When a rule is selected in Rules mode, Rule Details contains:
 - each peer selector or IP block;
 - ports;
 - rendered rule YAML;
+- notes about conservatively approximated semantics;
 - contributing evidence;
 - warnings.
 

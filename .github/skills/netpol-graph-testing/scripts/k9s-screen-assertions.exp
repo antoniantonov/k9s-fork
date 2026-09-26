@@ -1,0 +1,700 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Authors of K9s
+
+proc regexp_quote {value} {
+  regsub -all {[][\\.^$*+?(){}|]} $value {\\&} result
+  return $result
+}
+
+# Keep terminal cells and incomplete escapes across reads, not the entire stream.
+# Replaying an ever-growing ANSI prefix on every short PTY read starves input.
+proc reset_screen {state height width} {
+  upvar 1 $state rows
+  array unset rows
+  array set rows [list height $height width $width row 1 col 1 saved_row 1 saved_col 1 pending "" blank [string repeat " " $width]]
+  for {set y 1} {$y <= $height} {incr y} { set rows($y) $rows(blank) }
+}
+
+proc append_screen {state raw} {
+  upvar 1 $state rows
+  foreach name {height width row col saved_row saved_col blank} { set $name $rows($name) }
+  set raw "$rows(pending)$raw"
+  set rows(pending) ""
+  for {set i 0} {$i < [string length $raw]} {incr i} {
+    set char [string index $raw $i]
+    if {$char eq "\033"} {
+      set tail [string range $raw $i end]
+      if {[regexp {^\x1b\[([0-9;?]*)([ -/]*)([@-~])} $tail sequence parameters intermediate command]} {
+        incr i [expr {[string length $sequence] - 1}]
+        set values [split [string trimleft $parameters "?"] ";"]
+        set first [lindex $values 0]
+        if {$first eq ""} { set first 1 }
+        switch -- $command {
+          H - f {
+            set row $first
+            set col [lindex $values 1]
+            if {$col eq ""} { set col 1 }
+          }
+          A { incr row -$first }
+          B { incr row $first }
+          C { incr col $first }
+          D { incr col -$first }
+          E { incr row $first; set col 1 }
+          F { incr row -$first; set col 1 }
+          G { set col $first }
+          d { set row $first }
+          J {
+            if {$parameters eq "2" || $parameters eq "3"} {
+              for {set y 1} {$y <= $height} {incr y} { set rows($y) $blank }
+            } elseif {$parameters eq "1"} {
+              for {set y 1} {$y < $row} {incr y} { set rows($y) $blank }
+              set rows($row) [string replace $rows($row) 0 [expr {$col - 1}] [string repeat " " $col]]
+            } else {
+              set rows($row) [string replace $rows($row) [expr {$col - 1}] end [string repeat " " [expr {$width - $col + 1}]]]
+              for {set y [expr {$row + 1}]} {$y <= $height} {incr y} { set rows($y) $blank }
+            }
+          }
+          K {
+            if {[info exists rows($row)]} {
+              if {$parameters eq "2"} {
+                set rows($row) $blank
+              } elseif {$parameters eq "1"} {
+                set rows($row) [string replace $rows($row) 0 [expr {$col - 1}] [string repeat " " $col]]
+              } else {
+                set rows($row) [string replace $rows($row) [expr {$col - 1}] end [string repeat " " [expr {$width - $col + 1}]]]
+              }
+            }
+          }
+          s { set saved_row $row; set saved_col $col }
+          u { set row $saved_row; set col $saved_col }
+        }
+        set row [expr {max(1, min($height, $row))}]
+        set col [expr {max(1, min($width, $col))}]
+      } elseif {[regexp {^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)} $tail sequence]} {
+        incr i [expr {[string length $sequence] - 1}]
+      } elseif {[regexp {^\x1b[()][A-Z0-9]} $tail sequence]} {
+        incr i [expr {[string length $sequence] - 1}]
+      } elseif {[string first "\033\]" $tail] == 0 ||
+                [regexp {^\x1b(?:\[[0-9;?]*[ -/]*|[()])?$} $tail]} {
+        set rows(pending) $tail
+        break
+      } else {
+        incr i
+      }
+      continue
+    }
+    switch -- $char {
+      "\r" { set col 1 }
+      "\n" { incr row; set row [expr {min($height, $row)}] }
+      "\b" { set col [expr {max(1, $col - 1)}] }
+      "\t" { set col [expr {min($width, (($col - 1) / 8 + 1) * 8 + 1)}] }
+      default {
+        scan $char %c code
+        if {$code >= 32 && $col <= $width} {
+          set rows($row) [string replace $rows($row) [expr {$col - 1}] [expr {$col - 1}] $char]
+          incr col
+        }
+      }
+    }
+  }
+  foreach name {row col saved_row saved_col} { set rows($name) [set $name] }
+}
+
+proc screen_text {state} {
+  upvar 1 $state rows
+  set result {}
+  for {set y 1} {$y <= $rows(height)} {incr y} { lappend result [string trimright $rows($y)] }
+  return [join $result "\n"]
+}
+
+proc render_screen {raw {height 50} {width 260}} {
+  reset_screen terminal $height $width
+  append_screen terminal $raw
+  return [screen_text terminal]
+}
+
+proc complete_repaint {screen} {
+  # K9s can retain a blank spacer below its bottom breadcrumb.
+  foreach line [lrange [split $screen "\n"] end-1 end] {
+    if {[regexp {^[[:space:]]*<[^>\n]+>} $line]} { return 1 }
+  }
+  return 0
+}
+
+proc screen_regexp {pattern screen} {
+  return [regexp $pattern $screen]
+}
+
+proc screen_patterns {patterns screen} {
+  foreach pattern $patterns {
+    if {![regexp $pattern $screen]} { return 0 }
+  }
+  return 1
+}
+
+proc capture_screen {{report_eof 1} {predicate ""} {read_seconds 20}} {
+  global screen_columns screen_rows
+  set started [clock milliseconds]
+  set ::screen_eof 0
+  set ::last_capture_matched 0
+  if {![drain 1 3]} {
+    set ::screen_eof 1
+    if {$report_eof} { fail_case "process exited while capturing a fresh screen" }
+    return ""
+  }
+  set drained [clock milliseconds]
+  repaint
+  set repainted [clock milliseconds]
+  set deadline [expr {$repainted + $read_seconds * 1000}]
+  reset_screen terminal $screen_rows $screen_columns
+  set received 0
+  set reads 0
+  set old_timeout $::timeout
+  # Continuation chunks belong to this repaint and share its original deadline.
+  set ::timeout [expr {max(0, ($deadline - [clock milliseconds] + 999) / 1000)}]
+  expect {
+    -re {(?s).+} {
+      incr reads
+      incr received [string length $expect_out(0,string)]
+      append_screen terminal $expect_out(0,string)
+      set screen [screen_text terminal]
+      if {[clock milliseconds] <= $deadline && [complete_repaint $screen] &&
+          ($predicate eq "" || [{*}$predicate $screen])} {
+        set ::last_capture_matched 1
+      } elseif {[clock milliseconds] < $deadline} { exp_continue -continue_timer }
+    }
+    timeout {}
+    eof {
+      set ::screen_eof 1
+      if {$report_eof} { fail_case "process exited while capturing a fresh screen" }
+    }
+  }
+  set ::timeout $old_timeout
+  set screen [screen_text terminal]
+  set ::last_capture_summary [dict create drain_ms [expr {$drained - $started}] \
+    repaint_ms [expr {$repainted - $drained}] elapsed_ms [expr {[clock milliseconds] - $started}] \
+    read_budget_ms [expr {$read_seconds * 1000}] reads $reads characters $received \
+    complete [complete_repaint $screen] eof $::screen_eof pending [string length $terminal(pending)]]
+  if {$report_eof && !$::screen_eof && !$::last_capture_matched} {
+    fail_case "timed out waiting for a complete fresh repaint\nCapture: $::last_capture_summary\n$screen"
+  }
+  return $screen
+}
+
+proc snapshot_contains {screen value} {
+  if {[string first $value $screen] >= 0} { return 1 }
+  fail_case "fresh screen is missing <$value>\n$screen"
+  return 0
+}
+
+proc snapshot_excludes {screen value} {
+  if {[string first $value $screen] < 0} { return 1 }
+  fail_case "fresh screen unexpectedly contains <$value>\n$screen"
+  return 0
+}
+
+proc table_rows {screen title headers} {
+  set active [expr {$title eq ""}]
+  set offsets {}
+  set result {}
+  foreach line [split $screen "\n"] {
+    if {!$active} {
+      if {[string first $title $line] >= 0} { set active 1 }
+      continue
+    }
+    if {[llength $offsets] == 0} {
+      set positions {}
+      set previous -1
+      foreach header $headers {
+        set position [string first $header $line [expr {$previous + 1}]]
+        if {$position < 0} { set positions {}; break }
+        lappend positions $position
+        set previous $position
+      }
+      if {[llength $positions] == [llength $headers]} { set offsets $positions }
+      continue
+    }
+    if {[regexp {[╭╰┌└]} $line]} { break }
+    set cells [dict create]
+    for {set index 0} {$index < [llength $headers]} {incr index} {
+      set end [expr {[string length $line] - 1}]
+      if {$index + 1 < [llength $offsets]} { set end [expr {[lindex $offsets [expr {$index + 1}]] - 1}] }
+      set cell [string range $line [lindex $offsets $index] $end]
+      dict set cells [lindex $headers $index] [string trim $cell " \t│┃"]
+    }
+    if {[dict get $cells [lindex $headers 0]] ne ""} { lappend result $cells }
+  }
+  return $result
+}
+
+proc exact_table_row {screen title headers key} {
+  set found {}
+  foreach row [table_rows $screen $title $headers] {
+    if {[dict get $row [lindex $headers 0]] eq $key} { lappend found $row }
+  }
+  if {[llength $found] != 1} {
+    fail_case "expected exactly one <$key> row in <$title>, got [llength $found]\n$screen"
+    return {}
+  }
+  return [lindex $found 0]
+}
+
+proc panel_lines {screen title} {
+  set active 0
+  set lines {}
+  foreach line [split $screen "\n"] {
+    if {!$active} {
+      if {[string first $title $line] >= 0} { set active 1 }
+      continue
+    }
+    if {[regexp {[╭╰┌└]} $line]} { break }
+    lappend lines [string trim $line " \t│┃"]
+  }
+  return $lines
+}
+
+proc rule_rows {screen title} {
+  set rows {}
+  foreach line [panel_lines $screen $title] {
+    if {[regexp {^(.+ #-?[0-9]+)[[:space:]]+([^[:space:]]+)[[:space:]]+(.+)$} $line match name type ports]} {
+      lappend rows [dict create Name [string trim $name] Type $type Ports [string trim $ports]]
+    }
+  }
+  return $rows
+}
+
+proc port_set {text} {
+  if {$text eq "no ports"} { return {} }
+  set pattern {(TCP|UDP|SCTP)/([0-9]+(?:-[0-9]+)?|\*)}
+  set matches [regexp -all -inline $pattern $text]
+  regsub -all $pattern $text "" rest
+  if {[string trim $rest " ,;\t"] ne "" || [llength $matches] == 0} {
+    error "unrecognized port summary <$text>"
+  }
+  set result {}
+  foreach {match protocol interval} $matches {
+    if {$interval eq "*"} { lappend result "$protocol/*"; continue }
+    set bounds [split $interval "-"]
+    set low [lindex $bounds 0]
+    set high [lindex $bounds end]
+    for {set port $low} {$port <= $high} {incr port} { lappend result "$protocol/$port" }
+  }
+  return [lsort -unique $result]
+}
+
+proc assert_ports {actual expected} {
+  if {[catch {set actual_set [port_set $actual]} message]} {
+    fail_case $message
+    return 0
+  }
+  if {$actual_set ne [port_set $expected]} {
+    fail_case "ports differ: expected exactly <$expected>, got <$actual>"
+    return 0
+  }
+  return 1
+}
+
+proc assert_applicability_values {row state ports peer_match opposite} {
+  foreach {column expected} [list State $state Peer $peer_match Opposite $opposite Ports $ports] {
+    set actual [dict get $row $column]
+    if {$expected eq "" && $column in {Peer Opposite}} {
+      if {$actual in {true false}} { continue }
+    } elseif {$actual eq $expected} { continue }
+    fail_case "wrong $column in applicability row: expected <$expected>, got <$actual>"
+    return 0
+  }
+  return 1
+}
+
+proc filter_to {value} {
+  send_key "/"
+  if {![assert_screen {Reachability Search|Filter:} 10]} { return 0 }
+  send_key "\t\t"
+  send_key "\r"
+  send_key "/"
+  if {![assert_screen {Reachability Search|Filter:} 10]} { return 0 }
+  send_key $value
+  send_key "\t"
+  send_key "\r" 400
+  return 1
+}
+
+proc command_prompt_open {screen} {
+  foreach line [split $screen "\n"] {
+    set line [string trimleft $line " \t│┃"]
+    # The optional icon may occupy multiple cells or use a different encoding.
+    if {[regexp {^[^!-~]*>[[:space:]]*} $line]} { return 1 }
+  }
+  return 0
+}
+
+proc graph_ready {subject screen} {
+  if {[command_prompt_open $screen] ||
+      [regexp -nocase {Waiting for |workloads loading} $screen] ||
+      [string first "Reachability Search" $screen] >= 0 ||
+      [string first "Filter:" $screen] >= 0} { return 0 }
+  if {$subject ne "" && [string first $subject $screen] < 0} { return 0 }
+  if {[string first "<npg>" $screen] < 0 ||
+      ![regexp {(Pod|Deployment|Job|Namespace) [^\n]+ · [1-9][0-9]* pods?\M} $screen] ||
+      ![regexp {(Effective|Rule|Primitive) Details|Both directions are hidden} $screen]} { return 0 }
+  set kind ""
+  set namespace ""
+  set name ""
+  set needed 1
+  if {$subject ne "" && ![regexp {^(Pod|Deployment) ([^/ ]+)/([^ ]+) · ([1-9][0-9]*) pods?$} $subject match kind namespace name needed]} { return 0 }
+  set ready 0
+  foreach row [table_rows $screen " Subject " {KIND NAMESPACE NAME STATUS}] {
+    if {[dict get $row KIND] ne "Pod" ||
+        ($namespace ne "" && [dict get $row NAMESPACE] ne $namespace) ||
+        ($kind eq "Pod" && [dict get $row NAME] ne $name)} { continue }
+    if {[regexp {^Running · ([0-9]+)/([0-9]+) ready\M} [dict get $row STATUS] match running total] &&
+        $running > 0 && $running == $total} { incr ready }
+  }
+  return [expr {$ready >= $needed}]
+}
+
+proc wait_for_frame {predicate {seconds 45}} {
+  set ::last_wait_screen [capture_screen 0 $predicate $seconds]
+  if {![expr {[info exists ::screen_eof] && $::screen_eof}] &&
+      $::last_capture_matched &&
+      [complete_repaint $::last_wait_screen] &&
+      [{*}$predicate $::last_wait_screen]} {
+    return $::last_wait_screen
+  }
+  return ""
+}
+
+proc fail_graph_setup {message} {
+  set ::navigation_setup_error $message
+  if {[info exists ::last_capture_summary]} { append message "\nCapture: $::last_capture_summary" }
+  fail_case "$message\n$::last_wait_screen"
+  return 0
+}
+
+proc open_edge_subject {name namespace direction {seconds 60}} {
+  global screen_columns
+  set screen_columns 260
+  if {[info exists ::navigation_setup_error] && $::navigation_setup_error ne ""} {
+    fail_case "graph setup aborted after: $::navigation_setup_error"
+    return 0
+  }
+  if {[wait_for_frame [list graph_ready ""] $seconds] eq ""} {
+    return [fail_graph_setup "current NPG did not reach a workload-ready frame before opening $namespace/$name"]
+  }
+  send_key ":"
+  if {[wait_for_frame command_prompt_open [expr {min(10, $seconds)}]] eq ""} {
+    return [fail_graph_setup "command prompt did not open for $namespace/$name"]
+  }
+  send -- "npg pod $name $namespace\r"
+  set subject "Pod $namespace/$name · 1 pod"
+  if {[wait_for_frame [list graph_ready $subject] $seconds] eq ""} {
+    return [fail_graph_setup "NPG did not render exactly <$subject> with workloads ready and command prompt closed"]
+  }
+  if {![ensure_rules]} { return 0 }
+  if {$direction eq "Ingress"} {
+    send_key "e"
+    send_key "\033\[D"
+  } else {
+    send_key "i"
+    send_key "\033\[C"
+  }
+  return 1
+}
+
+proc assert_edge_context {screen subject namespace direction partial selected} {
+  set title "Effective Applicability ($direction)"
+  if {$selected} { set title "Applicability ($direction)" }
+  if {![snapshot_contains $screen "Pod $namespace/$subject · 1 pod"] ||
+      ![snapshot_contains $screen "$direction · Rules"] ||
+      ![snapshot_contains $screen $title]} { return 0 }
+  if {$selected} {
+    if {![snapshot_excludes $screen "Effective Applicability ($direction)"] ||
+        ![snapshot_contains $screen "Rule Details"]} { return 0 }
+  } elseif {![snapshot_contains $screen "Selection: none"] ||
+            ![snapshot_contains $screen "Effective Details"]} { return 0 }
+  if {$partial} {
+    if {![snapshot_contains $screen "Partial Data"]} { return 0 }
+  } elseif {![snapshot_excludes $screen "Partial Data"]} { return 0 }
+  return 1
+}
+
+proc applicability_surface_ready {title key screen} {
+  set active 0
+  set closed 0
+  foreach line [split $screen "\n"] {
+    if {!$active} {
+      if {[string first $title $line] >= 0} { set active 1 }
+      continue
+    }
+    if {[regexp {[╰└]} $line]} { set closed 1; break }
+  }
+  if {!$closed} { return 0 }
+  foreach row [table_rows $screen $title {Primitive Peer Opposite State Ports}] {
+    if {[dict get $row Primitive] eq $key} { return 1 }
+  }
+  return 0
+}
+
+proc assert_edge_row {subject namespace direction peer peer_namespace state ports {partial 0} {selected 0} {peer_match ""} {opposite ""}} {
+  set title "Effective Applicability ($direction)"
+  if {$selected} { set title "Applicability ($direction)" }
+  set key "Pod $peer_namespace/$peer"
+  set screen [wait_for_frame [list applicability_surface_ready $title $key] 20]
+  if {$screen eq ""} {
+    fail_case "timed out waiting for complete <$title> and exact <$key> row\n$::last_wait_screen"
+    return 0
+  }
+  if {![assert_edge_context $screen $subject $namespace $direction $partial $selected]} { return 0 }
+  set row [exact_table_row $screen $title {Primitive Peer Opposite State Ports} $key]
+  if {$row eq ""} { return 0 }
+  return [assert_applicability_values $row $state $ports $peer_match $opposite]
+}
+
+proc verify_effective_edge {name subject namespace direction peer peer_namespace state ports {partial 0}} {
+  start_case $name 0
+  if {![open_edge_subject $subject $namespace $direction]} { return }
+  send_key "\r"
+  if {![filter_to "Pod $peer_namespace/$peer"]} { return }
+  set peer_match ""
+  set opposite false
+  if {$state in {Allowed {Partial Data}}} { set peer_match true; set opposite true }
+  if {[assert_edge_row $subject $namespace $direction $peer $peer_namespace $state $ports $partial 0 $peer_match $opposite]} { pass_case }
+}
+
+proc assert_yaml_origin {kind version policy namespace} {
+  set screen [capture_screen]
+  foreach value [list "apiVersion: $version" "kind: $kind" "name: $policy"] {
+    if {![snapshot_contains $screen $value]} { return 0 }
+  }
+  if {$namespace ne "" && ![snapshot_contains $screen "namespace: $namespace"]} { return 0 }
+  return 1
+}
+
+proc selected_policy_matches {screen type policy action} {
+  set start [string first "Rule Details" $screen]
+  if {$start < 0} { return 0 }
+  set details [string range $screen $start end]
+  set end [string first "Applicability (" $details]
+  if {$end >= 0} { set details [string range $details 0 [expr {$end - 1}]] }
+  if {$type eq "CiliumClusterwideNetworkPolicy"} { set policy "—/$policy" }
+  return [expr {
+    [regexp "Policy type: *[regexp_quote $type]\\M" $details] &&
+    [regexp "(^|\\s)[regexp_quote $policy](\\s|$)" $details] &&
+    [regexp -nocase "Action: *[regexp_quote $action]\\M" $details]
+  }]
+}
+
+proc rule_name_matches {rendered reference} {
+  return [regexp "^[regexp_quote $reference] #\\d+$" $rendered]
+}
+
+proc assert_selected_edge_rule {screen direction reference type version action ports} {
+  if {![selected_policy_matches $screen $type $reference $action]} {
+    fail_case "wrong selected rule: expected $type $reference $action"
+    return 0
+  }
+  set matches 0
+  foreach row [rule_rows $screen "$direction · Rules"] {
+    if {[dict get $row Name] eq "$reference #0" && [dict get $row Type] eq $type} {
+      if {[dict get $row Ports] eq $ports} { incr matches }
+    }
+  }
+  if {$matches != 1} {
+    fail_case "expected one exact rule row: $reference #0 | $type | $ports; got $matches\n$screen"
+    return 0
+  }
+  if {![regexp {Rule index: 0\M} $screen]} {
+    fail_case "selected $reference $action did not retain rule index 0"
+    return 0
+  }
+  return [expr {[snapshot_contains $screen "API version: $version"] &&
+                [snapshot_excludes $screen "Spec index:"]}]
+}
+
+proc verify_edge_policy {name subject namespace direction policy policy_namespace type version resource action rule_ports peer peer_namespace effective_ports {controls {}}} {
+  start_case $name 0
+  if {![open_edge_subject $subject $namespace $direction]} { return }
+  set reference $policy
+  if {$policy_namespace ne ""} { set reference "$policy_namespace/$policy" }
+  set screen [select_named_rule $policy $reference $type $action]
+  if {$screen eq "" || ![assert_selected_edge_rule $screen $direction $reference $type $version $action $rule_ports]} { return }
+  send_key "o"
+  set resource_screen [capture_screen]
+  if {![snapshot_contains $resource_screen $resource] ||
+      ![snapshot_excludes $resource_screen "· Rules"] ||
+      ![snapshot_excludes $resource_screen "Rule Details"]} { return }
+  send_key "y"
+  if {![assert_yaml_origin $type $version $policy $policy_namespace]} { return }
+  send_key "\033"
+  send_key "\033"
+  if {![selected_policy_matches [capture_screen] $type $reference $action]} {
+    fail_case "resource return lost the selected $reference rule"
+    return
+  }
+  send_key "y"
+  if {![assert_yaml_origin $type $version $policy $policy_namespace]} { return }
+  send_key "\033"
+  send_key "\r"
+  if {![filter_to "Pod $peer_namespace/$peer"]} { return }
+  if {![selected_policy_matches [capture_screen] $type $reference $action]} {
+    fail_case "peer filtering lost the selected $reference rule"
+    return
+  }
+  if {![assert_edge_row $subject $namespace $direction $peer $peer_namespace Allowed $effective_ports 0 1 true true]} { return }
+  foreach control $controls {
+    lassign $control control_action control_ports control_peer control_namespace state ports peer_match opposite
+    if {![open_edge_subject $subject $namespace $direction]} { return }
+    set screen [select_named_rule $policy $reference $type $control_action]
+    if {$screen eq "" || ![assert_selected_edge_rule $screen $direction $reference $type $version $control_action $control_ports]} { return }
+    send_key "\r"
+    if {![filter_to "Pod $control_namespace/$control_peer"]} { return }
+    if {![selected_policy_matches [capture_screen] $type $reference $control_action]} {
+      fail_case "peer filtering lost the selected $reference $control_action rule"
+      return
+    }
+    if {![assert_edge_row $subject $namespace $direction $control_peer $control_namespace $state $ports 0 1 $peer_match $opposite]} { return }
+  }
+  pass_case
+}
+
+proc select_named_rule {policy reference type action} {
+  if {![filter_to $policy]} { return "" }
+  for {set move 0} {$move < 8} {incr move} {
+    send_key "\033\[B"
+    set screen [capture_screen]
+    if {[selected_policy_matches $screen $type $reference $action]} { return $screen }
+  }
+  fail_case "could not select $reference $action"
+  return ""
+}
+
+proc verify_source_authz_noninterference {} {
+  global ns_edge_src
+  start_case istio-source-ingress-deny-egress-control 0
+  if {![open_edge_subject authz-client $ns_edge_src Egress]} { return }
+  set screen [capture_screen]
+  set native_found 0
+  foreach row [rule_rows $screen "Egress · Rules"] {
+    if {[dict get $row Type] eq "AuthorizationPolicy"} {
+      fail_case "source-local AuthorizationPolicy appeared as an egress rule"
+      return
+    }
+    if {[rule_name_matches [dict get $row Name] "$ns_edge_src/authz-source-network"] &&
+        [dict get $row Type] eq "NetworkPolicy"} {
+      if {[dict get $row Ports] ne "SCTP/9000, TCP/8080, TCP/8081, UDP/5353"} {
+        fail_case "source egress declared ports differ: [dict get $row Ports]"
+        return
+      }
+      set native_found 1
+    }
+  }
+  if {!$native_found} { fail_case "source egress network rule was not present"; return }
+  if {![open_edge_subject authz-client $ns_edge_src Ingress]} { return }
+  set screen [select_named_rule authz-client-ingress-deny "$ns_edge_src/authz-client-ingress-deny" AuthorizationPolicy DENY]
+  if {$screen ne "" && [snapshot_contains $screen "Ingress · Rules"] &&
+      [snapshot_contains $screen "API version: security.istio.io/v1"]} { pass_case }
+}
+
+proc verify_identity_edge {direction} {
+  global ns_edge_src ns_edge_dst probe_id
+  start_case "istio-identity-[string tolower $direction]-partial-data" 0
+  if {$direction eq "Ingress"} {
+    set subject authz-identity
+    set namespace $ns_edge_dst
+    set peer authz-client
+    set peer_namespace $ns_edge_src
+  } else {
+    set subject authz-client
+    set namespace $ns_edge_src
+    set peer authz-identity
+    set peer_namespace $ns_edge_dst
+  }
+  if {![open_edge_subject $subject $namespace $direction]} { return }
+  send_key "\r"
+  if {![filter_to "Pod $peer_namespace/$peer"]} { return }
+  set screen [capture_screen]
+  if {![assert_edge_context $screen $subject $namespace $direction 1 0]} { return }
+  set row [exact_table_row $screen "Effective Applicability ($direction)" {Primitive Peer Opposite State Ports} "Pod $peer_namespace/$peer"]
+  if {$row eq ""} { return }
+  if {[dict get $row State] ne "Partial Data"} { fail_case "identity-dependent path was reported as known"; return }
+  if {[catch {set ports [port_set [dict get $row Ports]]} message]} { fail_case $message; return }
+  foreach required {UDP/5353 SCTP/9000} {
+    if {$required ni $ports} { fail_case "identity uncertainty removed non-TCP permission $required"; return }
+  }
+  foreach port $ports {
+    if {$port ni {TCP/8080 TCP/8081 UDP/5353 SCTP/9000}} {
+      fail_case "identity fixture invented permission $port"
+      return
+    }
+  }
+  if {![open_edge_subject authz-identity $ns_edge_dst Ingress]} { return }
+  set policy "probe-identity-$probe_id"
+  set screen [select_named_rule $policy "$ns_edge_dst/$policy" AuthorizationPolicy ALLOW]
+  if {$screen eq ""} { return }
+  if {![regexp -nocase {mTLS|certificate|identity} $screen]} {
+    fail_case "identity-constrained rule has no identity uncertainty note\n$screen"
+    return
+  }
+  if {[snapshot_contains $screen "Partial Data"]} { pass_case }
+}
+
+proc unsupported_diagnostics {reference screen} {
+  global ns_edge_src
+  set subject "Pod $ns_edge_src/uncertain-client · 1 pod"
+  foreach value [list $subject "Egress · Rules" "Effective Details"] {
+    if {[string first $value $screen] < 0} { return 0 }
+  }
+  set partial_subject 0
+  foreach line [split $screen "\n"] {
+    if {[string first $subject $line] >= 0 && [regexp {PARTIAL DATA \([1-9][0-9]* warning\(s\)\)} $line]} {
+      set partial_subject 1
+    }
+  }
+  if {!$partial_subject} { return 0 }
+  set warning "Warning: snapshot resource \"ciliumnetworkpolicies\" could not be fully evaluated: $reference: egress allow rule 0: toFQDNs requires live DNS resolution"
+  set diagnosed 0
+  foreach line [panel_lines $screen "Effective Details"] {
+    if {$line eq $warning} { set diagnosed 1; break }
+  }
+  if {!$diagnosed} { return 0 }
+  foreach row [table_rows $screen "Effective Applicability (Egress)" {Primitive Peer Opposite State Ports}] {
+    if {[dict get $row State] eq "Partial Data"} { return 1 }
+  }
+  return 0
+}
+
+proc verify_unsupported_policy {} {
+  global ns_edge_src probe_id
+  start_case unsupported-cilium-rule-details 0
+  if {![open_edge_subject uncertain-client $ns_edge_src Egress]} { return }
+  if {![assert_edge_context [capture_screen] uncertain-client $ns_edge_src Egress 1 0]} { return }
+  send_key "\t"
+  send_key "\033\[F"
+  set reference "$ns_edge_src/probe-unsupported-$probe_id"
+  if {[wait_for_frame [list unsupported_diagnostics $reference] 15] eq ""} {
+    fail_case "effective details did not show Partial Data and the exact $reference toFQDNs warning\n$::last_wait_screen"
+    return
+  }
+  pass_case
+}
+
+proc verify_cidr_narrow_deny {} {
+  global ns_edge_src
+  start_case cilium-cidr-narrow-deny 0
+  if {![open_edge_subject cidr-client $ns_edge_src Egress]} { return }
+  send_key "\r"
+  foreach {prefix state} {203.0.113.0/24 Unknown 203.0.113.128/25 Disallowed} {
+    if {![filter_to "CIDR $prefix"]} { return }
+    set screen [capture_screen]
+    if {![assert_edge_context $screen cidr-client $ns_edge_src Egress 0 0]} { return }
+    set matches {}
+    foreach row [table_rows $screen "Effective Applicability (Egress)" {Primitive Peer Opposite State Ports}] {
+      if {[regexp {^CIDR ([^[:space:]]+)(?:[[:space:]]|$)} [dict get $row Primitive] match cidr] && $cidr eq $prefix} {
+        lappend matches $row
+      }
+    }
+    if {[llength $matches] != 1} { fail_case "expected exactly one CIDR $prefix row\n$screen"; return }
+    if {![assert_applicability_values [lindex $matches 0] $state {no ports} true n/a]} { return }
+  }
+  pass_case
+}
