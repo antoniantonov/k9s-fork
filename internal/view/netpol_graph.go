@@ -255,11 +255,12 @@ type NetworkPolicyGraph struct {
 	// kind. The model reports a result and a partial-data failure back to back
 	// for the same refresh, so a single slot would let the failure discard the
 	// evaluation entirely.
-	pendingResult *netpol.SubjectResult
-	pendingErr    error
-	updateQueued  bool
-	refreshing    bool
-	refreshQueued bool
+	pendingResult     *netpol.SubjectResult
+	pendingErr        error
+	pendingErrSubject netpol.SubjectRef
+	updateQueued      bool
+	refreshing        bool
+	refreshQueued     bool
 }
 
 var (
@@ -568,7 +569,9 @@ func (v *NetworkPolicyGraph) NetPolGraphChanged(result netpol.SubjectResult) {
 // NetPolGraphFailed reports failures while retaining any usable partial result.
 func (v *NetworkPolicyGraph) NetPolGraphFailed(err error) {
 	if v.app == nil {
-		v.applyError(err)
+		if v.model.LastRefresh().Subject == v.subject {
+			v.applyError(err)
+		}
 		return
 	}
 	v.queueUpdate(nil, err)
@@ -582,14 +585,24 @@ func (v *NetworkPolicyGraph) NetPolGraphFailed(err error) {
 // Results and failures are tracked separately on purpose. A partial-data
 // refresh fires NetPolGraphChanged immediately followed by NetPolGraphFailed,
 // and the queued drain cannot have run in between, so a single slot would let
-// the failure overwrite - and silently discard - the evaluated result.
+// the failure overwrite - and silently discard - the evaluated result. A newer
+// result supersedes any older failure; a following failure still annotates it.
 func (v *NetworkPolicyGraph) queueUpdate(result *netpol.SubjectResult, err error) {
+	if result != nil && !matchesNetPolSubject(v.model.Subject(), result.Subject.Ref) {
+		return
+	}
+	var errorSubject netpol.SubjectRef
+	if err != nil {
+		errorSubject = v.model.LastRefresh().Subject
+	}
 	v.mx.Lock()
 	if result != nil {
 		v.pendingResult = result
+		v.pendingErr = nil
 	}
 	if err != nil {
 		v.pendingErr = err
+		v.pendingErrSubject = errorSubject
 	}
 	queue := !v.updateQueued
 	v.updateQueued = true
@@ -604,13 +617,13 @@ func (v *NetworkPolicyGraph) queueUpdate(result *netpol.SubjectResult, err error
 // so a partial-data failure annotates it instead of replacing it.
 func (v *NetworkPolicyGraph) drainPendingUpdate() {
 	v.mx.Lock()
-	result, err := v.pendingResult, v.pendingErr
+	result, err, errorSubject := v.pendingResult, v.pendingErr, v.pendingErrSubject
 	v.pendingResult, v.pendingErr, v.updateQueued = nil, nil, false
 	v.mx.Unlock()
 	if result != nil {
 		v.applyResult(result)
 	}
-	if err != nil {
+	if err != nil && errorSubject == v.subject {
 		v.applyError(err)
 	}
 }
@@ -627,6 +640,9 @@ func (v *NetworkPolicyGraph) applyError(err error) {
 }
 
 func (v *NetworkPolicyGraph) applyResult(result *netpol.SubjectResult) {
+	if !matchesNetPolSubject(v.subject, result.Subject.Ref) {
+		return
+	}
 	capturePanelState := v.haveResult
 	v.result, v.haveResult, v.lastError = *result, true, nil
 	v.invalidateProjections()
@@ -642,6 +658,18 @@ func (v *NetworkPolicyGraph) applyResult(result *netpol.SubjectResult) {
 	v.scheduleWorkloads()
 	v.updateSubject()
 	v.updateDetails(v.focus)
+}
+
+func matchesNetPolSubject(expected, resolved netpol.SubjectRef) bool {
+	// Command-opened subjects have no UID until the evaluator resolves them.
+	if expected.Kind == netpol.SubjectNamespace {
+		if expected.Name == "" {
+			expected.Name = expected.Namespace
+		}
+		expected.Namespace = ""
+	}
+	return expected.Kind == resolved.Kind && expected.Namespace == resolved.Namespace && expected.Name == resolved.Name &&
+		(expected.UID == "" || expected.UID == resolved.UID)
 }
 
 func (v *NetworkPolicyGraph) loadPanel(direction netpol.Direction) {
@@ -1003,7 +1031,7 @@ func (v *NetworkPolicyGraph) updateSubject() {
 		extras = append(extras, fmt.Sprintf("TRUNCATED at %d results", v.result.ResultLimit))
 	}
 	warnings := len(v.result.Warnings)
-	if refresh := v.model.LastRefresh(); len(refresh.Incomplete) > 0 {
+	if refresh := v.model.LastRefresh(); refresh.Subject == v.subject {
 		warnings += len(refresh.Incomplete)
 	}
 	if warnings > 0 {
@@ -1554,7 +1582,7 @@ func (v *NetworkPolicyGraph) appendResultWarnings(b *strings.Builder) {
 	for _, note := range v.result.Notes {
 		fmt.Fprintf(b, "\nNote: %s", note)
 	}
-	if refresh := v.model.LastRefresh(); len(refresh.Incomplete) > 0 {
+	if refresh := v.model.LastRefresh(); refresh.Subject == v.subject && len(refresh.Incomplete) > 0 {
 		keys := make([]string, 0, len(refresh.Incomplete))
 		for resource := range refresh.Incomplete {
 			keys = append(keys, resource)
@@ -1867,6 +1895,9 @@ func (v *NetworkPolicyGraph) openSubjectDialog() {
 }
 
 func (v *NetworkPolicyGraph) applySubject(ref netpol.SubjectRef) {
+	v.mx.Lock()
+	v.pendingResult, v.pendingErr = nil, nil
+	v.mx.Unlock()
 	v.subject = ref
 	v.model.SetSubject(ref)
 	v.result, v.haveResult, v.lastError = netpol.SubjectResult{}, false, nil

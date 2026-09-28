@@ -75,7 +75,11 @@ type fakeNetPolGraphModel struct {
 func (m *fakeNetPolGraphModel) SetSubject(subject netpol.SubjectRef) { m.subject = subject }
 func (m *fakeNetPolGraphModel) Subject() netpol.SubjectRef           { return m.subject }
 func (m *fakeNetPolGraphModel) LastRefresh() model.NetPolGraphRefresh {
-	return m.refresh
+	refresh := m.refresh
+	if refresh.Subject.Name == "" {
+		refresh.Subject = m.subject
+	}
+	return refresh
 }
 func (m *fakeNetPolGraphModel) AddListener(listener model.NetPolGraphListener) {
 	m.listeners = append(m.listeners, listener)

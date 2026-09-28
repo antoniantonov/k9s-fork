@@ -289,6 +289,22 @@ func TestMeshEnrollmentDetection(t *testing.T) {
 			pod: corev1.Pod{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{istioInjectLabel: "true"}}},
 		},
 		{
+			name: "pod injection annotation", namespace: namespace(nil), want: meshUnknown,
+			pod: corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{istioInjectLabel: "true"}}},
+		},
+		{
+			name: "injection label overrides annotation opt out", namespace: namespace(nil), want: meshUnknown,
+			pod: corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{istioInjectLabel: "true"}, Annotations: map[string]string{istioInjectLabel: "false"},
+			}},
+		},
+		{
+			name: "opt out label overrides injection annotation", namespace: namespace(nil), want: meshNotEnrolled,
+			pod: corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{istioInjectLabel: "false"}, Annotations: map[string]string{istioInjectLabel: "true"},
+			}},
+		},
+		{
 			name: "annotation opt out", namespace: namespace(map[string]string{istioInjectionNamespaceLabel: "enabled"}), want: meshNotEnrolled,
 			pod: corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{istioInjectLabel: "false"}}},
 		},

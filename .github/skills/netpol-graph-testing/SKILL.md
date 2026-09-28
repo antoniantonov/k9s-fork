@@ -33,9 +33,9 @@ Before populating workloads, agents must run:
 Only run the population path when `--check` fails, unless `--force-workloads` is explicitly needed.
 
 The check includes the original topology and isolated `${prefix}-edge-src`,
-`${prefix}-edge-dst`, and `${prefix}-edge-other` scenarios: 21 ready bare pods,
+`${prefix}-edge-dst`, and `${prefix}-edge-other` scenarios: 40 ready bare pods,
 namespace/pod labels (including the Istio mesh-enrollment labels and the stale
-sidecar annotation), and 18 policy specifications. `${prefix}-app`,
+sidecar annotation and label-over-annotation injection controls), and 30 policy specifications. `${prefix}-app`,
 `${prefix}-edge-src`, and `${prefix}-edge-dst` are labeled
 `istio.io/dataplane-mode=ambient`, because AuthorizationPolicy only applies to
 mesh workloads. Policy `spec`/`specs` are
@@ -96,8 +96,8 @@ population even when the final file passes `bash -n`.
 
 ## Complete-data and uncertainty suites
 
-`tui-tests` runs **77 known-fixture cases**, then **2 identity cases**, then
-**2 unsupported-Cilium cases**, always using the same immutable image ID.
+`tui-tests` runs **101 known-fixture cases**, followed by **24 probe cases**
+in eight sequential suites, always using the same immutable image ID.
 New assertions reconstruct a fresh terminal repaint and compare the subject,
 direction, exact peer row, state and complete protocol/port set. Navigation
 checks bind the selected rule to its full policy type, action, API version,
@@ -180,10 +180,10 @@ while the same peer of a native/Istio-only subject stays definitive
 (`hostnetwork-peer-native-control`). Every known case that expects a complete
 result asserts that no `Partial Data` cell is on screen.
 
-The identity and unsupported probes stay opt-in so their suites run against a
-fixed topology. For each final probe suite the
+All probe policies stay opt-in so their suites run against a
+fixed topology. For each probe suite the
 runner checks that known fixtures are clean, checks the probe before applying
-it, launches a fresh TUI process, and removes only the exact policy carrying
+it, launches a fresh TUI process, and removes only the exact policies carrying
 that run's ownership ID in an EXIT/signal cleanup handler. The normal topology
 is rechecked even after a failing TUI run or failed deletion. A failed cleanup
 fails validation; a subsequent suite cannot populate over an unclean topology.
@@ -217,10 +217,52 @@ fi
 "$DEMO" --check
 ```
 
-Use `--probe unsupported` for the Cilium dynamic-peer fixture. Prefer the full
+Probe types and exact counts are:
+
+| Probe type | Policies | Live cases |
+|---|---:|---:|
+| `identity` | 1 | 2 |
+| `unsupported` | 1 | 2 |
+| `cilium-features` | 1 | 3 |
+| `cilium-rejected` | 1 | 2 |
+| `istio-features` | 4 | 8 |
+| `istio-custom` | 1 | 2 |
+| `istio-targetrefs` | 1 | 2 |
+| `istio-root` | 1 | 3 |
+
+Every policy has exact run ownership, including all four policies of
+`istio-features`. No probe is applied over an unclean known topology.
+The root suite uses a prefix-constrained selector in `istio-system`, expects
+the default root resolution, and never changes mesh configuration. Population
+creates that empty namespace only when absent; existing namespace metadata is
+preserved, and fixture cleanup never deletes it. No Istio/Cilium components
+or enforcement are installed.
+
+New stable contracts include native same-namespace versus AND/OR selectors
+and absent-label expressions, TCP range intersection with UDP/SCTP separation,
+Cilium alias conjunction and non-isolating deny across `spec` plus `specs`,
+Istio default ALLOW, DENY-only, AUDIT/dry-run non-enforcement, and three
+nonambient injection precedence specimens. The existing scaled-to-zero
+deployment now has an exact `Unknown/n/a/n/a/n/a` live row.
+See `references/test-matrix.md` for every case and unit-only limitation.
+The contradictory alias rule matches no peers, so its nonsynthetic `[EMPTY]`
+row is intentionally hidden. The combined-spec navigation case asserts its
+absence and the exact remaining CNP row set, then navigates the matching ALLOW
+and DENY rules. Generated-fixture tests separately retain the hidden rule's
+exact `false/false`, Disallowed, `no ports` API applicability.
+
+Unsupported diagnostics compare complete policy/spec/rule-qualified messages
+inside Effective Details; only visual whitespace wrapping is normalized.
+An uncertain rule with no modeled ports is not assumed to have positive
+applicability: dynamic Cilium peers require `false/false`, while matched native
+ingress followed by uncertain empty Istio ALLOW requires `true/false`.
+Definitive controls reject mixed-case `Partial Data` table cells; an uppercase
+subject badge may legitimately summarize a different affected peer.
+
+Use `--probe unsupported` for the original Cilium dynamic-peer fixture. Prefer the full
 runner for automated use: it supplies cleanup even on failure. Expect itself
 does not mutate the cluster. Direct probe-only Expect invocations require
-`SMOKE_SUITE=identity` or `unsupported` and the matching `PROBE_ID`.
+the corresponding `SMOKE_SUITE` value and matching `PROBE_ID`.
 
 ## Reading the results
 
@@ -232,7 +274,7 @@ parse this block rather than those lines:
 === authoritative combined smoke summary ===
   PASS   known/launch-npg-view
   ...
-=== 81 case(s), 0 failure(s) ===
+=== 125 case(s), 0 failure(s) ===
 ```
 
 Every declared case must have exactly one verdict. Missing, duplicate,
@@ -270,7 +312,7 @@ does not invent executable statements. Profile paths are matched within the
 actual module, not by ambiguous basename suffixes. These are Go **statement**
 coverage gates, not independent branch-coverage instrumentation.
 
-The helper's Go tests also exercise shell stubs, the 21-pod/18-policy fixture
+The helper's Go tests also exercise shell stubs, the 40-pod/30-policy fixture
 inventory and its mesh labels, Tcl compilation, fresh-screen parsing, both CIDR
 rows, spec-entry and action rule labels, per-layer synthetic rows, prefix-matched
 hostNetwork peer rows, headerless declared-rule rows, delayed startup and
@@ -278,10 +320,19 @@ command-prompt closure, fragmented repaint completion, an exact live
 unsupported-policy screen fixture with negative diagnostic controls, and verdict
 accounting without contacting Docker or Kubernetes. A real local PTY stub
 exercises delayed resource/YAML return and command-prompt tails, enforcing one
-repaint per operation and no whole-prefix re-parsing. Probe cleanup is tested
-after success, failed application, failed
-Expect, termination, failed deletion and failed topology restoration, for both
-probe types. A stubbed full population invocation must reach its final summary.
+repaint per operation and no whole-prefix re-parsing. Consumed EOF no longer
+aborts teardown before authoritative verdicts are written. Probe cleanup is tested
+after success, failed application, failed Expect, termination, failed deletion
+and failed topology restoration, for all eight
+probe types; multi-policy ownership, dry-run annotation drift, injected metadata,
+root-prefix isolation and exact combined-spec ordinals have dedicated regressions.
+A stubbed full population invocation must reach its final summary.
+`TestGeneratedStableFixtureSemantics`, `TestGeneratedCiliumProbeSemantics`, and
+`TestGeneratedIstioProbeSemantics` render the actual fixture library through
+shell stubs and evaluate those manifests with the production graph evaluator.
+They verify exact states, flags, ports and diagnostics, including unaffected
+controls, without contacting the cluster. These are fixture-contract regressions,
+not a substitute for the required live presentation run.
 
 ```bash
 for script in scripts/netpol-demo-workloads.sh \

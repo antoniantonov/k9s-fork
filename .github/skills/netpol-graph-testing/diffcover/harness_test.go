@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,8 +33,8 @@ edge_policies`
 		t.Fatalf("render edge policies: %v\n%s", err, output)
 	}
 	fields := strings.Split(strings.TrimSuffix(string(output), "\x00"), "\x00")
-	if len(fields) != 18*3 {
-		t.Fatalf("expected 18 policy fixtures, got %d fields", len(fields))
+	if len(fields) != 30*3 {
+		t.Fatalf("expected 30 policy fixtures, got %d fields", len(fields))
 	}
 	names := map[string]bool{}
 	for index := 0; index < len(fields); index += 3 {
@@ -76,7 +77,7 @@ edge_policies`
 			}
 		}
 	}
-	for _, name := range []string{"authz-unenrolled", "authz-unknown", "cnp-l7"} {
+	for _, name := range []string{"authz-unenrolled", "authz-unknown", "cnp-l7", "native-source", "native-target", "cnp-observe", "authz-default", "authz-denyonly", "authz-audit", "authz-dryrun", "authz-injection"} {
 		if !names[name] {
 			t.Fatalf("mesh enrollment or scoped uncertainty fixture %s disappeared", name)
 		}
@@ -104,19 +105,204 @@ edge_pods`, "LIB="+edgeLibrary(t))
 		counts[fields[0]]++
 		meshes[fields[1]] = fields[4]
 	}
-	if len(seen) != 21 || counts["stub-demo-edge-src"] != 8 ||
-		counts["stub-demo-edge-dst"] != 12 || counts["stub-demo-edge-other"] != 1 ||
+	if len(seen) != 40 || counts["stub-demo-edge-src"] != 11 ||
+		counts["stub-demo-edge-dst"] != 23 || counts["stub-demo-edge-other"] != 6 ||
 		!seen["stub-demo-edge-other/control"] {
 		t.Fatalf("isolated pod inventory changed: %#v", counts)
 	}
 	if meshes["authz-unenrolled"] != "opt-out" || meshes["authz-unknown"] != "stale-sidecar" || meshes["authz-server"] != "-" {
 		t.Fatalf("mesh enrollment fixtures changed: %#v", meshes)
 	}
+	for pod, fixture := range map[string]string{
+		"native-excluded": "selector-excluded", "authz-inject-annotation": "inject-annotation",
+		"authz-inject-label": "inject-label", "authz-inject-optout": "inject-optout",
+	} {
+		if meshes[pod] != fixture {
+			t.Fatalf("missing metadata specimen %s: %s", pod, meshes[pod])
+		}
+	}
 	mesh, err := bashScript(t, `source "$LIB"
 printf '%s,' "$(edge_namespace_mesh source)" "$(edge_namespace_mesh destination)" "$(edge_namespace_mesh other)"
 printf '%s,' "$(edge_pod_mesh opt-out)" "$(edge_pod_mesh stale-sidecar)" "$(edge_pod_mesh -)"`, "LIB="+edgeLibrary(t))
 	if err != nil || string(mesh) != `ambient,ambient,,none|,|{"containers":["istio-proxy"]},|,` {
 		t.Fatalf("mesh fixture labels changed: %v %q", err, mesh)
+	}
+}
+
+func TestExpandedFixtureMetadataAndPolicyContracts(t *testing.T) {
+	script := `source "$LIB"
+PREFIX=stub-demo
+NS_EDGE_SRC=stub-demo-edge-src
+NS_EDGE_DST=stub-demo-edge-dst
+NS_EDGE_OTHER=stub-demo-edge-other
+EDGE_SCENARIO=stub-demo-edges
+IMAGE=stub-image
+WAIT=0
+fixture_kubectl() { if [[ "$1" == apply ]]; then cat; fi; }
+KUBECTL=(fixture_kubectl)
+edge_policy() { :; }
+apply_edge_fixtures`
+	output, err := bashScript(t, script, "LIB="+edgeLibrary(t))
+	if err != nil {
+		t.Fatalf("render fixture metadata: %v\n%s", err, output)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(output)))
+	pods := map[string]map[string]any{}
+	for {
+		var object map[string]any
+		if err := decoder.Decode(&object); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if object["kind"] == "Pod" {
+			metadata := object["metadata"].(map[string]any)
+			pods[metadata["name"].(string)] = metadata
+		}
+	}
+	if len(pods) != 40 {
+		t.Fatalf("population differs from inventory: %d pods", len(pods))
+	}
+	if _, exists := pods["native-target"]["labels"].(map[string]any)["netpol-role"]; exists {
+		t.Fatal("native NotIn absence fixture acquired a role label")
+	}
+	if pods["native-excluded"]["labels"].(map[string]any)["netpol-excluded"] != "true" {
+		t.Fatal("native DoesNotExist control lost its excluded label")
+	}
+	for _, specimen := range []struct {
+		name, label, annotation string
+	}{
+		{"authz-inject-annotation", "", "true"},
+		{"authz-inject-label", "true", "false"},
+		{"authz-inject-optout", "false", "true"},
+	} {
+		pod := pods[specimen.name]
+		label, _ := pod["labels"].(map[string]any)["sidecar.istio.io/inject"].(string)
+		annotation := pod["annotations"].(map[string]any)["sidecar.istio.io/inject"]
+		if label != specimen.label || annotation != specimen.annotation || pod["namespace"] != "stub-demo-edge-other" {
+			t.Fatalf("wrong nonambient injection metadata for %s: %v", specimen.name, pod)
+		}
+	}
+}
+
+func TestDryRunAnnotationDriftIsRejected(t *testing.T) {
+	script := `source "$LIB"
+PREFIX=stub-demo
+PROBE=""
+PROBE_ID=""
+EDGE_MODE=check
+fixture_kubectl() {
+  case "$1" in
+    create)
+      cat >/dev/null
+      case "$*" in *metadata.annotations*) printf true ;; *) printf 'spec|' ;; esac ;;
+    get)
+      case "$*" in
+        *metadata.labels*) printf 'stub-demo|true||' ;;
+        *metadata.annotations*) printf '%s' "$ACTUAL" ;;
+        *) printf 'spec|' ;;
+      esac ;;
+  esac
+}
+KUBECTL=(fixture_kubectl)
+edge_policy authz AuthorizationPolicy security.istio.io/v1 example dryrun '"spec":{"action":"DENY","rules":[{}]}' '{"istio.io/dry-run":"true"}'`
+	for _, actual := range []string{"true", "false", ""} {
+		output, err := bashScript(t, script, "LIB="+edgeLibrary(t), "ACTUAL="+actual)
+		if (err == nil) != (actual == "true") {
+			t.Fatalf("dry-run drift %q: %v\n%s", actual, err, output)
+		}
+	}
+}
+
+func TestProbeInventoryAndMultiplePolicyOwnership(t *testing.T) {
+	script := `source "$LIB"
+PREFIX=stub-demo
+PROBE_ID=run-123
+NS_EDGE_SRC=stub-demo-edge-src
+NS_EDGE_DST=stub-demo-edge-dst
+NS_EDGE_OTHER=stub-demo-edge-other
+edge_policy() { printf '%s\000%s\000%s\000%s\000' "$PROBE" "$4" "$5" "{$6}"; }
+while read -r PROBE; do edge_probe_policy || exit; done < <(edge_probe_types)`
+	output, err := bashScript(t, script, "LIB="+edgeLibrary(t))
+	if err != nil {
+		t.Fatalf("probe inventory: %v\n%s", err, output)
+	}
+	fields := strings.Split(strings.TrimSuffix(string(output), "\x00"), "\x00")
+	if len(fields) != 11*4 {
+		t.Fatalf("expected 11 owned policies across eight probe modes, got %d fields", len(fields))
+	}
+	counts := map[string]int{}
+	for index := 0; index < len(fields); index += 4 {
+		suite, namespace, name, body := fields[index], fields[index+1], fields[index+2], fields[index+3]
+		counts[suite]++
+		if !strings.HasSuffix(name, "-run-123") {
+			t.Fatalf("probe is not run-qualified: %s", name)
+		}
+		var policy map[string]any
+		if err := json.Unmarshal([]byte(body), &policy); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if suite == "istio-root" {
+			selector := policy["spec"].(map[string]any)["selector"].(map[string]any)["matchLabels"].(map[string]any)
+			if namespace != "istio-system" || selector["netpol-demo-prefix"] != "stub-demo" {
+				t.Fatalf("root probe is not prefix-isolated: %s %v", namespace, selector)
+			}
+		}
+	}
+	if len(counts) != 8 || counts["istio-features"] != 4 {
+		t.Fatalf("probe suite inventory changed: %v", counts)
+	}
+
+	ownership := `source "$LIB"
+PREFIX=stub-demo
+PROBE=istio-features
+PROBE_ID=run-123
+NS_EDGE_SRC=stub-demo-edge-src
+NS_EDGE_DST=stub-demo-edge-dst
+EDGE_MODE=delete
+fixture_kubectl() {
+  case "$1" in
+    get) printf '%s|stub-demo|%s' "$3" "$OWNER_ID" ;;
+    delete) printf 'DELETE %s\n' "$*" ;;
+    *) return 90 ;;
+  esac
+}
+KUBECTL=(fixture_kubectl)
+edge_probe_policy`
+	for _, owner := range []string{"run-123", "another-run"} {
+		output, err := bashScript(t, ownership, "LIB="+edgeLibrary(t), "OWNER_ID="+owner)
+		if owner == "run-123" {
+			if err != nil || strings.Count(string(output), "DELETE ") != 4 {
+				t.Fatalf("multi-policy owned cleanup failed: %v\n%s", err, output)
+			}
+		} else if err == nil || strings.Contains(string(output), "DELETE ") {
+			t.Fatalf("multi-policy cleanup deleted an unowned policy: %v\n%s", err, output)
+		}
+	}
+}
+
+func TestMultiProbeCleanupContinuesAfterDeletionFailure(t *testing.T) {
+	script := `source "$LIB"
+PREFIX=stub-demo
+PROBE=istio-features
+PROBE_ID=run-123
+NS_EDGE_SRC=stub-demo-edge-src
+NS_EDGE_DST=stub-demo-edge-dst
+EDGE_MODE=delete
+fixture_kubectl() {
+  case "$1" in
+    get) printf '%s|stub-demo|run-123' "$3" ;;
+    delete)
+      printf 'DELETE %s\n' "$3"
+      [[ "$3" != probe-istio-l7-allow-run-123 ]] ;;
+    *) return 90 ;;
+  esac
+}
+KUBECTL=(fixture_kubectl)
+edge_probe_policy`
+	output, err := bashScript(t, script, "LIB="+edgeLibrary(t))
+	if err == nil || strings.Count(string(output), "DELETE ") != 4 {
+		t.Fatalf("failed deletion skipped other owned policies or lost its error: %v\n%s", err, output)
 	}
 }
 
@@ -128,10 +314,16 @@ PROBE_ID=""
 EDGE_MODE=check
 fixture_kubectl() {
   case "$1" in
-    create) cat >/dev/null; printf '%s' '{"ingress":[{}]}|' ;;
+    create)
+      cat >/dev/null
+      case "$*" in
+        *metadata.annotations*) ;;
+        *) printf '%s' '{"ingress":[{}]}|' ;;
+      esac ;;
     get)
       case "$*" in
         *metadata.labels*) printf 'stub-demo|true||' ;;
+        *metadata.annotations*) ;;
         *) printf '%s' "$ACTUAL_SPEC" ;;
       esac ;;
   esac
@@ -171,6 +363,11 @@ edge_probe_policy`
 	}{
 		{"identity", "authorizationpolicies.security.istio.io", "stub-demo-edge-dst"},
 		{"unsupported", "ciliumnetworkpolicies.cilium.io", "stub-demo-edge-src"},
+		{"cilium-features", "ciliumnetworkpolicies.cilium.io", "stub-demo-edge-src"},
+		{"cilium-rejected", "ciliumnetworkpolicies.cilium.io", "stub-demo-edge-src"},
+		{"istio-custom", "authorizationpolicies.security.istio.io", "stub-demo-edge-dst"},
+		{"istio-targetrefs", "authorizationpolicies.security.istio.io", "stub-demo-edge-dst"},
+		{"istio-root", "authorizationpolicies.security.istio.io", "istio-system"},
 	} {
 		name := "probe-" + probe.suite + "-run-123"
 		for _, owner := range []string{
@@ -230,7 +427,7 @@ EXPECT_SCRIPT="$FIXTURE/expect-stub"
 RUN_DIR="$FIXTURE"
 RUN_ID=stub-run
 run_probe_smoke "$PROBE_SUITE" image-stub config-stub network-stub`
-			for _, suite := range []string{"identity", "unsupported"} {
+			for _, suite := range []string{"identity", "unsupported", "cilium-features", "cilium-rejected", "istio-features", "istio-custom", "istio-targetrefs", "istio-root"} {
 				log := filepath.Join(directory, suite+".log")
 				output, err := bashScript(t, script,
 					"RUNNER="+runner, "FIXTURE="+directory, "COMMAND_LOG="+log,
@@ -388,8 +585,8 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(commands), "delete crd ") {
-		t.Fatalf("ordinary cleanup deleted a shared CRD:\n%s", commands)
+	if strings.Contains(string(commands), "delete crd ") || strings.Contains(string(commands), "istio-system") {
+		t.Fatalf("ordinary cleanup touched a shared CRD or root namespace:\n%s", commands)
 	}
 }
 
@@ -1278,8 +1475,16 @@ func TestSmokeManifestInventory(t *testing.T) {
 		seen[fields[1]] = true
 		counts[fields[0]]++
 	}
-	if counts["known"] != 77 || counts["identity"] != 2 || counts["unsupported"] != 2 || len(seen) != 81 {
+	expected := map[string]int{"known": 101, "identity": 2, "unsupported": 2,
+		"cilium-features": 3, "cilium-rejected": 2, "istio-features": 8,
+		"istio-custom": 2, "istio-targetrefs": 2, "istio-root": 3}
+	if len(seen) != 125 || len(counts) != len(expected) {
 		t.Fatalf("smoke inventory changed without updating its contract: %#v", counts)
+	}
+	for suite, count := range expected {
+		if counts[suite] != count {
+			t.Fatalf("%s smoke count: got %d, want %d", suite, counts[suite], count)
+		}
 	}
 	for _, name := range []string{
 		"cnp-empty-rule-ingress", "cnp-empty-rule-egress",
@@ -1293,10 +1498,149 @@ func TestSmokeManifestInventory(t *testing.T) {
 		"istio-authorization-default-deny-row",
 		"istio-identity-ingress-note", "istio-identity-egress-note",
 		"unsupported-cilium-rule-details", "unsupported-scoped-egress-control",
+		"native-range-protocol-ingress", "native-range-protocol-egress", "native-zero-pair-not-applicable",
+		"native-notin-blocked", "native-doesnotexist-excluded", "native-namespace-and-control",
+		"cilium-nonisolating-combined-spec-navigation", "cilium-cnp-namespace-scope-control-egress",
+		"istio-inject-annotation", "istio-inject-label-precedence", "istio-inject-optout-precedence",
+		"cilium-unsupported-fields-diagnostics", "cilium-rejected-sibling-diagnostics",
+		"istio-root-policy-navigation", "istio-targetrefs-diagnostics", "istio-custom-diagnostics",
 	} {
 		if !seen[name] {
 			t.Fatalf("required regression case %s disappeared", name)
 		}
+	}
+}
+
+func TestConsumedEOFStillFinishesSmokeAccounting(t *testing.T) {
+	_, _, smoke := harnessPaths(t)
+	source, err := os.ReadFile(smoke)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, summary, found := strings.Cut(string(source), "\nfinish_smoke_process\n")
+	if !found {
+		t.Fatal("smoke teardown/authoritative summary boundary is missing")
+	}
+	directory := t.TempDir()
+	script := `
+	set screen_eof 1
+	set startup_screen ready
+	set navigation_setup_error {process crashed}
+	set container fixture-only
+	set kills 0
+	rename exec real_exec
+	proc exec {args} {
+	  if {$args ne {docker kill fixture-only}} { error "unexpected cleanup command $args" }
+	  incr ::kills
+	}
+	proc expect {args} { error "a consumed EOF reopened the closed spawn" }
+	proc send_key {args} { error "keys sent after EOF" }
+	proc close_case {} {}
+	set suite known
+	set log_dir $env(VERDICT_DIR)
+	set failures 1
+	set case_manifest [dict create known {launch-npg-view crashed-case}]
+	set verdicts [dict create launch-npg-view PASS crashed-case FAIL]
+	finish_smoke_process
+	if {$kills != 1} { error "crashed process cleanup was skipped" }
+	` + summary
+	output, err := expectScript(t, script, "VERDICT_DIR="+directory)
+	if err == nil || !strings.Contains(string(output), "=== 2 case(s), 1 failure(s) ===") {
+		t.Fatalf("consumed EOF failed to retain its authoritative summary/status: %v\n%s", err, output)
+	}
+	verdicts, err := os.ReadFile(filepath.Join(directory, "smoke-known.verdicts"))
+	if err != nil || string(verdicts) != "PASS\tlaunch-npg-view\nFAIL\tcrashed-case\n" {
+		t.Fatalf("crash erased earlier case verdicts: %v\n%s", err, verdicts)
+	}
+}
+
+func TestEmptySubjectReadinessDoesNotAcceptLoading(t *testing.T) {
+	script := `
+	set subject {Deployment fixture/scaled-to-zero · 0 pods}
+	set ready "┌ Subject ┐\n│$subject│\n│No workloads found for this subject.│\n└\nIngress · Rules\nEffective Details\nEffective Applicability (Ingress)\n<npg>"
+	if {![empty_graph_ready $subject $ready]} { error "fully evaluated empty subject was rejected" }
+	if {[empty_graph_ready $subject [string map {{No workloads found for this subject.} {No subject workloads match the active filter.}} $ready]]} { error "filter-empty was mistaken for an empty subject" }
+	foreach marker {{Waiting for NetworkPolicy evaluation...} {workloads loading...} {> npg deployment scaled-to-zero fixture}} {
+	  if {[empty_graph_ready $subject "$ready\n$marker"]} { error "unready empty frame passed: $marker" }
+	}
+	foreach value {{Deployment fixture/other · 0 pods} {Deployment fixture/scaled-to-zero · 1 pod}} {
+	  if {[empty_graph_ready $subject [string map [list $subject $value] $ready]]} { error "wrong empty subject passed" }
+	}
+	set columns "%-8s %-16s %-25s %s"
+	set populated "┌ Subject ┐\n│$subject│\n│[format $columns KIND NAMESPACE NAME STATUS]│\n│[format $columns Pod fixture unexpected {Running · 1/1 ready}]│\n└\nIngress · Rules\nEffective Details\nEffective Applicability (Ingress)\n<npg>"
+	if {[empty_graph_ready $subject $populated]} { error "0-pod summary hid a real workload row" }
+	puts "empty-subject readiness is separate from ready-pod admission"
+	`
+	output, err := expectScript(t, script)
+	if err != nil {
+		t.Fatalf("empty-subject readiness contract: %v\n%s", err, output)
+	}
+}
+
+func TestNonisolatingRulesHideOnlyEmptyAliasRule(t *testing.T) {
+	script := `
+	proc fail_case {message} { error $message }
+	set reference fixture/cnp-observe
+	set format "%-60s %-30s %s"
+	set deny [format $format {fixture/cnp-observe specs[0] deny #0} CiliumNetworkPolicy TCP/8081]
+	set allow [format $format {fixture/cnp-observe spec #1} CiliumNetworkPolicy TCP/8080]
+	set hidden [format $format {fixture/cnp-observe spec #0} CiliumNetworkPolicy TCP/80]
+	set native [format $format {fixture/cnp-observe-network #0} NetworkPolicy {SCTP/9000, TCP/8080, TCP/8081, UDP/5353}]
+	set valid "┌ Egress · Rules ┐\n│$deny│\n│$allow│\n│$native│\n└"
+	if {![assert_nonisolating_rule_rows $valid $reference]} { error "exact visible rules rejected" }
+	foreach changed [list \
+	    [string map [list $allow $hidden] $valid] \
+	    [string map [list $allow ""] $valid] \
+	    [string map [list $deny "$deny\n$deny"] $valid] \
+	    [string map [list $allow "$allow\n$hidden"] $valid] \
+	    [string map {{specs[0]} {specs[1]}} $valid] \
+	    [string map {CiliumNetworkPolicy NetworkPolicy} $valid] \
+	    [string map {TCP/8080 TCP/80} $valid]] {
+	  if {![catch {assert_nonisolating_rule_rows $changed $reference}]} {
+	    error "incorrect visible rule set passed"
+	  }
+	}
+	set body [info body verify_nonisolating_policy]
+	if {[string first {ALLOW 0 spec 0 TCP/80} $body] >= 0 ||
+	    [string first {assert_nonisolating_rule_rows} $body] < 0} {
+	  error "live navigation still selects the hidden rule or skips its exact visibility assertion"
+	}
+	puts "hidden empty alias rule and complete visible rule set are asserted exactly"
+	`
+	output, err := expectScript(t, script)
+	if err != nil {
+		t.Fatalf("empty alias rule presentation: %v\n%s", err, output)
+	}
+}
+
+func TestExpandedExactDiagnosticsAndSpecOrdinals(t *testing.T) {
+	script := `
+	proc fail_case {message} { error $message }
+	set warning {Warning: AuthorizationPolicy fixture/probe: ingress allow rule 0: requestPrincipals depend on JWT request identity}
+	set screen "┌ Effective Details ┐\n│Warning: AuthorizationPolicy fixture/probe: ingress allow rule 0:│\n│ requestPrincipals depend on JWT request identity│\n└\n$warning"
+	if {[detail_text $screen "Effective Details"] ne $warning} { error "wrapped exact diagnostic was not reconstructed" }
+	set wrong [string map {{fixture/probe:} {fixture/other:}} [join [panel_lines $screen "Effective Details"] "\n"]]
+	if {[string first $warning [detail_text "┌ Effective Details ┐\n$wrong\n└\n$warning" "Effective Details"]] >= 0} {
+	  error "warning outside the panel satisfied policy identity"
+	}
+	set columns "%-60s %-30s %s"
+	set row [format $columns {fixture/cnp-observe specs[0] deny #0} CiliumNetworkPolicy TCP/8081]
+	set screen "┌ Egress · Rules ┐\n│$row│\n└\nRule Details\nPolicy: fixture/cnp-observe\nPolicy type: CiliumNetworkPolicy\nPolicy API version: cilium.io/v2\nAction: deny\nRule index: 0 in specs\[0\] (spec index 1)\n"
+	if {![assert_selected_edge_rule $screen Egress fixture/cnp-observe CiliumNetworkPolicy cilium.io/v2 DENY TCP/8081 {specs[0]} 1 0 1]} { error "correct ordinal rejected" }
+	foreach changed [list [string map {{spec index 1} {spec index 0}} $screen] [string map {{Rule index: 0} {Rule index: 1}} $screen]] {
+	  if {![catch {assert_selected_edge_rule $changed Egress fixture/cnp-observe CiliumNetworkPolicy cilium.io/v2 DENY TCP/8081 {specs[0]} 1 0 1}]} { error "wrong spec ordinal or rule index passed" }
+	}
+	set row [dict create State {Partial Data} Peer false Opposite false Ports {no ports}]
+	assert_applicability_values $row {Partial Data} {no ports} false false
+	if {![catch {assert_applicability_values $row {Partial Data} {no ports} true true}]} { error "partial state invented matching evidence" }
+	set row [dict create State {Partial Data} Peer true Opposite true Ports {SCTP/all, TCP/all, UDP/all}]
+	assert_applicability_values $row {Partial Data} {SCTP/all, TCP/all, UDP/all} true true
+	if {![catch {assert_applicability_values $row {Partial Data} {all ports} true true}]} { error "wildcard text was weakened" }
+	puts "wrapped diagnostics, combined spec ordinals and uncertainty flags are exact"
+	`
+	output, err := expectScript(t, script)
+	if err != nil {
+		t.Fatalf("expanded exact presentation contracts: %v\n%s", err, output)
 	}
 }
 

@@ -72,10 +72,13 @@ func podMeshEnrollment(pod *corev1.Pod, namespace *corev1.Namespace) meshEnrollm
 	if namespace.Labels[istioDataplaneModeLabel] == istioDataplaneModeAmbient {
 		return meshEnrollment{state: meshEnrolled, reason: istioAmbientEnrollment}
 	}
-	optOut := strings.EqualFold(pod.Labels[istioInjectLabel], "false") ||
-		strings.EqualFold(pod.Annotations[istioInjectLabel], "false")
+	inject := pod.Annotations[istioInjectLabel]
+	if value, present := pod.Labels[istioInjectLabel]; present {
+		inject = value
+	}
+	optOut := strings.EqualFold(inject, "false")
 	injection := namespace.Labels[istioInjectionNamespaceLabel]
-	expected := strings.EqualFold(pod.Labels[istioInjectLabel], "true") || pod.Labels[istioRevisionLabel] != "" ||
+	expected := strings.EqualFold(inject, "true") || pod.Labels[istioRevisionLabel] != "" ||
 		injection == "enabled" || (namespace.Labels[istioRevisionLabel] != "" && injection != "disabled")
 	if expected && !optOut {
 		return meshEnrollment{state: meshUnknown, reason: fmt.Sprintf(

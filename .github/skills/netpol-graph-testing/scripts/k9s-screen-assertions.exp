@@ -139,6 +139,7 @@ proc capture_screen {{report_eof 1} {predicate ""} {read_seconds 20}} {
   set ::last_capture_matched 0
   if {![drain 1 3]} {
     set ::screen_eof 1
+    set ::last_capture_summary [dict create phase drain eof 1 elapsed_ms [expr {[clock milliseconds] - $started}]]
     if {$report_eof} { fail_case "process exited while capturing a fresh screen" }
     return ""
   }
@@ -180,7 +181,6 @@ proc capture_screen {{report_eof 1} {predicate ""} {read_seconds 20}} {
   }
   return $screen
 }
-
 proc snapshot_contains {screen value} {
   if {[string first $value $screen] >= 0} { return 1 }
   fail_case "fresh screen is missing <$value>\n$screen"
@@ -450,7 +450,7 @@ proc assert_edge_row {subject namespace direction peer peer_namespace state port
   return [assert_applicability_values $row $state $ports $peer_match $opposite]
 }
 
-proc verify_effective_edge {name subject namespace direction peer peer_namespace state ports {partial 0}} {
+proc verify_effective_edge {name subject namespace direction peer peer_namespace state ports {partial 0} {flags {}} {diagnostics {}}} {
   start_case $name 0
   if {![open_edge_subject $subject $namespace $direction]} { return }
   send_key "\r"
@@ -458,7 +458,10 @@ proc verify_effective_edge {name subject namespace direction peer peer_namespace
   set peer_match ""
   set opposite false
   if {$state in {Allowed {Partial Data}}} { set peer_match true; set opposite true }
-  if {[assert_edge_row $subject $namespace $direction $peer $peer_namespace $state $ports $partial 0 $peer_match $opposite]} { pass_case }
+  if {[llength $flags]} { lassign $flags peer_match opposite }
+  if {![assert_edge_row $subject $namespace $direction $peer $peer_namespace $state $ports $partial 0 $peer_match $opposite]} { return }
+  if {[llength $diagnostics] && ![scan_effective_diagnostics $diagnostics]} { return }
+  pass_case
 }
 
 proc assert_yaml_origin {kind version policy namespace} {
@@ -496,19 +499,19 @@ proc rule_spec {policy direction action} {
 
 # expected_rule_label mirrors the Rules panel label: multi-spec Cilium rules
 # name their spec entry and deny rules name their action.
-proc expected_rule_label {reference action spec multi} {
+proc expected_rule_label {reference action spec multi {index 0}} {
   set label $reference
   if {$multi && $spec ne ""} { append label " $spec" }
   if {[string toupper $action] eq "DENY"} { append label " deny" }
-  return "$label #0"
+  return "$label #$index"
 }
 
-proc assert_selected_edge_rule {screen direction reference type version action ports {spec ""} {multi 0}} {
+proc assert_selected_edge_rule {screen direction reference type version action ports {spec ""} {multi 0} {index 0} {ordinal ""}} {
   if {![selected_policy_matches $screen $type $reference $action]} {
     fail_case "wrong selected rule: expected $type $reference $action"
     return 0
   }
-  set label [expected_rule_label $reference $action $spec $multi]
+  set label [expected_rule_label $reference $action $spec $multi $index]
   set matches 0
   foreach row [rule_rows $screen "$direction · Rules"] {
     if {[dict get $row Name] eq $label && [dict get $row Type] eq $type} {
@@ -519,14 +522,15 @@ proc assert_selected_edge_rule {screen direction reference type version action p
     fail_case "expected one exact rule row: $label | $type | $ports; got $matches\n$screen"
     return 0
   }
-  if {![regexp {Rule index: 0\M} $screen]} {
-    fail_case "selected $reference $action did not retain rule index 0"
+  if {![regexp "Rule index: $index\\M" $screen]} {
+    fail_case "selected $reference $action did not retain rule index $index"
     return 0
   }
   if {![snapshot_contains $screen "API version: $version"] || ![snapshot_excludes $screen "Spec index:"]} { return 0 }
   # Cilium rules name their spec entry on the rule index line.
-  if {$spec eq ""} { return [snapshot_excludes $screen "Rule index: 0 in "] }
-  return [snapshot_contains $screen "Rule index: 0 in $spec (spec index "]
+  if {$spec eq ""} { return [snapshot_excludes $screen "Rule index: $index in "] }
+  if {$ordinal ne ""} { return [snapshot_contains $screen "Rule index: $index in $spec (spec index $ordinal)"] }
+  return [snapshot_contains $screen "Rule index: $index in $spec (spec index "]
 }
 
 # scan_rule_details focuses the Rule Details text and scrolls it from the top,
@@ -560,7 +564,7 @@ proc scan_rule_details {required {forbidden {}}} {
   return 0
 }
 
-proc verify_edge_policy {name subject namespace direction policy policy_namespace type version resource action rule_ports peer peer_namespace effective_ports {controls {}}} {
+proc verify_edge_policy {name subject namespace direction policy policy_namespace type version resource action rule_ports peer peer_namespace effective_ports {controls {}} {expectation {Allowed true true}} {details {}}} {
   start_case $name 0
   if {![open_edge_subject $subject $namespace $direction]} { return }
   set reference $policy
@@ -590,7 +594,8 @@ proc verify_edge_policy {name subject namespace direction policy policy_namespac
     fail_case "peer filtering lost the selected $reference rule"
     return
   }
-  if {![assert_edge_row $subject $namespace $direction $peer $peer_namespace Allowed $effective_ports 0 1 true true]} { return }
+  lassign $expectation primary_state primary_peer primary_opposite
+  if {![assert_edge_row $subject $namespace $direction $peer $peer_namespace $primary_state $effective_ports 0 1 $primary_peer $primary_opposite]} { return }
   foreach control $controls {
     lassign $control control_action control_ports control_peer control_namespace state ports peer_match opposite
     if {![open_edge_subject $subject $namespace $direction]} { return }
@@ -605,18 +610,187 @@ proc verify_edge_policy {name subject namespace direction policy policy_namespac
     }
     if {![assert_edge_row $subject $namespace $direction $control_peer $control_namespace $state $ports 0 1 $peer_match $opposite]} { return }
   }
+  if {[llength $details]} {
+    if {![open_edge_subject $subject $namespace $direction]} { return }
+    if {[select_named_rule $policy $reference $type $action] eq "" ||
+        ![scan_rule_details $details {{Partial Data} Warnings:}]} { return }
+  }
   pass_case
 }
 
-proc select_named_rule {policy reference type action} {
+proc select_named_rule {policy reference type action {index ""} {spec ""}} {
   if {![filter_to $policy]} { return "" }
   for {set move 0} {$move < 8} {incr move} {
     send_key "\033\[B"
     set screen [capture_screen]
-    if {[selected_policy_matches $screen $type $reference $action]} { return $screen }
+    if {![selected_policy_matches $screen $type $reference $action]} { continue }
+    if {$index ne "" && ![regexp "Rule index: $index\\M" $screen]} { continue }
+    if {$spec ne "" && [string first "Rule index: $index in $spec (" $screen] < 0} { continue }
+    return $screen
   }
   fail_case "could not select $reference $action"
   return ""
+}
+
+# Diagnostics are compared inside the requested panel, with only visual line
+# wrapping normalized. A matching warning elsewhere cannot satisfy the check.
+proc detail_text {screen title} {
+  return [string trim [regsub -all {[[:space:]]+} [join [panel_lines $screen $title] " "] " "]]
+}
+
+proc scan_effective_diagnostics {required} {
+  send_key "\033\[Z"
+  send_key "\033\[H"
+  set seen [dict create]
+  for {set moves 0} {$moves <= 40} {incr moves} {
+    set screen [capture_screen]
+    set text [detail_text $screen "Effective Details"]
+    foreach value $required {
+      if {[string first $value $text] >= 0} { dict set seen $value 1 }
+    }
+    if {[dict size $seen] == [llength $required]} { return 1 }
+    send_key "\033\[B" 150
+  }
+  set missing {}
+  foreach value $required {
+    if {![dict exists $seen $value]} { lappend missing $value }
+  }
+  fail_case "Effective Details did not contain exact diagnostics <$missing>\n$screen"
+  return 0
+}
+
+proc assert_nonisolating_rule_rows {screen reference} {
+  set expected [dict create \
+    "$reference specs\[0\] deny #0" TCP/8081 \
+    "$reference spec #1" TCP/8080]
+  set seen [dict create]
+  foreach row [rule_rows $screen "Egress · Rules"] {
+    set name [dict get $row Name]
+    if {[string first "$reference " $name] != 0} { continue }
+    if {![dict exists $expected $name] || [dict exists $seen $name] ||
+        [dict get $row Type] ne "CiliumNetworkPolicy" ||
+        [dict get $row Ports] ne [dict get $expected $name]} {
+      fail_case "unexpected combined-spec rule row: $row\n$screen"
+      return 0
+    }
+    dict set seen $name 1
+  }
+  if {[dict size $seen] != [dict size $expected]} {
+    fail_case "combined-spec Rules must show exactly the matching ALLOW #1 and DENY #0, hiding empty ALLOW #0\n$screen"
+    return 0
+  }
+  return 1
+}
+
+proc verify_nonisolating_policy {} {
+  global ns_edge_src ns_edge_other
+  start_case cilium-nonisolating-combined-spec-navigation 0
+  set policy cnp-observe
+  set reference "$ns_edge_src/$policy"
+  foreach {action index spec ordinal declared state ports peer opposite} {
+    DENY 0 specs[0] 1 TCP/8081 Disallowed {no ports} true false
+    ALLOW 1 spec 0 TCP/8080 Allowed TCP/8080 true true
+  } {
+    if {![open_edge_subject cnp-observe $ns_edge_src Egress]} { return }
+    set screen [capture_screen]
+    if {![snapshot_contains $screen "Pod $ns_edge_src/cnp-observe · 1 pod"] ||
+        ![assert_nonisolating_rule_rows $screen $reference]} { return }
+    set screen [select_named_rule $policy $reference CiliumNetworkPolicy $action $index $spec]
+    if {$screen eq "" || ![assert_selected_edge_rule $screen Egress $reference CiliumNetworkPolicy cilium.io/v2 $action $declared $spec 1 $index $ordinal]} { return }
+    if {$action eq "DENY"} {
+      send_key "o"
+      set opened [capture_screen]
+      if {![snapshot_contains $opened ciliumnetworkpolicies] || ![snapshot_excludes $opened "Rule Details"]} { return }
+      send_key "y"
+      if {![assert_yaml_origin CiliumNetworkPolicy cilium.io/v2 $policy $ns_edge_src]} { return }
+      send_key "\033"
+      send_key "\033"
+      send_key "y"
+      if {![assert_yaml_origin CiliumNetworkPolicy cilium.io/v2 $policy $ns_edge_src]} { return }
+      send_key "\033"
+    }
+    send_key "\r"
+    if {![filter_to "Pod $ns_edge_other/control"]} { return }
+    if {![selected_policy_matches [capture_screen] CiliumNetworkPolicy $reference $action] ||
+        ![assert_edge_row cnp-observe $ns_edge_src Egress control $ns_edge_other $state $ports 0 1 $peer $opposite]} { return }
+  }
+  pass_case
+}
+
+proc verify_noenforcement_rows {} {
+  global ns_edge_dst ns_edge_src
+  start_case istio-audit-dryrun-rules-absent 0
+  if {![open_edge_subject authz-noenforce $ns_edge_dst Ingress]} { return }
+  set screen [capture_screen]
+  set native 0
+  foreach row [rule_rows $screen "Ingress · Rules"] {
+    if {[dict get $row Type] eq "AuthorizationPolicy"} {
+      fail_case "AUDIT or dry-run policy contributed a rule"
+      return
+    }
+    if {[dict get $row Name] eq "$ns_edge_dst/authz-feature-network #0" &&
+        [dict get $row Type] eq "NetworkPolicy" &&
+        [dict get $row Ports] eq "SCTP/9000, TCP/8080, TCP/8081, UDP/5353"} { set native 1 }
+  }
+  if {!$native} { fail_case "exact native baseline rule is missing"; return }
+  send_key "\r"
+  if {![filter_to "Pod $ns_edge_src/authz-client"]} { return }
+  if {[assert_edge_row authz-noenforce $ns_edge_dst Ingress authz-client $ns_edge_src Allowed {SCTP/9000, TCP/8080, TCP/8081, UDP/5353} 0 0 true true]} { pass_case }
+}
+
+proc empty_graph_ready {subject screen} {
+  return [expr {
+    ![command_prompt_open $screen] &&
+    ![regexp -nocase {Waiting for |workloads loading} $screen] &&
+    [string first $subject $screen] >= 0 &&
+    [string first "No workloads found for this subject." $screen] >= 0 &&
+    [string first "Effective Details" $screen] >= 0 &&
+    [string first "Effective Applicability (Ingress)" $screen] >= 0 &&
+    [string first "<npg>" $screen] >= 0 &&
+    [llength [table_rows $screen " Subject " {KIND NAMESPACE NAME STATUS}]] == 0
+  }]
+}
+
+proc verify_zero_subject {} {
+  global ns_app ns_edge_other
+  start_case native-zero-pair-not-applicable 0
+  if {[wait_for_frame [list graph_ready ""] 60] eq ""} { fail_graph_setup "current graph not ready"; return }
+  send_key ":"
+  if {[wait_for_frame command_prompt_open 10] eq ""} { fail_graph_setup "empty-subject command prompt not open"; return }
+  send -- "npg deployment scaled-to-zero $ns_app\r"
+  set subject "Deployment $ns_app/scaled-to-zero · 0 pods"
+  if {[wait_for_frame [list empty_graph_ready $subject] 60] eq ""} { fail_graph_setup "empty subject did not finish loading"; return }
+  send_key "e"
+  send_key "\033\[D"
+  send_key "\r"
+  if {![filter_to "Pod $ns_edge_other/control"]} { return }
+  set key "Pod $ns_edge_other/control"
+  set title "Effective Applicability (Ingress)"
+  set screen [wait_for_frame [list applicability_surface_ready $title $key] 20]
+  if {$screen eq ""} {
+    fail_case "empty subject did not render the exact <$key> applicability row\n$::last_wait_screen"
+    return
+  }
+  if {![snapshot_contains $screen $subject] || ![snapshot_excludes $screen "Partial Data"]} { return }
+  set row [exact_table_row $screen $title {Primitive Peer Opposite State Ports} $key]
+  if {$row ne "" && [assert_applicability_values $row Unknown n/a n/a n/a]} { pass_case }
+}
+
+proc finish_smoke_process {} {
+  global container startup_screen navigation_setup_error
+  if {$startup_screen eq "" || $navigation_setup_error ne "" || $::screen_eof} {
+    catch {exec docker kill $container}
+  } else {
+    send_key "q"
+  }
+  # A prior drain may already have consumed EOF and closed the spawn channel.
+  # Preserve all case verdicts rather than aborting their authoritative summary.
+  if {!$::screen_eof} {
+    expect {
+      eof { set ::screen_eof 1 }
+      timeout { catch {exec docker kill $container} }
+    }
+  }
 }
 
 proc verify_source_authz_noninterference {} {

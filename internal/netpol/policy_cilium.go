@@ -516,17 +516,17 @@ func normalizeCiliumSelector(
 		}
 		switch target {
 		case ciliumTargetNamespace:
-			namespace.MatchLabels[normalizedKey] = value
+			addCiliumSelectorLabel(&namespace, normalizedKey, value)
 			if strings.HasPrefix(stripCiliumSource(key), ciliumNamespaceLabelPrefix) {
 				namespaceLabels = true
 			} else {
 				namespaceName = true
 			}
 		case ciliumTargetServiceAccount:
-			serviceAccount.MatchLabels[normalizedKey] = value
+			addCiliumSelectorLabel(&serviceAccount, normalizedKey, value)
 			serviceAccountConstrained = true
 		default:
-			selector.Pod.MatchLabels[normalizedKey] = value
+			addCiliumSelectorLabel(&selector.Pod, normalizedKey, value)
 		}
 	}
 	for _, requirement := range source.MatchExpressions {
@@ -584,6 +584,18 @@ func normalizeCiliumSelector(
 		}
 	}
 	return selector, unsupported, invalid, namespaceLabels && !namespaceName
+}
+
+func addCiliumSelectorLabel(selector *metav1.LabelSelector, key, value string) {
+	if existing, present := selector.MatchLabels[key]; present && existing != value {
+		// Distinct label sources can normalize to the same Kubernetes key;
+		// retaining both requirements prevents a conflicting AND becoming an allow.
+		selector.MatchExpressions = append(selector.MatchExpressions, metav1.LabelSelectorRequirement{
+			Key: key, Operator: metav1.LabelSelectorOpIn, Values: []string{value},
+		})
+		return
+	}
+	selector.MatchLabels[key] = value
 }
 
 func stripCiliumSource(key string) string {

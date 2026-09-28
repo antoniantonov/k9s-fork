@@ -64,6 +64,10 @@ set edge_pairs [list \
   [list istio-enrollment-unknown authz-client $ns_edge_src authz-unknown $ns_edge_dst {Partial Data} {SCTP/9000, TCP/8080, UDP/5353} 1] \
   [list cilium-l7-scoped control $ns_edge_other l7-server $ns_edge_dst {Partial Data} {TCP/8080} 1] \
   [list cilium-l7-unmatched-peer authz-client $ns_edge_src l7-server $ns_edge_dst Disallowed {no ports}] \
+  [list native-range-protocol native-client $ns_edge_src native-target $ns_edge_dst Allowed {TCP/8001-8002, UDP/5353}] \
+  [list istio-default-action authz-client $ns_edge_src authz-default $ns_edge_dst Allowed {SCTP/9000, TCP/8080, TCP/8081, UDP/5353}] \
+  [list istio-deny-only authz-client $ns_edge_src authz-denyonly $ns_edge_dst Allowed {SCTP/9000, TCP/8080, UDP/5353}] \
+  [list istio-no-enforcement authz-client $ns_edge_src authz-noenforce $ns_edge_dst Allowed {SCTP/9000, TCP/8080, TCP/8081, UDP/5353}] \
 ]
 set known_cases {
   launch-npg-view subject-picker-kinds direction-toggles-placeholder
@@ -92,12 +96,24 @@ lappend known_cases \
   istio-source-ingress-deny-egress-control cilium-cidr-narrow-deny \
   cilium-hostnetwork-peer-partial-data hostnetwork-peer-native-control \
   istio-authorization-default-deny-row
+lappend known_cases \
+  native-same-namespace-selector native-podselector-scope native-notin-blocked native-doesnotexist-excluded native-namespace-and-control \
+  native-range-rule-navigation cilium-nonisolating-deny-egress cilium-cnp-namespace-scope-control-egress \
+  cilium-nonisolating-combined-spec-navigation istio-default-action-rule-navigation istio-deny-only-rule-navigation \
+  istio-audit-dryrun-rules-absent istio-inject-annotation istio-inject-label-precedence istio-inject-optout-precedence \
+  native-zero-pair-not-applicable
 set case_manifest [dict create known $known_cases \
   identity {istio-identity-ingress-note istio-identity-egress-note} \
-  unsupported {unsupported-cilium-rule-details unsupported-scoped-egress-control}]
+  unsupported {unsupported-cilium-rule-details unsupported-scoped-egress-control} \
+  cilium-features {cilium-unsupported-fields-diagnostics cilium-unsupported-fields-no-modeled-ports cilium-unsupported-fields-control} \
+  cilium-rejected {cilium-rejected-sibling-diagnostics cilium-rejected-sibling-control} \
+  istio-features {istio-l7-allow-diagnostics istio-l7-allow-unmatched-control istio-l7-deny-diagnostics istio-l7-deny-unmatched-control istio-request-allow-diagnostics istio-request-allow-unmatched-control istio-request-deny-diagnostics istio-request-deny-unmatched-control} \
+  istio-custom {istio-custom-diagnostics istio-custom-unmatched-control} \
+  istio-targetrefs {istio-targetrefs-diagnostics istio-targetrefs-other-namespace-control} \
+  istio-root {istio-root-scope-ingress istio-root-unmatched-control istio-root-policy-navigation}]
 if {!$syntax_only && [info exists env(EXPECT_CASE_MANIFEST)] && $env(EXPECT_CASE_MANIFEST) eq "1"} {
-  foreach group {known identity unsupported} {
-    foreach name [dict get $case_manifest $group] { puts "$group\t$name" }
+  dict for {group names} $case_manifest {
+    foreach name $names { puts "$group\t$name" }
   }
   exit 0
 }
@@ -116,6 +132,8 @@ proc rule_spec {policy direction action} {
     cnp-source/Egress/ALLOW { return [list {specs[0]} 1] }
     cnp-source/Egress/DENY { return [list {specs[1]} 1] }
     cnp-target/Ingress/ALLOW - cnp-target/Ingress/DENY { return [list spec 0] }
+    cnp-observe/Egress/ALLOW { return [list spec 1] }
+    cnp-observe/Egress/DENY { return [list {specs[0]} 1] }
   }
   if {$policy eq "${prefix}-edge-ccnp"} {
     if {$direction eq "Egress"} { return [list {specs[0]} 1] }
@@ -805,24 +823,84 @@ verify_cidr_narrow_deny
 verify_hostnetwork_peer cilium-hostnetwork-peer-partial-data cnp-server $ns_edge_dst Ingress {Partial Data} {no ports} 1
 verify_hostnetwork_peer hostnetwork-peer-native-control authz-server $ns_edge_dst Ingress Disallowed {no ports} 0
 verify_authorization_default_deny_row authz-no-tcp $ns_edge_dst
+verify_effective_edge native-same-namespace-selector native-client $ns_edge_src Egress native-local $ns_edge_src Allowed {SCTP/9000, TCP/8000-8002, UDP/5353} 0 {true true}
+verify_effective_edge native-podselector-scope native-client $ns_edge_src Egress native-local-lookalike $ns_edge_dst Disallowed {no ports} 0 {false false}
+verify_effective_edge native-notin-blocked native-client $ns_edge_src Egress native-blocked $ns_edge_dst Disallowed {no ports} 0 {false false}
+verify_effective_edge native-doesnotexist-excluded native-client $ns_edge_src Egress native-excluded $ns_edge_dst Disallowed {no ports} 0 {false false}
+verify_effective_edge native-namespace-and-control native-client $ns_edge_src Egress native-lookalike $ns_edge_other Disallowed {no ports} 0 {false false}
+verify_edge_policy native-range-rule-navigation native-client $ns_edge_src Egress native-source $ns_edge_src NetworkPolicy networking.k8s.io/v1 networkpolicies ALLOW {SCTP/9000, TCP/8000-8002, UDP/5353} native-target $ns_edge_dst {TCP/8001-8002, UDP/5353}
+verify_effective_edge cilium-nonisolating-deny-egress cnp-observe $ns_edge_src Egress control $ns_edge_other Allowed {SCTP/9000, TCP/8080, UDP/5353} 0 {true true}
+verify_effective_edge cilium-cnp-namespace-scope-control-egress cnp-scope $ns_edge_other Egress control $ns_edge_other Allowed {SCTP/9000, TCP/8080, TCP/8081, UDP/5353} 0 {true true}
+verify_nonisolating_policy
+verify_edge_policy istio-default-action-rule-navigation authz-default $ns_edge_dst Ingress authz-default $ns_edge_dst AuthorizationPolicy security.istio.io/v1 authorizationpolicies ALLOW {TCP/all} authz-client $ns_edge_src {TCP/8080, TCP/8081}
+verify_edge_policy istio-deny-only-rule-navigation authz-denyonly $ns_edge_dst Ingress authz-denyonly $ns_edge_dst AuthorizationPolicy security.istio.io/v1 authorizationpolicies DENY {TCP/8081} authz-client $ns_edge_src {no ports} {} {Disallowed true false}
+verify_noenforcement_rows
+foreach {name pod} {istio-inject-annotation authz-inject-annotation istio-inject-label-precedence authz-inject-label} {
+  set diagnostic "Warning: Istio AuthorizationPolicy enforcement for pod $ns_edge_other/$pod is uncertain: sidecar injection is enabled for pod $ns_edge_other/$pod, but it has no istio-proxy container"
+  verify_effective_edge $name $pod $ns_edge_other Ingress control $ns_edge_other {Partial Data} {no ports} 1 {true false} [list $diagnostic]
+}
+verify_effective_edge istio-inject-optout-precedence authz-inject-optout $ns_edge_other Ingress control $ns_edge_other Allowed {TCP/8080} 0 {true true}
+verify_zero_subject
 } elseif {$suite eq "identity"} {
   verify_identity_edge Ingress
   verify_identity_edge Egress
-} else {
+} elseif {$suite eq "unsupported"} {
   verify_unsupported_policy
   # The probe's dynamic FQDN peer only degrades pairs of the pod it selects.
   verify_effective_edge unsupported-scoped-egress-control cnp-client $ns_edge_src Egress cnp-server $ns_edge_dst Allowed {TCP/8081} 0
+} elseif {$suite eq "cilium-features"} {
+  set origin "Warning: CiliumNetworkPolicy $ns_edge_src/probe-cilium-features-$probe_id: egress allow rule"
+  set diagnostics [list \
+    "$origin 0: fromRequires/toRequires identity constraints are not supported" \
+    "$origin 1: cloud-provider groups require runtime Cilium resolution" \
+    "$origin 2: CIDR group references require runtime Cilium resolution" \
+    "$origin 3: peer selector cannot be evaluated: Cilium identity selector \"io.cilium.k8s.policy.unmodeled\" is not supported" \
+    "$origin 4: Cilium TLS, SNI, and listener constraints cannot be evaluated from the policy snapshot"]
+  verify_effective_edge cilium-unsupported-fields-diagnostics uncertain-client $ns_edge_src Egress control $ns_edge_other {Partial Data} {TCP/443} 1 {true true} $diagnostics
+  verify_effective_edge cilium-unsupported-fields-no-modeled-ports uncertain-client $ns_edge_src Egress cnp-server $ns_edge_dst {Partial Data} {no ports} 1 {false false}
+  verify_effective_edge cilium-unsupported-fields-control cnp-client $ns_edge_src Egress cnp-server $ns_edge_dst Allowed {TCP/8081} 0 {true true}
+} elseif {$suite eq "cilium-rejected"} {
+  set diagnostic "Warning: CiliumNetworkPolicy $ns_edge_src/probe-cilium-rejected-$probe_id spec: Cilium rejects this policy: specs\[0\]: egress allow rule 0: unable to parse port \"70000\": strconv.ParseUint: parsing \"70000\": value out of range"
+  verify_effective_edge cilium-rejected-sibling-diagnostics uncertain-client $ns_edge_src Egress control $ns_edge_other {Partial Data} {SCTP/all, TCP/all, UDP/all} 1 {true true} [list $diagnostic]
+  verify_effective_edge cilium-rejected-sibling-control cnp-client $ns_edge_src Egress cnp-server $ns_edge_dst Allowed {TCP/8081} 0 {true true}
+} elseif {$suite eq "istio-features"} {
+  foreach class {l7 request} {
+    foreach action {allow deny} {
+      set subject "authz-$class-$action"
+      set origin "Warning: AuthorizationPolicy $ns_edge_dst/probe-istio-$class-$action-$probe_id: ingress $action rule"
+      set ports {SCTP/9000, TCP/8080, TCP/8081, UDP/5353}
+      set control_ports $ports
+      if {$class eq "l7"} {
+        set diagnostics [list "$origin 0: Istio L7 operation constraints cannot be evaluated from the policy snapshot"]
+        if {$action eq "deny"} { lappend diagnostics "$origin 0: DENY has unmodeled L7 predicates; its ports are not subtracted" }
+      } else {
+        set diagnostics [list "$origin 0: requestPrincipals depend on JWT request identity" "$origin 1: remoteIpBlocks depend on proxy forwarding configuration"]
+      }
+      if {$action eq "allow"} {
+        set control_ports {SCTP/9000, UDP/5353}
+        set ports $control_ports
+        if {$class eq "l7"} { set ports {SCTP/9000, TCP/8080, UDP/5353} }
+      }
+      verify_effective_edge "istio-$class-$action-diagnostics" $subject $ns_edge_dst Ingress authz-client $ns_edge_src {Partial Data} $ports 1 {true true} $diagnostics
+      verify_effective_edge "istio-$class-$action-unmatched-control" $subject $ns_edge_dst Ingress control $ns_edge_other Allowed $control_ports 0 {true true}
+    }
+  }
+} elseif {$suite eq "istio-custom"} {
+  set diagnostic "Warning: AuthorizationPolicy $ns_edge_dst/probe-istio-custom-$probe_id: ingress custom rule 0: CUSTOM authorization depends on an external provider"
+  verify_effective_edge istio-custom-diagnostics authz-default $ns_edge_dst Ingress authz-client $ns_edge_src {Partial Data} {SCTP/9000, TCP/8080, TCP/8081, UDP/5353} 1 {true true} [list $diagnostic]
+  verify_effective_edge istio-custom-unmatched-control authz-default $ns_edge_dst Ingress control $ns_edge_other Allowed {SCTP/9000, TCP/8080, TCP/8081, UDP/5353} 0 {true true}
+} elseif {$suite eq "istio-targetrefs"} {
+  set diagnostic "Warning: AuthorizationPolicy $ns_edge_dst/probe-istio-targetrefs-$probe_id: targetRefs cannot be resolved to pods from the policy snapshot; the pods it selects cannot be determined"
+  verify_effective_edge istio-targetrefs-diagnostics authz-default $ns_edge_dst Ingress authz-client $ns_edge_src {Partial Data} {SCTP/9000, TCP/8080, TCP/8081, UDP/5353} 1 {true true} [list $diagnostic]
+  verify_effective_edge istio-targetrefs-other-namespace-control authz-inject-optout $ns_edge_other Ingress control $ns_edge_other Allowed {TCP/8080} 0 {true true}
+} elseif {$suite eq "istio-root"} {
+  verify_effective_edge istio-root-scope-ingress authz-identity $ns_edge_dst Ingress authz-client $ns_edge_src Allowed {SCTP/9000, TCP/8080, UDP/5353} 0 {true true}
+  verify_effective_edge istio-root-unmatched-control authz-default $ns_edge_dst Ingress authz-client $ns_edge_src Allowed {SCTP/9000, TCP/8080, TCP/8081, UDP/5353} 0 {true true}
+  verify_edge_policy istio-root-policy-navigation authz-identity $ns_edge_dst Ingress "probe-istio-root-$probe_id" istio-system AuthorizationPolicy security.istio.io/v1 authorizationpolicies ALLOW {TCP/8080} authz-client $ns_edge_src {TCP/8080} {} {Allowed true true} \
+    {{policy is treated as mesh-wide because istio-system is the resolved Istio root namespace}}
 }
 
-if {$startup_screen eq "" || $navigation_setup_error ne ""} {
-  catch {exec docker kill $container}
-} else {
-  send_key "q"
-}
-expect {
-  eof {}
-  timeout { catch {exec docker kill $container} }
-}
+finish_smoke_process
 
 close_case
 foreach name [dict get $case_manifest $suite] {

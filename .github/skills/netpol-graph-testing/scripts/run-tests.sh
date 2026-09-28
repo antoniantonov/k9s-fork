@@ -400,8 +400,7 @@ run_smoke_suite() {
     "$EXPECT_SCRIPT"
 }
 
-# The model's uncertainty flag is snapshot-wide. Each negative-data suite gets
-# its own process and uniquely owned policy, after the complete-data suites.
+# Each interfering suite gets a fresh process and uniquely owned policies.
 run_probe_smoke() (
   # Bash 3.2 unwinds function locals before EXIT traps; keep this in the
   # isolated subshell so cleanup still knows which exact probe it owns.
@@ -436,7 +435,7 @@ run_probe_smoke() (
 summarize_smoke() {
   local suite
   EXPECT_CASE_MANIFEST=1 "$EXPECT_SCRIPT" >"$RUN_DIR/smoke.expected" || return 1
-  for suite in known identity unsupported; do
+  for suite in $(awk -F '\t' '!seen[$1]++ {print $1}' "$RUN_DIR/smoke.expected"); do
     if [[ -f "$RUN_DIR/smoke-$suite.verdicts" ]]; then
       awk -F '\t' -v suite="$suite" '{print suite "\t" $0}' "$RUN_DIR/smoke-$suite.verdicts"
     fi
@@ -482,7 +481,7 @@ phase_tui_tests() {
     --entrypoint kubectl "$image" get namespace "$PREFIX-app" || return 1
   check_workloads || return 1
   run_smoke_suite known "$image" "$kubeconfig" "$network" || status=1
-  for probe in identity unsupported; do
+  for probe in identity unsupported cilium-features cilium-rejected istio-features istio-custom istio-targetrefs istio-root; do
     run_probe_smoke "$probe" "$image" "$kubeconfig" "$network" || status=1
   done
   summarize_smoke || status=1

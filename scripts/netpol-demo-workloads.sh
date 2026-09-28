@@ -41,7 +41,8 @@
 #   --no-wait            do not wait for pods to become ready
 #   --timeout DURATION   readiness wait timeout (default: 180s)
 #   --delete             delete this prefix's fixtures, preserving shared CRDs
-#   --probe TYPE         operate only on an opt-in identity or unsupported probe
+#   --probe TYPE         identity, unsupported, cilium-features, cilium-rejected,
+#                        istio-features, istio-custom, istio-targetrefs, istio-root
 #   --probe-id ID        unique owner ID required with --probe (check/apply/delete)
 #   -h, --help           show this help
 # END_USAGE
@@ -295,8 +296,8 @@ if [[ ! "$PREFIX" =~ ^[a-z0-9]([a-z0-9-]{0,50}[a-z0-9])?$ ]]; then
   exit 2
 fi
 if [[ -n "$PROBE" ]]; then
-  if [[ "$PROBE" != identity && "$PROBE" != unsupported ]]; then
-    echo "--probe must be identity or unsupported" >&2
+  if ! edge_probe_types | grep -qx "$PROBE"; then
+    echo "--probe must be one of: $(edge_probe_types | tr '\n' ' ')" >&2
     exit 2
   fi
   if [[ ! "$PROBE_ID" =~ ^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$ ]] || (( DELETE_CLUSTER == 1 )); then

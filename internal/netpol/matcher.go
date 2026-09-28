@@ -23,7 +23,7 @@ func policyHasDirection(policy *netv1.NetworkPolicy, direction Direction) bool {
 		if direction == Ingress {
 			return true
 		}
-		return policy.Spec.Egress != nil
+		return len(policy.Spec.Egress) > 0
 	}
 	want := netv1.PolicyTypeIngress
 	if direction == Egress {

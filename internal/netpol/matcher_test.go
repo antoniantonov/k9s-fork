@@ -94,13 +94,86 @@ func TestPolicyDirectionDefaults(t *testing.T) {
 	}{
 		{"implicit ingress", netv1.NetworkPolicySpec{}, Ingress, true},
 		{"implicit no egress", netv1.NetworkPolicySpec{}, Egress, false},
-		{"implicit egress when field present", netv1.NetworkPolicySpec{Egress: []netv1.NetworkPolicyEgressRule{}}, Egress, true},
+		{"empty egress does not default egress", netv1.NetworkPolicySpec{Egress: []netv1.NetworkPolicyEgressRule{}}, Egress, false},
+		{"nonempty egress defaults egress", netv1.NetworkPolicySpec{Egress: []netv1.NetworkPolicyEgressRule{{}}}, Egress, true},
+		{"egress rules still default ingress", netv1.NetworkPolicySpec{Egress: []netv1.NetworkPolicyEgressRule{{}}}, Ingress, true},
 		{"explicit egress", netv1.NetworkPolicySpec{PolicyTypes: []netv1.PolicyType{netv1.PolicyTypeEgress}}, Egress, true},
 		{"explicit egress excludes ingress", netv1.NetworkPolicySpec{PolicyTypes: []netv1.PolicyType{netv1.PolicyTypeEgress}}, Ingress, false},
+		{"explicit ingress excludes egress", netv1.NetworkPolicySpec{PolicyTypes: []netv1.PolicyType{netv1.PolicyTypeIngress}}, Egress, false},
+		{"explicit empty egress isolates", netv1.NetworkPolicySpec{
+			PolicyTypes: []netv1.PolicyType{netv1.PolicyTypeEgress}, Egress: []netv1.NetworkPolicyEgressRule{},
+		}, Egress, true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			require.Equal(t, test.want, policyHasDirection(&netv1.NetworkPolicy{Spec: test.spec}, test.direction))
 		})
 	}
+}
+
+func TestNativeSelectorExpressionBoundaries(t *testing.T) {
+	tests := []struct {
+		name     string
+		operator metav1.LabelSelectorOperator
+		values   []string
+		want     []bool
+	}{
+		{"in", metav1.LabelSelectorOpIn, []string{"client"}, []bool{true, false, false}},
+		{"not-in", metav1.LabelSelectorOpNotIn, []string{"client"}, []bool{false, true, true}},
+		{"exists", metav1.LabelSelectorOpExists, nil, []bool{true, true, false}},
+		{"does-not-exist", metav1.LabelSelectorOpDoesNotExist, nil, []bool{false, false, true}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := testSnapshot()
+			requirement := metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
+				Key: "role", Operator: test.operator, Values: test.values,
+			}}}
+			policy := ingressPolicy("expressions", "server", []netv1.NetworkPolicyIngressRule{{
+				From: []netv1.NetworkPolicyPeer{{
+					NamespaceSelector: selector(map[string]string{"team": "client"}), PodSelector: &requirement,
+				}},
+				Ports: []netv1.NetworkPolicyPort{numericPolicyPort(8080, 0)},
+			}})
+			snapshot.NetworkPolicies = []netv1.NetworkPolicy{policy}
+			for index, role := range []string{"client", "other", ""} {
+				snapshot.Pods[0].Labels = map[string]string{}
+				if role != "" {
+					snapshot.Pods[0].Labels["role"] = role
+				}
+				result := evaluateServer(t, &snapshot)
+				peer := findPrimitive(t, result.Ingress, PrimitivePod, "client", "client")
+				if test.want[index] {
+					require.Equal(t, AccessAllowed, peer.State, "role=%q", role)
+					require.Equal(t, []string{"TCP/8080"}, permissionStrings(peer.Permissions))
+				} else {
+					require.Equal(t, AccessDisallowed, peer.State, "role=%q", role)
+					require.Empty(t, peer.Permissions)
+				}
+				require.Empty(t, peer.Warnings)
+			}
+			snapshot.Pods[0].Labels = map[string]string{"role": "client"}
+			snapshot.Namespaces[0].Labels["team"] = "other"
+			result := evaluateServer(t, &snapshot)
+			require.Equal(t, AccessDisallowed,
+				findPrimitive(t, result.Ingress, PrimitivePod, "client", "client").State,
+				"namespace and pod expressions are conjunctive")
+		})
+	}
+}
+
+func TestNativeEmptyEgressBeforeAPIDefaulting(t *testing.T) {
+	// API-server snapshots already contain policyTypes; this raw-object
+	// regression checks that local defaulting agrees with API admission.
+	snapshot := testSnapshot()
+	policy := ingressPolicy("raw-defaults", "server", nil)
+	policy.Spec.PolicyTypes = nil
+	policy.Spec.Egress = []netv1.NetworkPolicyEgressRule{}
+	snapshot.NetworkPolicies = []netv1.NetworkPolicy{policy}
+	result := evaluateServer(t, &snapshot)
+	require.Equal(t, AccessDisallowed, findPrimitive(t, result.Ingress, PrimitivePod, "client", "client").State)
+	egress := findPrimitive(t, result.Egress, PrimitivePod, "client", "client")
+	require.Equal(t, AccessAllowed, egress.State)
+	require.Equal(t, []string{"SCTP/all", "TCP/all", "UDP/all"}, permissionStrings(egress.Permissions))
+	require.Empty(t, egress.Warnings)
 }

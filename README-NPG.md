@@ -31,6 +31,12 @@ Kubernetes NetworkPolicy rules are additive allow rules. Cilium and Istio
 policies can also contribute explicit deny rules, which take precedence over
 matching allows.
 
+When native `policyTypes` is omitted, Kubernetes defaults it to `Ingress`,
+adding `Egress` only when there is at least one egress rule. An empty
+`egress: []` therefore requires explicit `policyTypes: [Egress]` to isolate
+egress. Label-selector requirements are conjunctive, including Cilium
+`any:` and `k8s:` requirements that refer to the same Kubernetes label.
+
 NPG can be opened with:
 
 ```text
@@ -134,7 +140,11 @@ and pods without any enrollment signal are outside the mesh; authorization is
 not applied to them. When the signals conflict, for example a
 `sidecar.istio.io/status` annotation without an `istio-proxy` container, or a
 namespace with sidecar injection enabled but a pod without a sidecar, enrollment
-is unknown and the affected pairs are `Partial Data`.
+is unknown and the affected pairs are `Partial Data`. Pod-level
+`sidecar.istio.io/inject=true` labels and annotations also signal expected
+injection, not proof of an actual sidecar. When both are present, the label
+takes precedence over the annotation, as in Istio's injector. Actual sidecar
+and ambient enrollment signals are evaluated before injection expectations.
 
 Certificate-derived source namespace, service-account, principal, and
 trust-domain constraints are evaluated from workload metadata: enrolled sources
