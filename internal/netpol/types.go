@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,12 +15,28 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-const DefaultResultLimit = 5_000
+const (
+	DefaultResultLimit        = 5_000
+	DefaultIstioRootNamespace = "istio-system"
+)
+
+// Synthetic rule kinds explain results that no concrete policy rule produced.
+const (
+	// SyntheticUnrestricted means no network-layer policy isolates the pod.
+	SyntheticUnrestricted = "unrestricted"
+	// SyntheticDefaultDeny means a network-layer policy isolates the pod and
+	// no allow rule matches the peer.
+	SyntheticDefaultDeny = "default-deny"
+	// SyntheticAuthorizationDefaultDeny means an Istio ALLOW policy isolates a
+	// mesh workload's TCP ingress and no allow rule matches the request.
+	SyntheticAuthorizationDefaultDeny = "authorization-default-deny"
+)
 
 type Direction uint8
 
@@ -33,6 +50,57 @@ func (d Direction) String() string {
 		return "Egress"
 	}
 	return "Ingress"
+}
+
+// PolicyType identifies the API resource which supplied a policy rule.
+type PolicyType string
+
+const (
+	PolicyTypeNetworkPolicy                  PolicyType = "np"
+	PolicyTypeCiliumNetworkPolicy            PolicyType = "cnp"
+	PolicyTypeCiliumClusterwideNetworkPolicy PolicyType = "ccnp"
+	PolicyTypeIstioAuthorizationPolicy       PolicyType = "authz"
+	PolicyTypeSynthetic                      PolicyType = "synthetic"
+)
+
+func (t PolicyType) String() string {
+	if t == "" {
+		return string(PolicyTypeNetworkPolicy)
+	}
+	return string(t)
+}
+
+// Kind returns the Kubernetes kind represented by the policy type.
+func (t PolicyType) Kind() string {
+	switch t {
+	case PolicyTypeCiliumNetworkPolicy:
+		return "CiliumNetworkPolicy"
+	case PolicyTypeCiliumClusterwideNetworkPolicy:
+		return "CiliumClusterwideNetworkPolicy"
+	case PolicyTypeIstioAuthorizationPolicy:
+		return "AuthorizationPolicy"
+	case PolicyTypeSynthetic:
+		return "Synthetic"
+	default:
+		return "NetworkPolicy"
+	}
+}
+
+// PolicyAction is the effect of a matching policy rule.
+type PolicyAction string
+
+const (
+	PolicyActionAllow PolicyAction = "allow"
+	PolicyActionDeny  PolicyAction = "deny"
+	// PolicyActionCustom delegates the decision to an external authorizer.
+	PolicyActionCustom PolicyAction = "custom"
+)
+
+func (a PolicyAction) String() string {
+	if a == "" {
+		return string(PolicyActionAllow)
+	}
+	return string(a)
 }
 
 type SubjectKind uint8
@@ -161,20 +229,58 @@ type RuleID struct {
 	PolicyNamespace string
 	PolicyName      string
 	PolicyUID       types.UID
+	PolicyType      PolicyType
+	PolicyVersion   string
+	PolicySpecIndex int
+	Action          PolicyAction
 	Direction       Direction
 	Index           int
 	SyntheticKind   string
 }
 
 func (r RuleID) String() string {
-	return stableID(
+	var b strings.Builder
+	b.Grow(len(r.PolicyNamespace) + len(r.PolicyName) + len(r.PolicyUID) + len(r.SyntheticKind) + 48)
+	for index, part := range []string{
 		r.PolicyNamespace,
 		r.PolicyName,
 		string(r.PolicyUID),
 		r.Direction.String(),
-		fmt.Sprintf("%d", r.Index),
+		strconv.Itoa(r.Index),
 		r.SyntheticKind,
-	)
+	} {
+		if index > 0 {
+			b.WriteByte(stableIDSeparator)
+		}
+		b.WriteString(part)
+	}
+	// Preserve native NetworkPolicy IDs while making rules from different CRD
+	// kinds, top-level Cilium specs, and actions unambiguous.
+	if r.PolicyType != "" && r.PolicyType != PolicyTypeNetworkPolicy {
+		for _, part := range []string{
+			r.PolicyType.String(),
+			r.PolicyVersion,
+			strconv.Itoa(r.PolicySpecIndex),
+			r.Action.String(),
+		} {
+			b.WriteByte(stableIDSeparator)
+			b.WriteString(part)
+		}
+	}
+	return b.String()
+}
+
+// SourceType returns the rule's effective source policy type.
+//
+//nolint:gocritic // Value receiver preserves the public API and supports composite literals.
+func (r RuleID) SourceType() PolicyType {
+	if r.SyntheticKind != "" || r.PolicyName == "" {
+		return PolicyTypeSynthetic
+	}
+	if r.PolicyType == "" {
+		return PolicyTypeNetworkPolicy
+	}
+	return r.PolicyType
 }
 
 type PortPermission struct {
@@ -230,13 +336,19 @@ type RuleResult struct {
 	SubjectPodCount   int
 	SubjectMatchCount int
 	PolicySelector    string
-	Peers             []string
-	YAML              string
-	PeerSummary       string
-	Permissions       []PortPermission
-	Evidence          []PolicyEvidence
-	Synthetic         bool
-	Warnings          []string
+	// PolicySpec names the Cilium rule entry, such as spec or specs[1].
+	PolicySpec string
+	// PolicySpecCount is the number of top-level Cilium rule entries in the
+	// policy. Rule labels include PolicySpec when it is greater than one.
+	PolicySpecCount int
+	Peers           []string
+	YAML            string
+	PeerSummary     string
+	Permissions     []PortPermission
+	Evidence        []PolicyEvidence
+	Synthetic       bool
+	Notes           []string
+	Warnings        []string
 }
 
 //nolint:gocritic // Value receiver preserves the public API.
@@ -296,7 +408,11 @@ type SubjectResult struct {
 	Ingress     DirectionResult
 	Egress      DirectionResult
 	GeneratedAt time.Time
-	Warnings    []string
+	// Warnings explain why results for this subject are incomplete.
+	Warnings []string
+	// Notes describe assumptions and fallbacks which do not make any result
+	// incomplete on their own.
+	Notes       []string
 	Truncated   bool
 	ResultLimit int
 }
@@ -310,14 +426,23 @@ func (r SubjectResult) Direction(direction Direction) DirectionResult {
 }
 
 type Snapshot struct {
-	Pods            []corev1.Pod
-	Namespaces      []corev1.Namespace
-	NetworkPolicies []netv1.NetworkPolicy
-	Deployments     []appsv1.Deployment
-	ReplicaSets     []appsv1.ReplicaSet
-	Jobs            []batchv1.Job
-	Incomplete      map[string]error
-	GeneratedAt     time.Time
+	Pods                             []corev1.Pod
+	Namespaces                       []corev1.Namespace
+	NetworkPolicies                  []netv1.NetworkPolicy
+	CiliumNetworkPolicies            []unstructured.Unstructured
+	CiliumClusterwideNetworkPolicies []unstructured.Unstructured
+	IstioAuthorizationPolicies       []unstructured.Unstructured
+	IstioRootNamespace               string
+	// IstioRootNamespaceCandidates lists conflicting root namespaces reported
+	// by different Istio revisions. It is empty when the root is unambiguous.
+	IstioRootNamespaceCandidates []string
+	Deployments                  []appsv1.Deployment
+	ReplicaSets                  []appsv1.ReplicaSet
+	Jobs                         []batchv1.Job
+	Incomplete                   map[string]error
+	// Notes carry snapshot-level assumptions, such as configuration fallbacks.
+	Notes       []string
+	GeneratedAt time.Time
 }
 
 type Options struct {
@@ -339,6 +464,8 @@ type Evaluator interface {
 	RuleApplicability(SubjectResult, Direction, RuleID, sets.Set[PrimitiveKind]) []ApplicabilityRow
 }
 
+const stableIDSeparator = '\x1f'
+
 func stableID(parts ...string) string {
-	return strings.Join(parts, "\x1f")
+	return strings.Join(parts, string(stableIDSeparator))
 }

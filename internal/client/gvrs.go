@@ -39,6 +39,12 @@ var (
 	NpGVR  = NewGVR("networking.k8s.io/v1/networkpolicies")
 	ScGVR  = NewGVR("storage.k8s.io/v1/storageclasses")
 
+	// Network policy extensions...
+	CnpGVR         = NewGVR("cilium.io/v2/ciliumnetworkpolicies")
+	CcnpGVR        = NewGVR("cilium.io/v2/ciliumclusterwidenetworkpolicies")
+	AuthzGVR       = NewGVR("security.istio.io/v1/authorizationpolicies")
+	AuthzV1BetaGVR = NewGVR("security.istio.io/v1beta1/authorizationpolicies")
+
 	// Policy...
 	PdbGVR = NewGVR("policy/v1/poddisruptionbudgets")
 	PspGVR = NewGVR("policy/v1beta1/podsecuritypolicies")

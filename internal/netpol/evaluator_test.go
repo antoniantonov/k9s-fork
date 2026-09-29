@@ -581,11 +581,13 @@ func TestResultLimitBoundsPairsIndependentlyPerDirection(t *testing.T) {
 	}
 }
 
+// testSnapshot returns a client and a server pod. Both namespaces are enrolled
+// in the Istio ambient mesh so AuthorizationPolicy applies to their pods.
 func testSnapshot() Snapshot {
 	return Snapshot{
 		Namespaces: []corev1.Namespace{
-			{ObjectMeta: metav1.ObjectMeta{Name: "client", Labels: map[string]string{"team": "client"}}},
-			{ObjectMeta: metav1.ObjectMeta{Name: "server", Labels: map[string]string{"team": "server"}}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "client", Labels: map[string]string{"team": "client", istioDataplaneModeLabel: "ambient"}}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "server", Labels: map[string]string{"team": "server", istioDataplaneModeLabel: "ambient"}}},
 		},
 		Pods: []corev1.Pod{
 			{ObjectMeta: metav1.ObjectMeta{Namespace: "client", Name: "client", UID: "client", Labels: map[string]string{"role": "client"}}},

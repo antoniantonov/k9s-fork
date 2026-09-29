@@ -68,8 +68,10 @@ type reachabilityBlock struct {
 	label     string
 	synthetic bool
 	primary   string
+	ruleType  string
 	secondary string
 	detail    string
+	peer      string
 }
 
 // blockCell is one rendered cell of a block row.
@@ -347,14 +349,12 @@ func (p *DirectionPanel) ContentHeight() int {
 	return rows + 2
 }
 
-// blockColumns returns the cells of a block's two rendered rows. The Rules
-// projection drops the leading state column: now that only applicable rules are
-// listed it carried nothing but the occasional badge, and the row color says
-// the same thing without spending a column on it.
+// blockColumns returns the cells of a block's two rendered rows. Rules show the
+// source policy type between the rule identity and its ports.
 func (p *DirectionPanel) blockColumns(block *reachabilityBlock) (top, bottom []blockCell) {
 	if p.projection == RulesProjection {
-		return []blockCell{{block.primary, true}, {block.secondary, true}},
-			[]blockCell{{block.detail, true}, {"", true}}
+		return []blockCell{{block.primary, true}, {block.ruleType, false}, {block.secondary, true}},
+			[]blockCell{{block.detail, true}, {"", false}, {block.peer, true}}
 	}
 	return []blockCell{{block.label, false}, {block.primary, true}, {block.secondary, true}},
 		[]blockCell{{"", false}, {block.detail, true}, {"", true}}
@@ -451,10 +451,20 @@ func (p *DirectionPanel) project() []reachabilityBlock {
 				label:     label,
 				synthetic: rule.Synthetic,
 				primary:   formatRuleName(rule),
+				ruleType:  rule.ID.SourceType().Kind(),
 				secondary: permissions,
-				detail:    fmt.Sprintf("subjects %d/%d · peer %s", rule.SubjectMatchCount, rule.SubjectPodCount, valueOrDash(rule.PeerSummary)),
+				detail:    fmt.Sprintf("subjects %d/%d", rule.SubjectMatchCount, rule.SubjectPodCount),
+				peer:      "peer " + valueOrDash(rule.PeerSummary),
 			}
-			block.search = strings.Join([]string{block.label, block.primary, block.secondary, block.detail, strings.Join(rule.Warnings, " ")}, " ")
+			block.search = strings.Join([]string{
+				block.label,
+				block.primary,
+				block.ruleType,
+				block.secondary,
+				block.detail,
+				block.peer,
+				strings.Join(rule.Warnings, " "),
+			}, " ")
 			if matchesReachabilityFilter(block.search, p.filter) {
 				blocks = append(blocks, block)
 			}
@@ -703,15 +713,33 @@ func orDefaultColor(color config.Color, fallback tcell.Color) tcell.Color {
 	return color.Color()
 }
 
+// formatRuleName renders a rule's identity. Multi-spec Cilium rules add
+// their spec entry and non-allow rules add their action, so an allow and a
+// deny at the same index, or rules from different specs, never share a label.
 func formatRuleName(rule *netpol.RuleResult) string {
+	if rule.ID.PolicyName == "" {
+		return fmt.Sprintf("%s #%d", syntheticRuleName(rule.ID.SyntheticKind), rule.ID.Index)
+	}
 	name := rule.ID.PolicyName
 	if rule.ID.PolicyNamespace != "" {
 		name = rule.ID.PolicyNamespace + "/" + name
 	}
-	if name == "" {
-		name = valueOrDash(rule.ID.SyntheticKind)
+	if rule.PolicySpecCount > 1 && rule.PolicySpec != "" {
+		name += " " + rule.PolicySpec
+	}
+	if action := rule.ID.Action; action != "" && action != netpol.PolicyActionAllow {
+		name += " " + action.String()
 	}
 	return fmt.Sprintf("%s #%d", name, rule.ID.Index)
+}
+
+// syntheticRuleName labels synthetic rules. The authorization default deny
+// only covers TCP, so its label says so.
+func syntheticRuleName(kind string) string {
+	if kind == netpol.SyntheticAuthorizationDefaultDeny {
+		return "authorization default-deny (TCP)"
+	}
+	return valueOrDash(kind)
 }
 
 func formatPrimitiveName(ref *netpol.PrimitiveRef) string {
@@ -1018,10 +1046,19 @@ func colorName(color tcell.Color) string {
 func RuleDetailsText(rule netpol.RuleResult) string {
 	var b strings.Builder
 	state, label := ruleState(&rule)
-	fmt.Fprintf(&b, "Policy: %s/%s\nPolicy UID: %s\nDirection: %s\nRule index: %d\nState: %s (%s)\nPolicy pod selector: %s\nSubjects: %d/%d\nPeers:\n",
-		valueOrDash(rule.ID.PolicyNamespace), valueOrDash(rule.ID.PolicyName), valueOrDash(string(rule.ID.PolicyUID)),
-		rule.ID.Direction, rule.ID.Index, state, label, valueOrDash(rule.PolicySelector),
-		rule.SubjectMatchCount, rule.SubjectPodCount)
+	fmt.Fprintf(&b, "Policy: %s/%s\nPolicy type: %s\nPolicy API version: %s\n",
+		valueOrDash(rule.ID.PolicyNamespace), valueOrDash(rule.ID.PolicyName),
+		rule.ID.SourceType().Kind(), valueOrDash(rule.ID.PolicyVersion))
+	fmt.Fprintf(&b, "Policy UID: %s\nDirection: %s\nAction: %s\nRule index: %d",
+		valueOrDash(string(rule.ID.PolicyUID)), rule.ID.Direction, rule.ID.Action.String(), rule.ID.Index)
+	// The Cilium spec entry shares the rule index line so the identity stays
+	// visible in the short detail pane.
+	if rule.PolicySpec != "" {
+		fmt.Fprintf(&b, " in %s (spec index %d)", rule.PolicySpec, rule.ID.PolicySpecIndex)
+	}
+	fmt.Fprintf(&b, "\nState: %s (%s)\n", state, label)
+	fmt.Fprintf(&b, "Policy pod selector: %s\nSubjects: %d/%d\nPeers:\n",
+		valueOrDash(rule.PolicySelector), rule.SubjectMatchCount, rule.SubjectPodCount)
 	if len(rule.Peers) == 0 {
 		fmt.Fprintf(&b, "  - %s\n", valueOrDash(rule.PeerSummary))
 	}
@@ -1032,6 +1069,7 @@ func RuleDetailsText(rule netpol.RuleResult) string {
 	if rule.YAML != "" {
 		fmt.Fprintf(&b, "Rule YAML:\n%s\n", rule.YAML)
 	}
+	appendNotes(&b, rule.Notes)
 	appendEvidence(&b, rule.Evidence)
 	appendWarnings(&b, rule.Warnings)
 	return strings.TrimRight(b.String(), "\n")
@@ -1136,6 +1174,16 @@ func appendEvidence(b *strings.Builder, evidence []netpol.PolicyEvidence) {
 			summary = item.RuleID.String()
 		}
 		fmt.Fprintf(b, "  - %s\n", summary)
+	}
+}
+
+func appendNotes(b *strings.Builder, notes []string) {
+	if len(notes) == 0 {
+		return
+	}
+	b.WriteString("Notes:\n")
+	for _, note := range notes {
+		fmt.Fprintf(b, "  - %s\n", note)
 	}
 }
 

@@ -255,11 +255,12 @@ type NetworkPolicyGraph struct {
 	// kind. The model reports a result and a partial-data failure back to back
 	// for the same refresh, so a single slot would let the failure discard the
 	// evaluation entirely.
-	pendingResult *netpol.SubjectResult
-	pendingErr    error
-	updateQueued  bool
-	refreshing    bool
-	refreshQueued bool
+	pendingResult     *netpol.SubjectResult
+	pendingErr        error
+	pendingErrSubject netpol.SubjectRef
+	updateQueued      bool
+	refreshing        bool
+	refreshQueued     bool
 }
 
 var (
@@ -568,7 +569,9 @@ func (v *NetworkPolicyGraph) NetPolGraphChanged(result netpol.SubjectResult) {
 // NetPolGraphFailed reports failures while retaining any usable partial result.
 func (v *NetworkPolicyGraph) NetPolGraphFailed(err error) {
 	if v.app == nil {
-		v.applyError(err)
+		if v.model.LastRefresh().Subject == v.subject {
+			v.applyError(err)
+		}
 		return
 	}
 	v.queueUpdate(nil, err)
@@ -582,14 +585,24 @@ func (v *NetworkPolicyGraph) NetPolGraphFailed(err error) {
 // Results and failures are tracked separately on purpose. A partial-data
 // refresh fires NetPolGraphChanged immediately followed by NetPolGraphFailed,
 // and the queued drain cannot have run in between, so a single slot would let
-// the failure overwrite - and silently discard - the evaluated result.
+// the failure overwrite - and silently discard - the evaluated result. A newer
+// result supersedes any older failure; a following failure still annotates it.
 func (v *NetworkPolicyGraph) queueUpdate(result *netpol.SubjectResult, err error) {
+	if result != nil && !matchesNetPolSubject(v.model.Subject(), result.Subject.Ref) {
+		return
+	}
+	var errorSubject netpol.SubjectRef
+	if err != nil {
+		errorSubject = v.model.LastRefresh().Subject
+	}
 	v.mx.Lock()
 	if result != nil {
 		v.pendingResult = result
+		v.pendingErr = nil
 	}
 	if err != nil {
 		v.pendingErr = err
+		v.pendingErrSubject = errorSubject
 	}
 	queue := !v.updateQueued
 	v.updateQueued = true
@@ -604,13 +617,13 @@ func (v *NetworkPolicyGraph) queueUpdate(result *netpol.SubjectResult, err error
 // so a partial-data failure annotates it instead of replacing it.
 func (v *NetworkPolicyGraph) drainPendingUpdate() {
 	v.mx.Lock()
-	result, err := v.pendingResult, v.pendingErr
+	result, err, errorSubject := v.pendingResult, v.pendingErr, v.pendingErrSubject
 	v.pendingResult, v.pendingErr, v.updateQueued = nil, nil, false
 	v.mx.Unlock()
 	if result != nil {
 		v.applyResult(result)
 	}
-	if err != nil {
+	if err != nil && errorSubject == v.subject {
 		v.applyError(err)
 	}
 }
@@ -627,6 +640,9 @@ func (v *NetworkPolicyGraph) applyError(err error) {
 }
 
 func (v *NetworkPolicyGraph) applyResult(result *netpol.SubjectResult) {
+	if !matchesNetPolSubject(v.subject, result.Subject.Ref) {
+		return
+	}
 	capturePanelState := v.haveResult
 	v.result, v.haveResult, v.lastError = *result, true, nil
 	v.invalidateProjections()
@@ -642,6 +658,18 @@ func (v *NetworkPolicyGraph) applyResult(result *netpol.SubjectResult) {
 	v.scheduleWorkloads()
 	v.updateSubject()
 	v.updateDetails(v.focus)
+}
+
+func matchesNetPolSubject(expected, resolved netpol.SubjectRef) bool {
+	// Command-opened subjects have no UID until the evaluator resolves them.
+	if expected.Kind == netpol.SubjectNamespace {
+		if expected.Name == "" {
+			expected.Name = expected.Namespace
+		}
+		expected.Namespace = ""
+	}
+	return expected.Kind == resolved.Kind && expected.Namespace == resolved.Namespace && expected.Name == resolved.Name &&
+		(expected.UID == "" || expected.UID == resolved.UID)
 }
 
 func (v *NetworkPolicyGraph) loadPanel(direction netpol.Direction) {
@@ -823,7 +851,7 @@ func (v *NetworkPolicyGraph) detailStops(direction netpol.Direction) (details, a
 		if !ok {
 			return false, false
 		}
-		return true, len(v.visibleApplicability(direction, v.ruleApplicability(direction, rule.ID))) > 0
+		return true, len(v.visibleApplicability(direction, v.ruleApplicability(direction, &rule.ID))) > 0
 	}
 	// Primitives render a plain text pane with no applicability table.
 	_, ok := v.selectedPrimitive(direction, id)
@@ -1003,7 +1031,7 @@ func (v *NetworkPolicyGraph) updateSubject() {
 		extras = append(extras, fmt.Sprintf("TRUNCATED at %d results", v.result.ResultLimit))
 	}
 	warnings := len(v.result.Warnings)
-	if refresh := v.model.LastRefresh(); len(refresh.Incomplete) > 0 {
+	if refresh := v.model.LastRefresh(); refresh.Subject == v.subject {
 		warnings += len(refresh.Incomplete)
 	}
 	if warnings > 0 {
@@ -1365,7 +1393,7 @@ func (v *NetworkPolicyGraph) renderDetails(direction netpol.Direction) {
 			v.refocusDetail()
 			return
 		}
-		rows := v.visibleApplicability(direction, v.ruleApplicability(direction, rule.ID))
+		rows := v.visibleApplicability(direction, v.ruleApplicability(direction, &rule.ID))
 		ruleDetail := ui.NewRuleDetailsWithStyle(rule, rows, v.reachabilityStyle())
 		ruleDetail.Applicability.SetTitle(v.applicabilityTitle("Applicability", direction))
 		v.applyDetailFocusStyle(ruleDetail)
@@ -1551,7 +1579,10 @@ func (v *NetworkPolicyGraph) appendResultWarnings(b *strings.Builder) {
 	for _, warning := range v.result.Warnings {
 		fmt.Fprintf(b, "\nWarning: %s", warning)
 	}
-	if refresh := v.model.LastRefresh(); len(refresh.Incomplete) > 0 {
+	for _, note := range v.result.Notes {
+		fmt.Fprintf(b, "\nNote: %s", note)
+	}
+	if refresh := v.model.LastRefresh(); refresh.Subject == v.subject && len(refresh.Incomplete) > 0 {
 		keys := make([]string, 0, len(refresh.Incomplete))
 		for resource := range refresh.Incomplete {
 			keys = append(keys, resource)
@@ -1643,18 +1674,18 @@ func (v *NetworkPolicyGraph) projection(direction netpol.Direction) *projectionC
 
 // ruleApplicability returns the applicability rows contributed by a single
 // rule, reusing the last computation when the pane repaints unchanged.
-func (v *NetworkPolicyGraph) ruleApplicability(direction netpol.Direction, id netpol.RuleID) []netpol.ApplicabilityRow {
+func (v *NetworkPolicyGraph) ruleApplicability(direction netpol.Direction, id *netpol.RuleID) []netpol.ApplicabilityRow {
 	mask := v.kindMask()
 	if memo := v.rows[direction]; memo != nil && memo.generation == v.dataGen && memo.kindMask == mask &&
-		!memo.effective && memo.ruleID == id {
+		!memo.effective && memo.ruleID == *id {
 		return memo.rows
 	}
 	v.rows[direction] = &applicabilityMemo{
 		generation: v.dataGen,
 		kindMask:   mask,
 		direction:  direction,
-		ruleID:     id,
-		rows:       v.evaluator.RuleApplicability(v.result, direction, id, v.kinds),
+		ruleID:     *id,
+		rows:       v.evaluator.RuleApplicability(v.result, direction, *id, v.kinds),
 	}
 	return v.rows[direction].rows
 }
@@ -1864,6 +1895,9 @@ func (v *NetworkPolicyGraph) openSubjectDialog() {
 }
 
 func (v *NetworkPolicyGraph) applySubject(ref netpol.SubjectRef) {
+	v.mx.Lock()
+	v.pendingResult, v.pendingErr = nil, nil
+	v.mx.Unlock()
 	v.subject = ref
 	v.model.SetSubject(ref)
 	v.result, v.haveResult, v.lastError = netpol.SubjectResult{}, false, nil
@@ -2035,19 +2069,19 @@ func (v *NetworkPolicyGraph) restoreSearchFocus(stop focusStop) {
 }
 
 // selectedRulePolicy returns the policy behind the direction's selected rule.
-func (v *NetworkPolicyGraph) selectedRulePolicy(direction netpol.Direction) (namespace, name string, found bool) {
+func (v *NetworkPolicyGraph) selectedRulePolicy(direction netpol.Direction) (netpol.RuleID, bool) {
 	if !v.state[direction].visible {
-		return "", "", false
+		return netpol.RuleID{}, false
 	}
 	id := v.panels[direction].SelectedID()
 	if id == "" {
-		return "", "", false
+		return netpol.RuleID{}, false
 	}
 	rule, ok := v.selectedRule(direction, id)
 	if !ok || rule.Synthetic || rule.ID.PolicyName == "" {
-		return "", "", false
+		return netpol.RuleID{}, false
 	}
-	return rule.ID.PolicyNamespace, rule.ID.PolicyName, true
+	return rule.ID, true
 }
 
 func (v *NetworkPolicyGraph) yamlCmd(_ *tcell.EventKey) *tcell.EventKey {
@@ -2112,11 +2146,15 @@ func (v *NetworkPolicyGraph) directionYAMLTarget(direction netpol.Direction) (*c
 		return nil, "", false
 	}
 	if v.mode == ui.RulesProjection {
-		namespace, name, ok := v.selectedRulePolicy(direction)
+		ruleID, ok := v.selectedRulePolicy(direction)
 		if !ok {
 			return nil, "", false
 		}
-		return client.NpGVR, objectKey(namespace, name), true
+		gvr, ok := policyGVR(&ruleID)
+		if !ok {
+			return nil, "", false
+		}
+		return gvr, policyPath(&ruleID), true
 	}
 	primitive, ok := v.selectedPrimitive(direction, id)
 	if !ok {
@@ -2178,6 +2216,42 @@ func primitiveGVR(ref *netpol.PrimitiveRef) (*client.GVR, string, bool) {
 	default:
 		return nil, "", false
 	}
+}
+
+func policyGVR(ruleID *netpol.RuleID) (*client.GVR, bool) {
+	switch ruleID.SourceType() {
+	case netpol.PolicyTypeNetworkPolicy:
+		return client.NpGVR, true
+	case netpol.PolicyTypeCiliumNetworkPolicy:
+		return client.CnpGVR, true
+	case netpol.PolicyTypeCiliumClusterwideNetworkPolicy:
+		return client.CcnpGVR, true
+	case netpol.PolicyTypeIstioAuthorizationPolicy:
+		if strings.HasSuffix(ruleID.PolicyVersion, "/v1beta1") {
+			return client.AuthzV1BetaGVR, true
+		}
+		return client.AuthzGVR, true
+	default:
+		return nil, false
+	}
+}
+
+func policyPath(ruleID *netpol.RuleID) string {
+	namespace := ruleID.PolicyNamespace
+	if ruleID.SourceType() == netpol.PolicyTypeCiliumClusterwideNetworkPolicy {
+		namespace = client.ClusterScope
+	}
+	return client.FQN(namespace, ruleID.PolicyName)
+}
+
+// policyCommand names a policy resource unambiguously. Custom resources use
+// plural.group, because another CRD, such as Linkerd's
+// authorizationpolicies.policy.linkerd.io, may share the bare plural.
+func policyCommand(gvr *client.GVR) string {
+	if gvr == client.NpGVR {
+		return gvr.R()
+	}
+	return gvr.R() + "." + gvr.G()
 }
 
 // escapeCmd clears the focused panel selection so the details pane shows the
@@ -2244,11 +2318,15 @@ func (v *NetworkPolicyGraph) directionPrimitiveTarget(direction netpol.Direction
 		return "", "", errNoPrimitiveTarget
 	}
 	if v.mode == ui.RulesProjection {
-		namespace, name, ok := v.selectedRulePolicy(direction)
+		ruleID, ok := v.selectedRulePolicy(direction)
 		if !ok {
 			return "", "", errNoPrimitiveTarget
 		}
-		return "networkpolicies", objectKey(namespace, name), nil
+		gvr, ok := policyGVR(&ruleID)
+		if !ok {
+			return "", "", errNoPrimitiveTarget
+		}
+		return policyCommand(gvr), policyPath(&ruleID), nil
 	}
 	primitive, ok := v.selectedPrimitive(direction, id)
 	if !ok {
