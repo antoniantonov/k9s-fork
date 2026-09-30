@@ -27,7 +27,7 @@ type SubjectWorkload struct {
 }
 
 // ID returns a stable identity used to preserve the selection across refreshes.
-func (w SubjectWorkload) ID() string {
+func (w *SubjectWorkload) ID() string {
 	return w.Kind + "/" + w.Namespace + "/" + w.Name
 }
 
@@ -198,8 +198,8 @@ func (s *SubjectInfo) rebuild() {
 		return
 	}
 	s.setHeader(0)
-	for index, item := range s.visible {
-		s.setWorkload(1+index, item)
+	for index := range s.visible {
+		s.setWorkload(1+index, &s.visible[index])
 	}
 	if index := s.indexOf(selectedID); index >= 0 {
 		s.Table.Select(1+index, max(0, column))
@@ -283,7 +283,7 @@ func (s *SubjectInfo) setHeader(row int) {
 	}
 }
 
-func (s *SubjectInfo) setWorkload(row int, item SubjectWorkload) {
+func (s *SubjectInfo) setWorkload(row int, item *SubjectWorkload) {
 	values := []string{item.Kind, item.Namespace, item.Name, item.Status}
 	for column, text := range values {
 		cell := tview.NewTableCell(text).

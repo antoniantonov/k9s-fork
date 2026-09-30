@@ -34,15 +34,33 @@ const (
 	TextStyleDim TextStyle = "dim"
 
 	// Default color palette values used to build the default skin.
-	colorBlack        = "black"
-	colorWhite        = "white"
-	colorAqua         = "aqua"
-	colorCadetBlue    = "cadetblue"
-	colorDodgerBlue   = "dodgerblue"
-	colorFuchsia      = "fuchsia"
-	colorGreen        = "green"
-	colorLightSkyBlue = "lightskyblue"
-	colorOrange       = "orange"
+	colorAqua            = "aqua"
+	colorBlack           = "black"
+	colorCadetBlue       = "cadetblue"
+	colorDarkOrange      = "darkorange"
+	colorDarkSlateBlue   = "darkslateblue"
+	colorDarkTurquoise   = "darkturquoise"
+	colorDodgerBlue      = "dodgerblue"
+	colorFuchsia         = "fuchsia"
+	colorGoldenrod       = "goldenrod"
+	colorGray            = "gray"
+	colorGreen           = "green"
+	colorGreenYellow     = "greenyellow"
+	colorLawnGreen       = "lawngreen"
+	colorLightSkyBlue    = "lightskyblue"
+	colorLightSlateGray  = "lightslategray"
+	colorLimeGreen       = "limegreen"
+	colorMediumPurple    = "mediumpurple"
+	colorMediumVioletRed = "mediumvioletred"
+	colorOrange          = "orange"
+	colorOrangeRed       = "orangered"
+	colorPaleGreen       = "palegreen"
+	colorPapayaWhip      = "papayawhip"
+	colorRed             = "red"
+	colorSeaGreen        = "seagreen"
+	colorSteelBlue       = "steelblue"
+	colorWhite           = "white"
+	colorYellow          = "yellow"
 )
 
 // ToShortString returns a short string representation of the text style.
@@ -292,7 +310,7 @@ func newDialog() Dialog {
 	return Dialog{
 		FgColor:            colorCadetBlue,
 		BgColor:            colorBlack,
-		ButtonBgColor:      "darkslateblue",
+		ButtonBgColor:      colorDarkSlateBlue,
 		ButtonFgColor:      colorBlack,
 		ButtonFocusBgColor: colorDodgerBlue,
 		ButtonFocusFgColor: colorBlack,
@@ -307,7 +325,7 @@ func newPrompt() Prompt {
 		BgColor:      colorBlack,
 		SuggestColor: colorDodgerBlue,
 		Border: PromptBorder{
-			DefaultColor: "seagreen",
+			DefaultColor: colorSeaGreen,
 			CommandColor: colorAqua,
 		},
 	}
@@ -318,11 +336,11 @@ func newCharts() Charts {
 		BgColor:            colorBlack,
 		DialBgColor:        colorBlack,
 		ChartBgColor:       colorBlack,
-		DefaultDialColors:  Colors{Color("palegreen"), Color("orangered")},
-		DefaultChartColors: Colors{Color("palegreen"), Color("orangered")},
+		DefaultDialColors:  Colors{Color(colorPaleGreen), Color(colorOrangeRed)},
+		DefaultChartColors: Colors{Color(colorPaleGreen), Color(colorOrangeRed)},
 		ResourceColors: map[string]Colors{
-			CPU: {Color(colorDodgerBlue), Color("darkslateblue")},
-			MEM: {Color("yellow"), Color("goldenrod")},
+			CPU: {Color(colorDodgerBlue), Color(colorDarkSlateBlue)},
+			MEM: {Color(colorYellow), Color(colorGoldenrod)},
 		},
 		FocusFgColor: colorWhite,
 		FocusBgColor: colorOrange,
@@ -343,12 +361,12 @@ func newViews() Views {
 
 func newReachability() Reachability {
 	return Reachability{
-		AllowedColor:     "green",
-		DisallowedColor:  "red",
-		PartialDataColor: "orange",
-		PartialColor:     "yellow",
-		UnknownColor:     "white",
-		FocusColor:       "orange",
+		AllowedColor:     colorGreen,
+		DisallowedColor:  colorRed,
+		PartialDataColor: colorOrange,
+		PartialColor:     colorYellow,
+		UnknownColor:     colorWhite,
+		FocusColor:       colorOrange,
 	}
 }
 
@@ -379,21 +397,21 @@ func newBody() Body {
 		LogoColor:      colorOrange,
 		LogoColorMsg:   colorWhite,
 		LogoColorInfo:  colorGreen,
-		LogoColorWarn:  "mediumvioletred",
-		LogoColorError: "red",
+		LogoColorWarn:  colorMediumVioletRed,
+		LogoColorError: colorRed,
 	}
 }
 
 func newStatus() Status {
 	return Status{
 		NewColor:       colorLightSkyBlue,
-		ModifyColor:    "greenyellow",
+		ModifyColor:    colorGreenYellow,
 		AddColor:       colorDodgerBlue,
-		PendingColor:   "darkorange",
-		ErrorColor:     "orangered",
+		PendingColor:   colorDarkOrange,
+		ErrorColor:     colorOrangeRed,
 		HighlightColor: colorAqua,
-		KillColor:      "mediumpurple",
-		CompletedColor: "lightslategray",
+		KillColor:      colorMediumPurple,
+		CompletedColor: colorLightSlateGray,
 	}
 }
 
@@ -417,16 +435,16 @@ func newLogIndicator() LogIndicator {
 	return LogIndicator{
 		FgColor:        colorDodgerBlue,
 		BgColor:        colorBlack,
-		ToggleOnColor:  "limegreen",
-		ToggleOffColor: "gray",
+		ToggleOnColor:  colorLimeGreen,
+		ToggleOffColor: colorGray,
 	}
 }
 
 func newYaml() Yaml {
 	return Yaml{
-		KeyColor:   "steelblue",
+		KeyColor:   colorSteelBlue,
 		ColonColor: colorWhite,
-		ValueColor: "papayawhip",
+		ValueColor: colorPapayaWhip,
 	}
 }
 
@@ -435,8 +453,8 @@ func newTitle() Title {
 		FgColor:        colorAqua,
 		BgColor:        colorBlack,
 		HighlightColor: colorFuchsia,
-		CounterColor:   "papayawhip",
-		FilterColor:    "seagreen",
+		CounterColor:   colorPapayaWhip,
+		FilterColor:    colorSeaGreen,
 	}
 }
 
@@ -444,8 +462,8 @@ func newInfo() Info {
 	return Info{
 		SectionColor: colorWhite,
 		FgColor:      colorOrange,
-		CPUColor:     "lawngreen",
-		MEMColor:     "darkturquoise",
+		CPUColor:     colorLawnGreen,
+		MEMColor:     colorDarkTurquoise,
 		K9sRevColor:  colorAqua,
 	}
 }
@@ -466,7 +484,7 @@ func newTable() Table {
 		BgColor:       colorBlack,
 		CursorFgColor: colorBlack,
 		CursorBgColor: colorAqua,
-		MarkColor:     "palegreen",
+		MarkColor:     colorPaleGreen,
 		Header:        newTableHeader(),
 	}
 }

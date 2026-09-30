@@ -26,7 +26,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
@@ -39,13 +38,22 @@ const (
 	openPrimitiveHint     = "Open Primitive"
 )
 
+const (
+	workloadKindPod         = "Pod"
+	workloadKindDeployment  = "Deployment"
+	workloadKindReplicaSet  = "ReplicaSet"
+	workloadKindStatefulSet = "StatefulSet"
+	workloadKindDaemonSet   = "DaemonSet"
+	workloadKindJob         = "Job"
+)
+
 // Section sizing. Every section above the applicability table is sized to its
 // own content, but capped so that a subject with hundreds of workloads or a
 // direction with hundreds of rules cannot squeeze the applicability table --
 // the table this view exists to show -- off the screen. The caps alone are not
 // enough: the rule detail text is long enough to hit its cap on almost every
 // rule, so the applicability table also reserves a share of the view up front
-// and the sections above it are trimmed from the bottom up to honour it.
+// and the sections above it are trimmed from the bottom up to honor it.
 const (
 	subjectMaxPercent    = 25
 	directionMaxPercent  = 35
@@ -99,7 +107,7 @@ func solveSectionHeights(total, remainder int, requests []sectionRequest) []int 
 	// Give the flexible section its floor by trimming the sections above it,
 	// starting with the one nearest to it.
 	shrink(sizes, total-remainder, func(index int) int { return requests[index].min })
-	// The container is too small to honour even the minimums: keep the topmost
+	// The container is too small to honor even the minimums: keep the topmost
 	// sections and drop the ones that no longer fit at all.
 	shrink(sizes, total, func(int) int { return 0 })
 	return sizes
@@ -1107,7 +1115,7 @@ func (v *NetworkPolicyGraph) workloadCollector() func(netpol.SubjectRef, []netpo
 	}
 }
 
-func collectSubjectWorkloads(factory dao.Factory, subject netpol.SubjectRef, pods []netpol.PodRef) ([]ui.SubjectWorkload, []string) {
+func collectSubjectWorkloads(factory dao.Factory, subject netpol.SubjectRef, pods []netpol.PodRef) (workloads []ui.SubjectWorkload, notes []string) {
 	switch subject.Kind {
 	case netpol.SubjectNamespace:
 		return namespaceSubjectWorkloads(factory, subject.Name)
@@ -1118,7 +1126,7 @@ func collectSubjectWorkloads(factory dao.Factory, subject netpol.SubjectRef, pod
 	}
 }
 
-func subjectPodWorkloads(factory dao.Factory, pods []netpol.PodRef) ([]ui.SubjectWorkload, []string) {
+func subjectPodWorkloads(factory dao.Factory, pods []netpol.PodRef) (workloads []ui.SubjectWorkload, notes []string) {
 	if len(pods) == 0 {
 		return nil, nil
 	}
@@ -1127,7 +1135,7 @@ func subjectPodWorkloads(factory dao.Factory, pods []netpol.PodRef) ([]ui.Subjec
 		byNamespace[pod.Namespace] = append(byNamespace[pod.Namespace], pod)
 	}
 	statuses := make(map[string]string, len(pods))
-	notes := []string{}
+	notes = []string{}
 	for namespace := range byNamespace {
 		objects, err := listUnstructured(factory, client.PodGVR, namespace)
 		if err != nil {
@@ -1137,7 +1145,7 @@ func subjectPodWorkloads(factory dao.Factory, pods []netpol.PodRef) ([]ui.Subjec
 			statuses[objectKey(object.GetNamespace(), object.GetName())] = podStatus(object)
 		}
 	}
-	workloads := make([]ui.SubjectWorkload, 0, min(len(pods), subjectInfoRowLimit))
+	workloads = make([]ui.SubjectWorkload, 0, min(len(pods), subjectInfoRowLimit))
 	truncated := false
 	for _, pod := range pods {
 		if len(workloads) >= subjectInfoRowLimit {
@@ -1145,7 +1153,7 @@ func subjectPodWorkloads(factory dao.Factory, pods []netpol.PodRef) ([]ui.Subjec
 			break
 		}
 		workloads = append(workloads, ui.SubjectWorkload{
-			Kind:      "Pod",
+			Kind:      workloadKindPod,
 			Namespace: pod.Namespace,
 			Name:      pod.Name,
 			UID:       pod.UID,
@@ -1158,20 +1166,20 @@ func subjectPodWorkloads(factory dao.Factory, pods []netpol.PodRef) ([]ui.Subjec
 	return workloads, notes
 }
 
-func namespaceSubjectWorkloads(factory dao.Factory, namespace string) ([]ui.SubjectWorkload, []string) {
+func namespaceSubjectWorkloads(factory dao.Factory, namespace string) (workloads []ui.SubjectWorkload, notes []string) {
 	specs := []struct {
 		gvr  *client.GVR
 		kind string
 	}{
-		{client.DpGVR, "Deployment"},
-		{client.RsGVR, "ReplicaSet"},
-		{client.StsGVR, "StatefulSet"},
-		{client.DsGVR, "DaemonSet"},
-		{client.JobGVR, "Job"},
-		{client.PodGVR, "Pod"},
+		{client.DpGVR, workloadKindDeployment},
+		{client.RsGVR, workloadKindReplicaSet},
+		{client.StsGVR, workloadKindStatefulSet},
+		{client.DsGVR, workloadKindDaemonSet},
+		{client.JobGVR, workloadKindJob},
+		{client.PodGVR, workloadKindPod},
 	}
-	workloads := make([]ui.SubjectWorkload, 0, subjectInfoRowLimit)
-	notes := []string{}
+	workloads = make([]ui.SubjectWorkload, 0, subjectInfoRowLimit)
+	notes = []string{}
 	truncated := false
 	for _, spec := range specs {
 		if len(workloads) >= subjectInfoRowLimit {
@@ -1227,13 +1235,13 @@ func listUnstructured(factory dao.Factory, gvr *client.GVR, namespace string) ([
 
 func workloadStatus(kind string, object *unstructured.Unstructured) string {
 	switch kind {
-	case "Pod":
+	case workloadKindPod:
 		return podStatus(object)
-	case "Deployment", "ReplicaSet", "StatefulSet":
+	case workloadKindDeployment, workloadKindReplicaSet, workloadKindStatefulSet:
 		return readyReplicasStatus(object)
-	case "DaemonSet":
+	case workloadKindDaemonSet:
 		return daemonSetStatus(object)
-	case "Job":
+	case workloadKindJob:
 		return jobStatus(object)
 	default:
 		return ""
@@ -1256,11 +1264,10 @@ func podStatus(object *unstructured.Unstructured) string {
 	return strings.Join(parts, " · ")
 }
 
-func podReadyContainers(object *unstructured.Unstructured) (int, int) {
+func podReadyContainers(object *unstructured.Unstructured) (ready, total int) {
 	statuses, _, _ := unstructured.NestedSlice(object.Object, "status", "containerStatuses")
-	ready := 0
 	for _, status := range statuses {
-		statusMap, ok := status.(map[string]interface{})
+		statusMap, ok := status.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -1268,7 +1275,7 @@ func podReadyContainers(object *unstructured.Unstructured) (int, int) {
 			ready++
 		}
 	}
-	total := len(statuses)
+	total = len(statuses)
 	if total == 0 {
 		containers, _, _ := unstructured.NestedSlice(object.Object, "spec", "containers")
 		total = len(containers)
@@ -1315,11 +1322,11 @@ func jobStatus(object *unstructured.Unstructured) string {
 	return fmt.Sprintf("%d/%d complete", succeeded, completions)
 }
 
-func jobConditions(object *unstructured.Unstructured) []map[string]interface{} {
+func jobConditions(object *unstructured.Unstructured) []map[string]any {
 	conditions, _, _ := unstructured.NestedSlice(object.Object, "status", "conditions")
-	items := make([]map[string]interface{}, 0, len(conditions))
+	items := make([]map[string]any, 0, len(conditions))
 	for _, condition := range conditions {
-		if item, ok := condition.(map[string]interface{}); ok {
+		if item, ok := condition.(map[string]any); ok {
 			items = append(items, item)
 		}
 	}
@@ -1739,10 +1746,10 @@ func matchesApplicabilityFilter(row *netpol.ApplicabilityRow, filter string) boo
 	opposite := fmt.Sprintf("%t", row.OppositeSideAllows)
 	ports := applicabilityPermissionsText(row.Permissions)
 	if ref.Kind == netpol.PrimitiveCIDR {
-		opposite = "n/a"
+		opposite = client.NA
 	}
 	if row.Primitive.TotalPairs == 0 {
-		peer, opposite, ports = "n/a", "n/a", "n/a"
+		peer, opposite, ports = client.NA, client.NA, client.NA
 	}
 	displayed := []string{
 		applicabilityPrimitiveText(ref),
@@ -1980,7 +1987,7 @@ func subjectRefFromObject(kind netpol.SubjectKind, object runtime.Object) (netpo
 	ref := netpol.SubjectRef{
 		Kind:      kind,
 		Name:      name,
-		UID:       types.UID(unstructuredObject.GetUID()),
+		UID:       unstructuredObject.GetUID(),
 		Namespace: unstructuredObject.GetNamespace(),
 	}
 	if kind == netpol.SubjectNamespace {
@@ -2183,17 +2190,17 @@ func (v *NetworkPolicyGraph) applicabilityYAMLTarget() (*client.GVR, string, boo
 // produced by the workload collector.
 func workloadGVR(kind string) (*client.GVR, bool) {
 	switch kind {
-	case "Pod":
+	case workloadKindPod:
 		return client.PodGVR, true
-	case "Deployment":
+	case workloadKindDeployment:
 		return client.DpGVR, true
-	case "ReplicaSet":
+	case workloadKindReplicaSet:
 		return client.RsGVR, true
-	case "StatefulSet":
+	case workloadKindStatefulSet:
 		return client.StsGVR, true
-	case "DaemonSet":
+	case workloadKindDaemonSet:
 		return client.DsGVR, true
-	case "Job":
+	case workloadKindJob:
 		return client.JobGVR, true
 	default:
 		return nil, false
@@ -2205,13 +2212,13 @@ func workloadGVR(kind string) (*client.GVR, bool) {
 func primitiveGVR(ref *netpol.PrimitiveRef) (*client.GVR, string, bool) {
 	command, path := primitiveCommand(ref)
 	switch command {
-	case "pods":
+	case client.PodGVR.R():
 		return client.PodGVR, path, true
-	case "namespaces":
+	case client.NsGVR.R():
 		return client.NsGVR, path, true
-	case "deployments":
+	case client.DpGVR.R():
 		return client.DpGVR, path, true
-	case "jobs":
+	case client.JobGVR.R():
 		return client.JobGVR, path, true
 	default:
 		return nil, "", false
@@ -2442,11 +2449,11 @@ func (v *NetworkPolicyGraph) subjectWorkloadTarget() (netpol.SubjectRef, bool) {
 		UID:       workload.UID,
 	}
 	switch workload.Kind {
-	case "Pod":
+	case workloadKindPod:
 		ref.Kind = netpol.SubjectPod
-	case "Deployment":
+	case workloadKindDeployment:
 		ref.Kind = netpol.SubjectDeployment
-	case "Job":
+	case workloadKindJob:
 		ref.Kind = netpol.SubjectJob
 	default:
 		return netpol.SubjectRef{}, false
@@ -2529,13 +2536,13 @@ func primitiveCommand(ref *netpol.PrimitiveRef) (command, resourcePath string) {
 	}
 	switch ref.Kind {
 	case netpol.PrimitivePod:
-		return "pods", path
+		return client.PodGVR.R(), path
 	case netpol.PrimitiveNamespace:
-		return "namespaces", ref.Name
+		return client.NsGVR.R(), ref.Name
 	case netpol.PrimitiveDeployment:
-		return "deployments", path
+		return client.DpGVR.R(), path
 	case netpol.PrimitiveJob:
-		return "jobs", path
+		return client.JobGVR.R(), path
 	default:
 		return "", ""
 	}

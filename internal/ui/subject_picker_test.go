@@ -85,13 +85,13 @@ func TestSubjectPickerAcceptCallback(t *testing.T) {
 }
 
 func TestSubjectPickerEscapeCancels(t *testing.T) {
-	cancelled := false
+	canceled := false
 	picker := newTestSubjectPicker(nil, nil)
-	picker.cancel = func() { cancelled = true }
+	picker.cancel = func() { canceled = true }
 
 	sendPickerKey(picker, tcell.KeyEscape)
 
-	require.True(t, cancelled)
+	require.True(t, canceled)
 }
 
 func TestSubjectPickerKeepsApplicationFocus(t *testing.T) {

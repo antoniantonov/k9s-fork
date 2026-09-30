@@ -149,7 +149,7 @@ func gotoNetworkPolicyGraph(app *App, kind, fqn string, evt *tcell.EventKey) *tc
 
 func networkPolicyGraphCommand(kind, fqn string) string {
 	namespace, name := client.Namespaced(fqn)
-	if kind == "namespace" {
+	if kind == namespaceKind {
 		if name == "" {
 			name = namespace
 		}

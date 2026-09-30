@@ -95,9 +95,9 @@ func (t *Threshold) SeverityColor(k string, v int) string {
 	//nolint:exhaustive
 	switch t.LevelFor(k, v) {
 	case SeverityHigh:
-		return "red"
+		return colorRed
 	case SeverityMedium:
-		return "orangered"
+		return colorOrangeRed
 	default:
 		return colorGreen
 	}

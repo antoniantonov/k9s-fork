@@ -2177,13 +2177,13 @@ func TestNetworkPolicyGraphCoalescesQueuedUpdates(t *testing.T) {
 	view.queueUpdate(second, nil)
 
 	view.drainPendingUpdate()
-	assert.Equal(t, len(second.Ingress.Rules), len(view.result.Ingress.Rules), "the newest result wins")
+	assert.Len(t, view.result.Ingress.Rules, len(second.Ingress.Rules), "the newest result wins")
 
 	view.mx.Lock()
 	result, err, queued := view.pendingResult, view.pendingErr, view.updateQueued
 	view.mx.Unlock()
 	assert.Nil(t, result)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.False(t, queued)
 }
 
@@ -2201,7 +2201,7 @@ func TestNetworkPolicyGraphPartialDataKeepsTheResult(t *testing.T) {
 	view.drainPendingUpdate()
 
 	require.True(t, view.haveResult, "the evaluated result must survive the partial-data failure")
-	assert.Greater(t, view.panels[netpol.Ingress].GetRowCount(), 0, "panels must be populated")
+	assert.Positive(t, view.panels[netpol.Ingress].GetRowCount(), "panels must be populated")
 	assert.Empty(t, view.panels[netpol.Ingress].SelectedID())
 	assert.Empty(t, view.panels[netpol.Egress].SelectedID())
 	detail, ok := view.detailItem.(*ui.RuleDetails)

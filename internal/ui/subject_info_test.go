@@ -41,13 +41,13 @@ func TestSubjectInfoRendersWorkloadRowsInOrder(t *testing.T) {
 	require.Equal(t, "NAMESPACE", info.Table.GetCell(0, 1).Text)
 	require.Equal(t, "NAME", info.Table.GetCell(0, 2).Text)
 	require.Equal(t, "STATUS", info.Table.GetCell(0, 3).Text)
-	requireSubjectInfoRow(t, info, 1, SubjectWorkload{
+	requireSubjectInfoRow(t, info, 1, &SubjectWorkload{
 		Kind:      "Deployment",
 		Namespace: "netpol-demo-app",
 		Name:      "api",
 		Status:    "3/3 ready",
 	})
-	requireSubjectInfoRow(t, info, 2, SubjectWorkload{
+	requireSubjectInfoRow(t, info, 2, &SubjectWorkload{
 		Kind:      "Pod",
 		Namespace: "netpol-demo-app",
 		Name:      "api-123",
@@ -79,7 +79,7 @@ func TestSubjectInfoSetWorkloadsReplacesRatherThanAppends(t *testing.T) {
 	})
 
 	require.Equal(t, 2, info.Table.GetRowCount())
-	requireSubjectInfoRow(t, info, 1, SubjectWorkload{
+	requireSubjectInfoRow(t, info, 1, &SubjectWorkload{
 		Kind:      "Deployment",
 		Namespace: "netpol-demo-app",
 		Name:      "api",
@@ -129,7 +129,7 @@ func TestSubjectInfoKeepsSelectionAcrossStatusOnlyRefresh(t *testing.T) {
 	})
 
 	require.Equal(t, "Pod/demo/b", info.SelectedID())
-	requireSubjectInfoRow(t, info, 2, SubjectWorkload{
+	requireSubjectInfoRow(t, info, 2, &SubjectWorkload{
 		Kind: "Pod", Namespace: "demo", Name: "b", Status: "1/1 ready",
 	})
 }
@@ -158,7 +158,7 @@ func TestSubjectInfoFiltersVisibleWorkloads(t *testing.T) {
 	require.Equal(t, "complete", info.Filter())
 	require.Equal(t, " Subject · filter: complete ", info.GetTitle())
 	require.Equal(t, 2, info.Table.GetRowCount())
-	requireSubjectInfoRow(t, info, 1, SubjectWorkload{
+	requireSubjectInfoRow(t, info, 1, &SubjectWorkload{
 		Kind: "Job", Namespace: "ops", Name: "cleanup", Status: "Complete",
 	})
 	require.Equal(t, "Job/ops/cleanup", info.SelectedID())
@@ -181,7 +181,7 @@ func TestSubjectInfoFilterShowsEmptyState(t *testing.T) {
 	require.Empty(t, info.SelectedID())
 }
 
-func requireSubjectInfoRow(t *testing.T, info *SubjectInfo, row int, expected SubjectWorkload) {
+func requireSubjectInfoRow(t *testing.T, info *SubjectInfo, row int, expected *SubjectWorkload) {
 	t.Helper()
 
 	require.Equal(t, expected.Kind, info.Table.GetCell(row, 0).Text)
