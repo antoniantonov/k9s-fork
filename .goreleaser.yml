@@ -8,7 +8,10 @@ before:
     - go generate ./...
 
 release:
-  prerelease: false
+  github:
+    owner: antoniantonov
+    name: k9s-fork
+  prerelease: auto
 
 env:
   - CGO_ENABLED=0
@@ -98,24 +101,10 @@ changelog:
       - "^docs:"
       - "^test:"
 
-brews:
-  - name: k9s
-    repository:
-      owner: derailed
-      name: homebrew-k9s
-    commit_author:
-      name: derailed
-      email: fernand@imhotep.io
-    directory: Formula
-    homepage: https://k9scli.io/
-    description: Kubernetes CLI To Manage Your Clusters In Style!
-    test: |
-      system "k9s version"
-
 nfpms:
   - file_name_template: '{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}'
-    maintainer: Fernand Galiana
-    homepage: https://k9scli.io
+    maintainer: antoniantonov
+    homepage: https://github.com/antoniantonov/k9s-fork
     description: Kubernetes CLI To Manage Your Clusters In Style!
     license: "Apache-2.0"
     formats:

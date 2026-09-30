@@ -23,9 +23,9 @@ Your donations will go a long way in keeping our servers lights on and beers in 
 [![Go Report Card](https://goreportcard.com/badge/github.com/derailed/k9s?)](https://goreportcard.com/report/github.com/derailed/k9s)
 [![golangci badge](https://github.com/golangci/golangci-web/blob/master/src/assets/images/badge_a_plus_flat.svg)](https://golangci.com/r/github.com/derailed/k9s)
 [![Docker Pulls](https://img.shields.io/docker/pulls/derailed/k9s.svg?maxAge=604800)](https://hub.docker.com/r/derailed/k9s/)
-[![release](https://img.shields.io/github/release-pre/derailed/k9s.svg)](https://github.com/derailed/k9s/releases)
+[![release](https://img.shields.io/github/release-pre/antoniantonov/k9s-fork.svg)](https://github.com/antoniantonov/k9s-fork/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/mum4k/termdash/blob/master/LICENSE)
-[![Releases](https://img.shields.io/github/downloads/derailed/k9s/total.svg)](https://github.com/derailed/k9s/releases)
+[![Releases](https://img.shields.io/github/downloads/antoniantonov/k9s-fork/total.svg)](https://github.com/antoniantonov/k9s-fork/releases)
 
 ---
 
@@ -77,8 +77,28 @@ Wanna discuss K9s features with your fellow `K9sers` or simply show your support
 
 ## Installation
 
-K9s is available on Linux, macOS and Windows platforms.
-Binaries for Linux, Windows and Mac are available as tarballs in the [release page](https://github.com/derailed/k9s/releases).
+### Fork releases
+
+Download this fork from the [release page](https://github.com/antoniantonov/k9s-fork/releases).
+Choose the archive for your operating system and architecture: `.tar.gz` for
+Linux, macOS and FreeBSD, or `.zip` for Windows. Releases also include Linux
+`.deb`, `.rpm` and `.apk` packages, `checksums.sha256`, and archive SBOMs.
+
+For Ubuntu on amd64, download the latest stable release:
+
+```shell
+wget https://github.com/antoniantonov/k9s-fork/releases/latest/download/k9s_linux_amd64.deb
+sudo apt install ./k9s_linux_amd64.deb
+rm k9s_linux_amd64.deb
+```
+
+The `latest/download` URL requires a published, non-prerelease version. To install
+a prerelease, select its assets directly on the release page.
+
+### Upstream packages
+
+The package-manager and `go install` commands below install upstream K9s, not
+this fork. This fork does not publish to upstream's Homebrew tap or package feeds.
 
 * Via [Homebrew](https://brew.sh/) for macOS or Linux
 
@@ -114,12 +134,6 @@ Binaries for Linux, Windows and Mac are available as tarballs in the [release pa
 
   ```shell
   pkg install k9s
-  ```
-
-* On Ubuntu
-
-  ```shell
-  wget https://github.com/derailed/k9s/releases/latest/download/k9s_linux_amd64.deb && sudo apt install ./k9s_linux_amd64.deb && rm k9s_linux_amd64.deb
   ```
 
 * On Fedora (42+)
@@ -196,6 +210,63 @@ Binaries for Linux, Windows and Mac are available as tarballs in the [release pa
       ```shell
       make build && ./execs/k9s
       ```
+
+---
+
+## Publishing a Release
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) publishes a
+GitHub release whenever a new tag matching `v*` is pushed to this repository.
+Normal branch pushes and pull requests do not publish releases.
+[`.goreleaser.yml`](.goreleaser.yml) defines the builds, packages, checksums and
+SBOMs uploaded to [this fork's releases](https://github.com/antoniantonov/k9s-fork/releases).
+
+### Repository setup
+
+Enable GitHub Actions under **Settings > Actions > General**, allowing the
+actions used by the release workflow. The workflow requests `contents: write`
+and uses GitHub's automatically supplied `GITHUB_TOKEN`; no personal access token,
+manually created secret, or GoReleaser Pro license is needed. The repository's
+default workflow permission can remain read-only.
+
+The workflow installs the Go version from `go.mod` and Syft for SBOM generation.
+It runs `make test` before GoReleaser, so a test failure prevents publishing.
+Publishing a Homebrew tap or container image is not part of this workflow.
+
+### Push a release tag
+
+First merge the release workflow, configuration and intended changes into
+`master`. The tagged commit must contain the workflow. Start with a clean
+working tree and ensure `origin` points to `antoniantonov/k9s-fork`.
+
+Choose an unused semantic version. For example:
+
+```shell
+git switch master
+git pull --ff-only origin master
+git tag -a v0.51.1 -m "Release v0.51.1"
+git push origin v0.51.1
+```
+
+Push only the intended tag, not `git push --tags`, which could trigger releases
+for other inherited tags. Existing tags do not retroactively trigger the workflow.
+Treat published tags as immutable; use a new version for subsequent releases.
+
+For a prerelease, use a tag such as `v0.51.1-rc.1` instead:
+
+```shell
+git tag -a v0.51.1-rc.1 -m "Release v0.51.1-rc.1"
+git push origin v0.51.1-rc.1
+```
+
+GoReleaser marks prerelease versions automatically. Regular versions such as
+`v0.51.1` publish stable releases. You do not need to create a release manually
+in GitHub first.
+
+Follow the **K9s Release** run in the repository's **Actions** tab. On success,
+the release page contains the downloadable assets rather than temporary
+Actions artifacts. If the run fails, inspect the failed step before retrying;
+do not move the published tag to a different commit.
 
 ---
 
