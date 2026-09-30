@@ -317,7 +317,7 @@ func TestDirectionPanelClearedSelectionSurvivesEmptyFilterAndReturn(t *testing.T
 	panel.SetFilter("does-not-match-anything")
 	assert.Empty(t, panel.SelectedID())
 	assert.False(t, panel.HasSelection())
-	assert.Zero(t, len(panel.blocks))
+	assert.Empty(t, panel.blocks)
 
 	panel.SetFilter("")
 	assert.Empty(t, panel.SelectedID())
@@ -1176,7 +1176,7 @@ func TestHighlightedStateLineRendersInColor(t *testing.T) {
 	assert.Contains(t, state, "State: Partial ([PARTIAL 1/2])", "the tag itself must not be printed")
 	assert.NotContains(t, state, "yellow")
 	assert.Positive(t, stateColors[reachabilityPartialStateColor], "the state line renders yellow")
-	assert.Zero(t, directionColors[reachabilityPartialStateColor], "neighbouring lines are untouched")
+	assert.Zero(t, directionColors[reachabilityPartialStateColor], "neighboring lines are untouched")
 	assert.Contains(t, direction, "Direction: Ingress")
 	assert.Contains(t, ports, "ports: []", "square brackets survive the dynamic-color pass")
 }

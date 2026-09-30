@@ -27,6 +27,8 @@ import (
 const (
 	podCmd = "v1/pods"
 	ctxCmd = "ctx"
+
+	namespaceKind = "namespace"
 )
 
 var (
@@ -340,7 +342,7 @@ func (c *Command) networkPolicyGraphCmd(p *cmd.Interpreter, pushCmd bool) error 
 
 func resolveNetworkPolicyGraphArgs(factory dao.Factory, args cmd.NetworkPolicyGraphArgs, activeNamespace string) (cmd.NetworkPolicyGraphArgs, error) {
 	if args.Kind == "" {
-		args.Kind = "namespace"
+		args.Kind = namespaceKind
 	}
 
 	gvr, plural, err := networkPolicyGraphGVR(args.Kind)
@@ -349,7 +351,7 @@ func resolveNetworkPolicyGraphArgs(factory dao.Factory, args cmd.NetworkPolicyGr
 	}
 
 	listNamespace := client.ClusterScope
-	if args.Kind != "namespace" {
+	if args.Kind != namespaceKind {
 		if args.Namespace == "" {
 			args.Namespace = activeNamespace
 		}
@@ -368,7 +370,7 @@ func resolveNetworkPolicyGraphArgs(factory dao.Factory, args cmd.NetworkPolicyGr
 		return cmd.NetworkPolicyGraphArgs{}, err
 	}
 	if name == "" {
-		if args.Kind == "namespace" {
+		if args.Kind == namespaceKind {
 			return cmd.NetworkPolicyGraphArgs{}, errors.New("no namespaces found")
 		}
 		return cmd.NetworkPolicyGraphArgs{}, fmt.Errorf("no %s found in namespace %s", plural, args.Namespace)
@@ -381,13 +383,13 @@ func resolveNetworkPolicyGraphArgs(factory dao.Factory, args cmd.NetworkPolicyGr
 func networkPolicyGraphGVR(kind string) (*client.GVR, string, error) {
 	switch kind {
 	case "pod":
-		return client.PodGVR, "pods", nil
+		return client.PodGVR, client.PodGVR.R(), nil
 	case "deployment":
-		return client.DpGVR, "deployments", nil
+		return client.DpGVR, client.DpGVR.R(), nil
 	case "job":
-		return client.JobGVR, "jobs", nil
-	case "namespace":
-		return client.NsGVR, "namespaces", nil
+		return client.JobGVR, client.JobGVR.R(), nil
+	case namespaceKind:
+		return client.NsGVR, client.NsGVR.R(), nil
 	default:
 		return nil, "", fmt.Errorf("unsupported NetworkPolicy graph subject kind %q", kind)
 	}
@@ -426,7 +428,7 @@ func networkPolicyGraphSubject(args cmd.NetworkPolicyGraphArgs, activeNamespace 
 		subject.Kind = netpol.SubjectDeployment
 	case "job":
 		subject.Kind = netpol.SubjectJob
-	case "namespace":
+	case namespaceKind:
 		subject.Kind = netpol.SubjectNamespace
 		subject.Namespace = ""
 	default:
