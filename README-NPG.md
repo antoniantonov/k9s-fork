@@ -3,6 +3,158 @@
 This document describes only the Network Policy Graph (NPG) read-only panel in
 K9s.
 ![alt text](assets/npg/intro.png)
+
+## 0. Install v0.52.1-beta
+
+Install the [v0.52.1-beta prerelease of this fork](https://github.com/antoniantonov/k9s-fork/releases/tag/v0.52.1-beta)
+to get NPG. Standard upstream K9s packages, such as `brew install k9s` or
+`winget install k9s`, do not install this fork.
+
+Copy the entire block for your operating system into a terminal. Each block
+selects the matching CPU architecture, downloads the pinned release, verifies
+its SHA-256 checksum, and installs it for your user without administrator access.
+Close running K9s instances first: an existing binary at the installation path
+will be replaced. No Go toolchain, repository checkout, or Docker is required.
+
+### Linux
+
+Requires `curl`, `tar`, `sha256sum`, and `install`. Supports amd64, arm64, ARMv7,
+ppc64le, and s390x. Run this in a POSIX-compatible shell:
+
+```sh
+(
+  set -eu
+  [ "$(uname -s)" = Linux ] || { echo "Run this block on Linux." >&2; exit 1; }
+  case "$(uname -m)" in
+    x86_64|amd64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    armv7l) arch=armv7 ;;
+    ppc64le|s390x) arch=$(uname -m) ;;
+    *) echo "Unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
+  esac
+
+  version=v0.52.1-beta
+  archive="k9s_Linux_${arch}.tar.gz"
+  base_url="https://github.com/antoniantonov/k9s-fork/releases/download/$version"
+  tmp_dir=$(mktemp -d)
+  trap 'rm -f "$tmp_dir/$archive" "$tmp_dir/checksums.sha256" "$tmp_dir/checksum.sha256" "$tmp_dir/k9s"; rmdir "$tmp_dir"' EXIT
+  cd "$tmp_dir"
+
+  curl -fL "$base_url/$archive" -o "$archive"
+  curl -fL "$base_url/checksums.sha256" -o checksums.sha256
+  awk -v name="$archive" '$2 == name { print }' checksums.sha256 > checksum.sha256
+  [ -s checksum.sha256 ] || { echo "Missing checksum for $archive" >&2; exit 1; }
+  sha256sum -c checksum.sha256
+  tar -xzf "$archive" k9s
+  mkdir -p "$HOME/.local/bin"
+  install -m 755 k9s "$HOME/.local/bin/k9s"
+  "$HOME/.local/bin/k9s" version
+)
+```
+
+Start the installed fork with `"$HOME/.local/bin/k9s"`.
+
+### macOS
+
+Supports Apple Silicon and Intel Macs. The commands use macOS's `curl`, `tar`,
+`shasum`, and `install`:
+
+```sh
+(
+  set -eu
+  [ "$(uname -s)" = Darwin ] || { echo "Run this block on macOS." >&2; exit 1; }
+  case "$(uname -m)" in
+    arm64) arch=arm64 ;;
+    x86_64) arch=amd64 ;;
+    *) echo "Unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+  esac
+
+  version=v0.52.1-beta
+  archive="k9s_Darwin_${arch}.tar.gz"
+  base_url="https://github.com/antoniantonov/k9s-fork/releases/download/$version"
+  tmp_dir=$(mktemp -d)
+  trap 'rm -f "$tmp_dir/$archive" "$tmp_dir/checksums.sha256" "$tmp_dir/checksum.sha256" "$tmp_dir/k9s"; rmdir "$tmp_dir"' EXIT
+  cd "$tmp_dir"
+
+  curl -fL "$base_url/$archive" -o "$archive"
+  curl -fL "$base_url/checksums.sha256" -o checksums.sha256
+  awk -v name="$archive" '$2 == name { print }' checksums.sha256 > checksum.sha256
+  [ -s checksum.sha256 ] || { echo "Missing checksum for $archive" >&2; exit 1; }
+  shasum -a 256 -c checksum.sha256
+  tar -xzf "$archive" k9s
+  mkdir -p "$HOME/.local/bin"
+  install -m 755 k9s "$HOME/.local/bin/k9s"
+  "$HOME/.local/bin/k9s" version
+)
+```
+
+Start the installed fork with `"$HOME/.local/bin/k9s"`. On Linux and macOS, you
+can also run `export PATH="$HOME/.local/bin:$PATH"` in your terminal and then use
+`k9s`. Add that export to your shell's startup file to keep it for new terminals.
+The full path avoids accidentally launching a different K9s installation.
+
+### Windows
+
+Run this in **PowerShell 5.1 or newer**, not Command Prompt. Supports x64 and
+ARM64 and installs into `%LOCALAPPDATA%\Programs\k9s`:
+
+```powershell
+& {
+    $ErrorActionPreference = 'Stop'
+    $cpu = if ($env:PROCESSOR_ARCHITEW6432) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+    $arch = switch ($cpu) {
+        'AMD64' { 'amd64' }
+        'ARM64' { 'arm64' }
+        default { throw "Unsupported Windows architecture: $cpu" }
+    }
+
+    $version = 'v0.52.1-beta'
+    $archive = "k9s_Windows_$arch.zip"
+    $baseUrl = "https://github.com/antoniantonov/k9s-fork/releases/download/$version"
+    $tempDir = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N'))
+    $installDir = Join-Path $env:LOCALAPPDATA 'Programs\k9s'
+    New-Item -ItemType Directory -Path $tempDir | Out-Null
+    $archivePath = Join-Path $tempDir $archive
+    $checksumsPath = Join-Path $tempDir 'checksums.sha256'
+
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/$archive" -OutFile $archivePath
+        Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/checksums.sha256" -OutFile $checksumsPath
+        $pattern = '^[0-9a-fA-F]{64}\s+\*?' + [regex]::Escape($archive) + '$'
+        $checksum = @(Get-Content -LiteralPath $checksumsPath | Where-Object { $_ -match $pattern })
+        if ($checksum.Count -ne 1) { throw "Missing or ambiguous checksum for $archive" }
+        $expected = ($checksum[0] -split '\s+')[0]
+        if ((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash -ne $expected) {
+            throw "Checksum mismatch for $archive"
+        }
+
+        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+        Expand-Archive -LiteralPath $archivePath -DestinationPath $installDir -Force
+        & (Join-Path $installDir 'k9s.exe') version
+        if ($LASTEXITCODE -ne 0) { throw "k9s version exited with code $LASTEXITCODE" }
+    } finally {
+        foreach ($file in @($archivePath, $checksumsPath)) {
+            if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
+        }
+        Remove-Item -LiteralPath $tempDir
+    }
+}
+```
+
+Start the installed fork with:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\k9s\k9s.exe"
+```
+
+The version output should show `v0.52.1-beta`. To use NPG, configure access to
+your Kubernetes cluster through your kubeconfig, start K9s, and open the view
+using the commands or `Shift-R` shortcut described below.
+
 ## 1. What Is Network Policy Graph?
 
 Network Policy Graph is a read-only reachability view for Kubernetes
