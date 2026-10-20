@@ -5,12 +5,20 @@ package ui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/derailed/k9s/internal/config"
 	"github.com/derailed/tcell/v2"
 	"github.com/derailed/tview"
+)
+
+const (
+	// LogoWidth is the maximum width of header art in terminal columns.
+	LogoWidth = 26
+	// LogoArtHeight is the fixed number of art rows, excluding status.
+	LogoArtHeight = 6
 )
 
 // LogoBadgeToken identifies the owner of a logo badge.
@@ -37,6 +45,7 @@ type Logo struct {
 	*tview.Flex
 
 	logo, status   *tview.TextView
+	lines          []string
 	styles         *config.Styles
 	badge          logoBadge
 	nextBadgeToken LogoBadgeToken
@@ -54,11 +63,12 @@ func NewLogo(styles *config.Styles) *Logo {
 		Flex:   tview.NewFlex(),
 		logo:   logo(),
 		status: status(),
+		lines:  slices.Clone(LogoSmall),
 		styles: styles,
 	}
 	l.SetDirection(tview.FlexRow)
-	l.AddItem(l.logo, 6, 1, false)
-	l.AddItem(l.status, 1, 1, false)
+	l.AddItem(l.logo, LogoArtHeight, 0, false)
+	l.AddItem(l.status, 1, 0, false)
 	l.refreshLogo(styles.Body().LogoColor)
 	l.SetBackgroundColor(styles.BgColor())
 	styles.AddListener(&l)
@@ -122,6 +132,29 @@ func (l *Logo) ClearViewBadge(token LogoBadgeToken) {
 	l.renderStatusLocked()
 }
 
+// SetLogo updates the logo art.
+func (l *Logo) SetLogo(art string) {
+	if l == nil {
+		return
+	}
+
+	l.mx.Lock()
+	defer l.mx.Unlock()
+	lines := logoLines(art)
+	if slices.Equal(l.lines, lines) {
+		return
+	}
+	l.lines = lines
+	l.refreshLogoLocked(l.transientColorLocked())
+}
+
+// Draw synchronizes rendering with logo and style updates.
+func (l *Logo) Draw(screen tcell.Screen) {
+	l.mx.Lock()
+	defer l.mx.Unlock()
+	l.Flex.Draw(screen)
+}
+
 // StylesChanged notifies the skin changed.
 func (l *Logo) StylesChanged(s *config.Styles) {
 	if l == nil {
@@ -145,6 +178,9 @@ func (l *Logo) IsBenchmarking() bool {
 	if l == nil || l.Status() == nil {
 		return false
 	}
+
+	l.mx.Lock()
+	defer l.mx.Unlock()
 	txt := l.Status().GetText(true)
 	return strings.Contains(txt, "Bench")
 }
@@ -262,12 +298,28 @@ func (l *Logo) refreshLogoLocked(c config.Color) {
 		return
 	}
 	l.logo.Clear()
-	for i, s := range LogoSmall {
-		_, _ = fmt.Fprintf(l.logo, "[%s::b]%s", c, s)
-		if i+1 < len(LogoSmall) {
+	for i, s := range l.lines {
+		_, _ = fmt.Fprintf(l.logo, "[%s::b]%s", c, tview.Escape(s))
+		if i+1 < len(l.lines) {
 			_, _ = fmt.Fprintf(l.logo, "\n")
 		}
 	}
+	l.logo.ScrollToBeginning()
+}
+
+func logoLines(art string) []string {
+	art = strings.ReplaceAll(art, "\r\n", "\n")
+	art = strings.TrimRight(art, "\n")
+	if strings.TrimSpace(art) == "" {
+		return slices.Clone(LogoSmall)
+	}
+
+	lines := strings.SplitN(art, "\n", LogoArtHeight+1)
+	lines = lines[:min(len(lines), LogoArtHeight)]
+	for i, line := range lines {
+		lines[i] = strings.ReplaceAll(line, "\t", strings.Repeat(" ", tview.TabSize))
+	}
+	return lines
 }
 
 func logo() *tview.TextView {
