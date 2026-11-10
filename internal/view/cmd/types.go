@@ -24,9 +24,9 @@ const (
 	labelFlagIn        = " in "
 	labelFlagNotin     = " notin "
 	labelFlagQuote     = "'"
-	label
-	fuzzyFlag   = "-f"
-	contextFlag = "@"
+	labelFlag          = "-l"
+	fuzzyFlag          = "-f"
+	contextFlag        = "@"
 )
 
 // NetworkPolicyGraphArgs tracks a network policy graph subject.
